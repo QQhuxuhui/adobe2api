@@ -77,6 +77,7 @@ Current supported model families are:
 - `firefly-veo31-*` (video)
 - `firefly-veo31-ref-*` (video, reference-image mode)
 - `firefly-veo31-fast-*` (video)
+- `firefly-kling3-*` (video, Kling 3.0 with frame references)
 
 Nano Banana image models (`nano-banana-2`):
 
@@ -188,6 +189,19 @@ Veo31 Fast video models:
 - Examples:
   - `firefly-veo31-fast-4s-16x9-1080p`
   - `firefly-veo31-fast-6s-9x16-720p`
+
+Kling 3.0 video models:
+
+- Pattern: `firefly-kling3-{duration}-{ratio}`
+- Duration: `5s` / `10s` / `15s`
+- Ratio: `16x9` / `9x16`
+- Resolution: `720p`
+- Supports up to 2 frame reference images: 1 image is first frame, 2 images are first frame + last frame
+- Audio defaults to disabled, matching the current official Kling 3.0 request; override with `generate_audio` / `generateAudio`
+- Upstream model version: `kling_v3_standard_i2v`
+- Examples:
+  - `firefly-kling3-5s-16x9`
+  - `firefly-kling3-15s-9x16`
 
 ### 3.1 List models
 

@@ -302,6 +302,18 @@ class AdobeClient:
             "accept": "*/*",
         }
 
+    def _video_submit_headers(self, token: str) -> dict:
+        headers = self._browser_headers()
+        headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "x-api-key": self.api_key,
+                "content-type": "application/json",
+                "accept": "*/*",
+            }
+        )
+        return headers
+
     def _poll_headers(self, token: str) -> dict:
         return {
             "Authorization": f"Bearer {token}",
@@ -1164,6 +1176,30 @@ class AdobeClient:
                     )
             return payload
 
+        if engine == "kling3":
+            payload = {
+                "n": 1,
+                "seeds": [seed_val],
+                "modelId": "kling",
+                "modelVersion": "kling_v3_standard_i2v",
+                "output": {"storeInputs": True},
+                "prompt": prompt,
+                "size": self._video_size(aspect_ratio, resolution),
+                "generateAudio": bool(generate_audio),
+                "generationMetadata": {
+                    "module": "image2video" if source_image_ids else "text2video"
+                },
+                "duration": int(duration),
+                "generationSettings": {"aspectRatio": aspect_ratio},
+                "referenceBlobs": [],
+            }
+            if source_image_ids:
+                for idx, image_id in enumerate(source_image_ids[:2], start=1):
+                    payload["referenceBlobs"].append(
+                        {"id": str(image_id), "usage": "frame", "order": idx}
+                    )
+            return payload
+
         payload = {
             "n": 1,
             "seeds": [seed_val],
@@ -1244,7 +1280,7 @@ class AdobeClient:
         )
         submit_resp = self._post_json(
             self.video_submit_url,
-            headers=self._submit_headers(token, prompt=prompt),
+            headers=self._video_submit_headers(token),
             payload=payload,
         )
 

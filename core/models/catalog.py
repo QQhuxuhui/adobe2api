@@ -198,3 +198,16 @@ for dur in (5, 15):
             "resolution": "1080p",
             "description": f"Firefly Kling O3 video model ({dur}s {ratio})",
         }
+
+for dur in (5, 10, 15):
+    for ratio in ("16:9", "9:16"):
+        model_id = f"firefly-kling3-{dur}s-{RATIO_SUFFIX_MAP[ratio]}"
+        VIDEO_MODEL_CATALOG[model_id] = {
+            "engine": "kling3",
+            "upstream_model": "kling:firefly:colligo:3.0",
+            "duration": dur,
+            "aspect_ratio": ratio,
+            "resolution": "720p",
+            "generate_audio": False,
+            "description": f"Firefly Kling 3.0 video model ({dur}s {ratio} 720p)",
+        }

@@ -614,6 +614,8 @@ def build_generation_router(
                     video_reference_mode = requested_reference_mode
             else:
                 generate_audio, negative_prompt = resolved_video_options
+            if not any(k in data for k in ("generate_audio", "generateAudio")):
+                generate_audio = bool(video_conf.get("generate_audio", generate_audio))
         else:
             ratio, output_resolution, resolved_model_id = resolve_ratio_and_resolution(
                 data, model_id or None
@@ -647,7 +649,7 @@ def build_generation_router(
                         max_video_inputs = (
                             2
                             if video_engine
-                            in {"veo31-fast", "veo31-standard", "kling-o3"}
+                            in {"veo31-fast", "veo31-standard", "kling-o3", "kling3"}
                             else 1
                         )
                     if len(input_images) > max_video_inputs:

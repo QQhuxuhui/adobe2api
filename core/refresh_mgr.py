@@ -22,7 +22,7 @@ class RefreshManager:
     DEFAULT_SCOPE = (
         "AdobeID,firefly_api,openid,pps.read,pps.write,additional_info.projectedProductContext,"
         "additional_info.ownerOrg,uds_read,uds_write,ab.manage,read_organizations,"
-        "additional_info.roles,account_cluster.read,creative_production"
+        "additional_info.roles,account_cluster.read,creative_production,profile"
     )
 
     def __init__(self):
@@ -107,10 +107,15 @@ class RefreshManager:
             "User-Agent": str(headers.get("User-Agent") or "Mozilla/5.0"),
         }
 
+        scope = str(form.get("scope") or "").strip()
+        scope_parts = [part.strip() for part in scope.split(",") if part.strip()]
+        if "profile" not in scope_parts:
+            scope_parts.append("profile")
+
         normalized_form = {
             "client_id": str(form.get("client_id") or "").strip(),
             "guest_allowed": str(form.get("guest_allowed") or "true").strip() or "true",
-            "scope": str(form.get("scope") or "").strip(),
+            "scope": ",".join(scope_parts),
         }
 
         return {

@@ -75,6 +75,7 @@ docker compose up -d --build
 - `firefly-veo31-*`（视频）
 - `firefly-veo31-ref-*`（视频，参考图模式）
 - `firefly-veo31-fast-*`（视频）
+- `firefly-kling3-*`（视频，Kling 3.0，支持首尾帧参考）
 - `firefly-kling-o3-*`（视频，支持实体引用）
 
 Nano Banana 图像模型（`nano-banana-2`）：
@@ -187,6 +188,19 @@ Veo31 Fast 视频模型：
 - 示例：
   - `firefly-veo31-fast-4s-16x9-1080p`
   - `firefly-veo31-fast-6s-9x16-720p`
+
+Kling 3.0 视频模型：
+
+- 命名：`firefly-kling3-{duration}-{ratio}`
+- 时长：`5s` / `10s` / `15s`
+- 比例：`16x9` / `9x16`
+- 分辨率：`720p`
+- 最多支持 2 张帧参考图：1 张为首帧，2 张为首帧 + 尾帧
+- 默认关闭音频，与官方 Kling 3.0 当前请求一致；可通过 `generate_audio` / `generateAudio` 覆盖
+- 上游模型版本：`kling_v3_standard_i2v`
+- 示例：
+  - `firefly-kling3-5s-16x9`
+  - `firefly-kling3-15s-9x16`
 
 Kling O3 视频模型：
 
