@@ -63,7 +63,20 @@ def _build_submit_nonce(token: str, prompt: str) -> str:
 
 
 class AdobeRequestError(Exception):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+        error_type: str = "",
+        user_message: str = "",
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_type = str(error_type or "").strip().lower()
+        self.user_message = (
+            str(user_message or "").strip() or str(message or "").strip()
+        )
 
 
 class QuotaExhaustedError(AdobeRequestError):

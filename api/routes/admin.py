@@ -191,14 +191,22 @@ def build_admin_router(
             item["auto_refresh_enabled"] = refresh_manager.is_profile_enabled(pid)
         total_count = len(tokens)
         active_count = 0
+        credits_available_total = 0.0
         for item in tokens:
             if str(item.get("status") or "").strip().lower() == "active":
                 active_count += 1
+            try:
+                available = item.get("credits_available")
+                if available is not None:
+                    credits_available_total += float(available)
+            except Exception:
+                pass
         return {
             "tokens": tokens,
             "summary": {
                 "total": total_count,
                 "active": active_count,
+                "credits_available_total": credits_available_total,
             },
         }
 

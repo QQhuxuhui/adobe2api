@@ -30,6 +30,7 @@ except Exception:
     Image = None
 
 from core.adobe_client import (
+    AdobeRequestError,
     AdobeClient,
     AuthError,
     QuotaExhaustedError,
@@ -605,20 +606,42 @@ def _run_with_token_retries(
     max_attempts = max(1, int(max_attempts))
     last_exc: Optional[Exception] = None
     report_error = set_request_error_detail or _set_request_error_detail
+    attempt = 0
+    limited_retry_attempts = 0
+    tried_tokens: set[str] = set()
 
-    for attempt in range(1, max_attempts + 1):
-        token = (
-            token_selector()
-            if token_selector is not None
-            else token_manager.get_available(strategy=client.token_rotation_strategy)
-        )
+    while True:
+        attempt += 1
+        token = ""
+        fetch_attempts = 0
+        while not token:
+            fetch_attempts += 1
+            candidate = (
+                token_selector()
+                if token_selector is not None
+                else token_manager.get_available(strategy=client.token_rotation_strategy)
+            )
+            candidate = str(candidate or "").strip()
+            if not candidate:
+                break
+            if candidate not in tried_tokens:
+                token = candidate
+                break
+            if fetch_attempts >= max(1, len(tried_tokens) + 1):
+                break
         if not token:
             break
+        tried_tokens.add(token)
         token_meta = _set_request_token_context(request, token, attempt)
         attempt_started = time.time()
+        retryable = False
+        retry_reason = ""
+        delay = 0.0
+        retry_error_text = ""
 
         try:
             result = run_once(token)
+            token_manager.report_success(token)
             _append_attempt_log(
                 request=request,
                 operation=operation_name,
@@ -632,7 +655,7 @@ def _run_with_token_retries(
         except QuotaExhaustedError as exc:
             token_manager.report_exhausted(token)
             last_exc = exc
-            retryable = attempt < max_attempts
+            retryable = True
             retry_reason = "quota_exhausted"
             err_code = report_error(
                 request,
@@ -652,16 +675,40 @@ def _run_with_token_retries(
                 error_code=err_code,
                 task_status_override="FAILED",
             )
+            retry_error_text = str(exc)
         except AuthError as exc:
-            token_manager.report_invalid(token)
-            last_exc = exc
-            retryable = attempt < max_attempts
-            retry_reason = "auth"
+            auth_result = token_manager.handle_auth_failure(token)
+            auth_status = str(auth_result.get("status") or "invalid").strip().lower()
+            if auth_status == "invalid":
+                last_exc = exc
+                retry_reason = "auth_invalid"
+                err_status_code = 401
+                err_type = "authentication_error"
+                err_value = exc
+            else:
+                refresh_message = str(
+                    auth_result.get("message")
+                    or "token auth failed, cookie refresh recovery triggered"
+                ).strip()
+                last_exc = UpstreamTemporaryError(
+                    refresh_message,
+                    status_code=503,
+                    error_type="upstream_unavailable",
+                )
+                retry_reason = (
+                    "auth_refresh_success"
+                    if auth_status == "refreshed"
+                    else "auth_refresh_retry"
+                )
+                err_status_code = 503
+                err_type = "server_error"
+                err_value = refresh_message
+            retryable = True
             err_code = report_error(
                 request,
-                error=exc,
-                status_code=401,
-                error_type="authentication_error",
+                error=err_value,
+                status_code=err_status_code,
+                error_type=err_type,
                 include_traceback=False,
             )
             _append_attempt_log(
@@ -670,19 +717,22 @@ def _run_with_token_retries(
                 token_meta=token_meta,
                 attempt=attempt,
                 attempt_started=attempt_started,
-                status_code=401,
-                error=str(exc),
+                status_code=err_status_code,
+                error=str(err_value),
                 error_code=err_code,
                 task_status_override="FAILED",
             )
+            retry_error_text = str(err_value)
         except UpstreamTemporaryError as exc:
             last_exc = exc
-            retryable = attempt < max_attempts and client.should_retry_temporary_error(
+            limited_retry_attempts += 1
+            retryable = limited_retry_attempts < max_attempts and client.should_retry_temporary_error(
                 exc
             )
             status_part = f"status={exc.status_code}" if exc.status_code else "status=?"
             type_part = f"type={exc.error_type or 'temporary'}"
             retry_reason = f"upstream_temporary {status_part} {type_part}"
+            delay = client._retry_delay_for_attempt(limited_retry_attempts)
             err_code = report_error(
                 request,
                 error=exc,
@@ -701,6 +751,34 @@ def _run_with_token_retries(
                 error_code=err_code,
                 task_status_override="FAILED",
             )
+            retry_error_text = str(exc)
+        except AdobeRequestError as exc:
+            status_code = int(getattr(exc, "status_code", None) or 500)
+            detail = str(
+                getattr(exc, "user_message", "") or str(exc) or "Adobe request failed"
+            ).strip()
+            err_type = str(getattr(exc, "error_type", "") or "").strip().lower() or (
+                "invalid_request_error" if 400 <= status_code < 500 else "server_error"
+            )
+            err_code = report_error(
+                request,
+                error=detail,
+                status_code=status_code,
+                error_type=err_type,
+                include_traceback=False,
+            )
+            _append_attempt_log(
+                request=request,
+                operation=operation_name,
+                token_meta=token_meta,
+                attempt=attempt,
+                attempt_started=attempt_started,
+                status_code=status_code,
+                error=detail,
+                error_code=err_code,
+                task_status_override="FAILED",
+            )
+            raise HTTPException(status_code=status_code, detail=detail)
         except HTTPException as exc:
             err_code = report_error(
                 request,
@@ -747,12 +825,10 @@ def _run_with_token_retries(
             raise
 
         if retryable:
-            delay = client._retry_delay_for_attempt(attempt)
             logger.warning(
-                "retrying operation=%s attempt=%s/%s reason=%s delay=%.2fs strategy=%s",
+                "retrying operation=%s attempt=%s reason=%s delay=%.2fs strategy=%s",
                 operation_name,
                 attempt,
-                max_attempts,
                 retry_reason,
                 delay,
                 client.token_rotation_strategy,
@@ -760,7 +836,7 @@ def _run_with_token_retries(
             _set_request_task_progress(
                 request,
                 task_status="IN_PROGRESS",
-                error=f"retry {attempt}/{max_attempts}: {retry_reason}",
+                error=retry_error_text or f"retry attempt {attempt}: {retry_reason}",
             )
             if delay > 0:
                 time.sleep(delay)
@@ -768,6 +844,20 @@ def _run_with_token_retries(
         break
 
     if last_exc is not None:
+        if isinstance(last_exc, AuthError):
+            raise HTTPException(
+                status_code=401, detail="All available tokens are invalid or expired"
+            )
+        if isinstance(last_exc, QuotaExhaustedError):
+            raise HTTPException(
+                status_code=503,
+                detail="Upstream is temporarily unavailable. Please retry later.",
+            )
+        if isinstance(last_exc, UpstreamTemporaryError):
+            raise HTTPException(
+                status_code=503,
+                detail="Upstream is temporarily unavailable. Please retry later.",
+            )
         raise last_exc
     raise HTTPException(
         status_code=503, detail="No active tokens available in the pool"

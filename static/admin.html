@@ -38,12 +38,17 @@
       <section class="token-list-card card">
         <div class="list-head">
           <h2>Token 账号池</h2>
-          <div class="actions">
-            <button id="exportTokensBtn" class="secondary">导出 Token</button>
-            <button id="exportCookiesBtn" class="secondary">导出 Cookie</button>
-            <button id="deleteTokensBatchBtn" class="danger">批量删除</button>
-            <button id="refreshCreditsBatchBtn" class="secondary">批量刷新积分</button>
-            <button id="refreshBtn" class="secondary">刷新列表</button>
+          <div class="token-list-actions">
+            <div class="actions">
+              <button id="exportTokensBtn" class="secondary">导出 Token</button>
+              <button id="exportCookiesBtn" class="secondary">导出 Cookie</button>
+              <button id="deleteTokensBatchBtn" class="danger">批量删除</button>
+              <button id="refreshCreditsBatchBtn" class="secondary">批量刷新积分</button>
+              <button id="refreshBtn" class="secondary">刷新列表</button>
+            </div>
+            <div id="tokenCreditsSummary" class="token-credits-summary">
+              可用积分总量：<strong id="tokenAvailableCreditsTotal">-</strong>
+            </div>
           </div>
         </div>
         <div id="tokenSummary" class="token-summary">

@@ -72,6 +72,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const tbody = document.querySelector("#tokenTable tbody");
   const tokenTotalCount = document.getElementById("tokenTotalCount");
   const tokenActiveCount = document.getElementById("tokenActiveCount");
+  const tokenAvailableCreditsTotal = document.getElementById("tokenAvailableCreditsTotal");
   const tokenPagination = document.getElementById("tokenPagination");
   const tokenPrevBtn = document.getElementById("tokenPrevBtn");
   const tokenNextBtn = document.getElementById("tokenNextBtn");
@@ -119,10 +120,30 @@ document.addEventListener("DOMContentLoaded", async () => {
     const list = Array.isArray(tokens) ? tokens : [];
     const fallbackTotal = list.length;
     const fallbackActive = list.filter((t) => String(t?.status || "").toLowerCase() === "active").length;
+    const fallbackCreditsTotal = list.reduce((sum, token) => {
+      const available = Number(token?.credits_available);
+      return Number.isFinite(available) ? sum + available : sum;
+    }, 0);
     const total = Number.isFinite(Number(summary?.total)) ? Number(summary.total) : fallbackTotal;
     const active = Number.isFinite(Number(summary?.active)) ? Number(summary.active) : fallbackActive;
+    const creditsTotal = Number.isFinite(Number(summary?.credits_available_total))
+      ? Number(summary.credits_available_total)
+      : fallbackCreditsTotal;
     if (tokenTotalCount) tokenTotalCount.textContent = String(total);
     if (tokenActiveCount) tokenActiveCount.textContent = String(active);
+    if (tokenAvailableCreditsTotal) {
+      tokenAvailableCreditsTotal.textContent = formatCreditsTotal(creditsTotal);
+    }
+  }
+
+  function formatCreditsTotal(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return "-";
+    const rounded = Math.round(num * 100) / 100;
+    return rounded.toLocaleString("zh-CN", {
+      minimumFractionDigits: Number.isInteger(rounded) ? 0 : 2,
+      maximumFractionDigits: 2,
+    });
   }
 
   function renderTokenPagination(totalCount) {

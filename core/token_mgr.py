@@ -239,7 +239,7 @@ class TokenManager:
     def _pick_active_token_locked(
         self, strategy: str = "round_robin"
     ) -> Optional[Dict]:
-        active = [t for t in self.tokens if t["status"] == "active"]
+        active = [t for t in self.tokens if t.get("status") in {"active", "error"}]
         if not active:
             return None
 
@@ -256,27 +256,7 @@ class TokenManager:
     def get_available(self, strategy: str = "round_robin") -> Optional[str]:
         with self._lock:
             chosen = self._pick_active_token_locked(strategy=strategy)
-            if chosen is not None:
-                return chosen["value"]
-
-            # Auto-revive one recoverable token after cooldown.
-            now_ts = time.time()
-            recoverable = [
-                t
-                for t in self.tokens
-                if t["status"] == "error"
-                and float(t.get("error_until", 0) or 0) <= now_ts
-            ]
-            if not recoverable:
-                return None
-            recoverable.sort(key=lambda x: x["fails"])
-            chosen = recoverable[0]
-            chosen["status"] = "active"
-            chosen["fails"] = max(0, int(chosen.get("fails", 0)) - 1)
-            chosen["error_until"] = 0
-            self.save()
-            picked = self._pick_active_token_locked(strategy=strategy)
-            return (picked or chosen)["value"]
+            return chosen["value"] if chosen is not None else None
 
     @classmethod
     def account_id_from_token(cls, value: str) -> str:
@@ -297,7 +277,7 @@ class TokenManager:
             active = [
                 t
                 for t in self.tokens
-                if t.get("status") == "active"
+                if t.get("status") in {"active", "error"}
                 and str(t.get("account_id") or self.account_id_from_token(t.get("value") or ""))
                 == aid
             ]
@@ -348,20 +328,62 @@ class TokenManager:
                     t["error_until"] = 0
             self.save()
 
+    def handle_auth_failure(self, value: str) -> Dict:
+        token_value = str(value or "").strip()
+        linked_profile_id = ""
+        linked_auto_refresh = False
+
+        with self._lock:
+            for t in self.tokens:
+                if str(t.get("value") or "").strip() != token_value:
+                    continue
+                linked_profile_id = str(t.get("refresh_profile_id") or "").strip()
+                linked_auto_refresh = bool(t.get("auto_refresh"))
+                break
+
+        if not linked_auto_refresh or not linked_profile_id:
+            self.report_invalid(token_value)
+            return {
+                "status": "invalid",
+                "message": "token invalid or expired",
+                "http_status": 401,
+                "profile_id": linked_profile_id,
+            }
+
+        try:
+            from core.refresh_mgr import refresh_manager
+
+            refresh_result = refresh_manager.refresh_once(linked_profile_id)
+        except Exception as exc:
+            self.report_error(token_value)
+            return {
+                "status": "retry",
+                "message": f"auto refresh failed: {exc}",
+                "http_status": None,
+                "profile_id": linked_profile_id,
+            }
+
+        return {
+            "status": "refreshed",
+            "message": "token refreshed via cookie",
+            "http_status": 200,
+            "profile_id": linked_profile_id,
+            "result": refresh_result,
+        }
+
     def report_error(self, value: str):
         with self._lock:
             for t in self.tokens:
                 if t["value"] == value:
                     t["fails"] += 1
-                    t["status"] = "error"
-                    t["error_until"] = time.time() + self.ERROR_COOLDOWN_SECONDS
+                    t["updated_at"] = time.time()
             self.save()
 
     def report_success(self, value: str):
         with self._lock:
             for t in self.tokens:
                 if t["value"] == value:
-                    t["fails"] = max(0, int(t.get("fails", 0)) - 1)
+                    t["fails"] = 0
                     if t["status"] == "error":
                         t["status"] = "active"
                         t["error_until"] = 0
