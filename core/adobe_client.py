@@ -62,6 +62,16 @@ def _build_submit_nonce(token: str, prompt: str) -> str:
     return hashlib.sha256(nonce_input).hexdigest()
 
 
+def _build_arp_session_id() -> str:
+    now_ms = int(time.time() * 1000)
+    ftr = f"{os.urandom(16).hex()}_{now_ms}_{os.getpid()}_dUAL43-mnts-ants-d4_31ck__tt"
+    raw = json.dumps(
+        {"sid": str(uuid.uuid4()), "ftr": ftr},
+        separators=(",", ":"),
+    )
+    return base64.b64encode(raw.encode("utf-8")).decode("ascii")
+
+
 class AdobeRequestError(Exception):
     def __init__(
         self,
@@ -305,6 +315,7 @@ class AdobeClient:
         submit_nonce = _build_submit_nonce(token, prompt)
         if submit_nonce:
             headers["x-nonce"] = submit_nonce
+        headers["x-arp-session-id"] = _build_arp_session_id()
         return headers
 
     def _submit_headers_minimal(self, token: str) -> dict:
@@ -325,6 +336,7 @@ class AdobeClient:
                 "accept": "*/*",
             }
         )
+        headers["x-arp-session-id"] = _build_arp_session_id()
         return headers
 
     def _poll_headers(self, token: str) -> dict:
