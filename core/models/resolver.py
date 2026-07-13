@@ -18,10 +18,16 @@ def build_image_usage(prompt: str, output_resolution: str) -> dict:
     """
     it = max(1, len(str(prompt or "")) // 4)
     ot = IMAGE_OUTPUT_TOKENS.get(str(output_resolution or "2K").upper(), 2000)
+    # 同时给出两套命名: chat(prompt/completion) 与 responses/images(input/output),
+    # 并把图像输出 token 放进 output_tokens_details.image_tokens——
+    # 下游网关(sub2api/new-api)图像计费正是从这个字段取 image_output_tokens。
     return {
         "prompt_tokens": it,
         "completion_tokens": ot,
         "total_tokens": it + ot,
+        "input_tokens": it,
+        "output_tokens": ot,
+        "output_tokens_details": {"image_tokens": ot},
         "completion_tokens_details": {"image_tokens": ot},
     }
 
