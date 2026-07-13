@@ -15,6 +15,24 @@ from core.entity_store import entity_store
 from core.models.resolver import build_image_usage
 
 
+def _count_input_images(data: dict) -> int:
+    """数请求里的输入图(图生图/改图),用于计入输入 token。"""
+    n = 0
+    for m in (data.get("messages") or []):
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    n += 1
+    for key in ("image", "images", "image_url"):
+        v = data.get(key)
+        if isinstance(v, list):
+            n += len(v)
+        elif v:
+            n += 1
+    return n
+
+
 def build_generation_router(
     *,
     store,
@@ -299,6 +317,9 @@ def build_generation_router(
                     "created": int(time.time()),
                     "model": resolved_model_id,
                     "data": [{"url": image_url}],
+                    "usage": build_image_usage(
+                        prompt, output_resolution, ratio, _count_input_images(data)
+                    ),
                 }
 
             return run_with_token_retries(
@@ -797,7 +818,9 @@ def build_generation_router(
                             "finish_reason": "stop",
                         }
                     ],
-                    "usage": build_image_usage(prompt, output_resolution),
+                    "usage": build_image_usage(
+                        prompt, output_resolution, ratio, _count_input_images(data)
+                    ),
                 }
                 if bool(data.get("stream", False)):
                     return StreamingResponse(

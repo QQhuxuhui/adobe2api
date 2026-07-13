@@ -7,28 +7,74 @@ from fastapi import HTTPException
 from .catalog import DEFAULT_MODEL_ID, MODEL_CATALOG, SUPPORTED_RATIOS
 
 
-# 图像输出 token 数(按分辨率),用于在响应 usage 里上报,好让下游网关(new-api/sub2api)
-# 按 token 计费。量级对标 OpenAI gpt-image-1 的输出图像 token。可按成本/利润调整。
-IMAGE_OUTPUT_TOKENS = {"1K": 1000, "2K": 2000, "4K": 4200}
+# OpenAI gpt-image-1 官方"输出图像 token"表: [质量档][朝向]。
+# 依据 OpenAI 文档: 1024x1024/1024x1536/1536x1024 在 low/medium/high 下的输出 token。
+# adobe 的分辨率档(1K/2K/4K)映射为 OpenAI 质量档(low/medium/high);
+# aspect_ratio 映射为朝向(方形/竖版/横版)。这样下游看到的 token 与真 gpt-image-1 一致。
+_GPT_IMAGE_OUTPUT_TOKENS = {
+    "low":    {"square": 272,  "portrait": 408,  "landscape": 400},
+    "medium": {"square": 1056, "portrait": 1584, "landscape": 1568},
+    "high":   {"square": 4160, "portrait": 6240, "landscape": 6208},
+}
+_RES_TO_QUALITY = {"1K": "low", "2K": "medium", "4K": "high"}
+# 每张输入图(图生图/改图)的估算 token(gpt-image 输入图约此量级)
+INPUT_IMAGE_TOKENS = 300
 
 
-def build_image_usage(prompt: str, output_resolution: str) -> dict:
-    """构造图像生成的 usage(token 计费用)。
-    prompt_tokens 按提示词粗估(~4 字符/token),completion_tokens 按分辨率给图像输出 token。
+def _orientation_of(ratio: str) -> str:
+    try:
+        w, h = (float(x) for x in str(ratio or "1:1").split(":")[:2])
+        if w <= 0 or h <= 0:
+            return "square"
+        r = w / h
+    except (ValueError, TypeError, ZeroDivisionError):
+        return "square"
+    if r > 1.1:
+        return "landscape"
+    if r < 0.91:
+        return "portrait"
+    return "square"
+
+
+def _count_text_tokens(text: str) -> int:
+    # 粗估但比"字符数/4"准: CJK 字符按 1 token/字, 其余按 ~4 字符/token
+    s = str(text or "")
+    cjk = sum(
+        1 for c in s
+        if "一" <= c <= "鿿" or "぀" <= c <= "ヿ" or "가" <= c <= "힣"
+    )
+    return max(1, cjk + (len(s) - cjk) // 4)
+
+
+def build_image_usage(
+    prompt: str,
+    output_resolution: str,
+    ratio: str = "1:1",
+    input_images: int = 0,
+) -> dict:
+    """按 OpenAI gpt-image-1 口径构造 usage(token 计费用)。
+    输出图像 token = 表[质量档(由分辨率映射)][朝向(由比例映射)];
+    输入 = 提示词 token(CJK 感知) + 输入图 token(图生图/改图)。
+    同时给出 chat(prompt/completion) 与 responses/images(input/output) 两套命名,
+    图像输出 token 放进 output_tokens_details.image_tokens(下游图像计费取此字段)。
     """
-    it = max(1, len(str(prompt or "")) // 4)
-    ot = IMAGE_OUTPUT_TOKENS.get(str(output_resolution or "2K").upper(), 2000)
-    # 同时给出两套命名: chat(prompt/completion) 与 responses/images(input/output),
-    # 并把图像输出 token 放进 output_tokens_details.image_tokens——
-    # 下游网关(sub2api/new-api)图像计费正是从这个字段取 image_output_tokens。
+    quality = _RES_TO_QUALITY.get(str(output_resolution or "2K").upper(), "medium")
+    orient = _orientation_of(ratio)
+    img_out = _GPT_IMAGE_OUTPUT_TOKENS[quality][orient]
+
+    text_in = _count_text_tokens(prompt)
+    img_in = max(0, int(input_images or 0)) * INPUT_IMAGE_TOKENS
+    input_tokens = text_in + img_in
+
     return {
-        "prompt_tokens": it,
-        "completion_tokens": ot,
-        "total_tokens": it + ot,
-        "input_tokens": it,
-        "output_tokens": ot,
-        "output_tokens_details": {"image_tokens": ot},
-        "completion_tokens_details": {"image_tokens": ot},
+        "prompt_tokens": input_tokens,
+        "completion_tokens": img_out,
+        "total_tokens": input_tokens + img_out,
+        "input_tokens": input_tokens,
+        "output_tokens": img_out,
+        "input_tokens_details": {"text_tokens": text_in, "image_tokens": img_in},
+        "output_tokens_details": {"image_tokens": img_out},
+        "completion_tokens_details": {"image_tokens": img_out},
     }
 
 
