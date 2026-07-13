@@ -45,7 +45,8 @@ def resolve_ratio_and_resolution(
     model_conf = MODEL_CATALOG[resolved_model_id]
 
     output_resolution = model_conf["output_resolution"]
-    if not model_id:
+    # 基础模型(dynamic)或未指定模型时: 分辨率由请求的 quality 参数决定(下游传参自适应)
+    if not model_id or model_conf.get("dynamic"):
         quality = str(data.get("quality", "2k")).lower()
         if quality in ("4k", "ultra"):
             output_resolution = "4K"

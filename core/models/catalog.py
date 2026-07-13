@@ -102,6 +102,50 @@ _register_nano_banana_family(
 )
 _register_gpt_image_family()
 
+
+def _register_base_model(
+    model_id: str,
+    *,
+    upstream_model: str,
+    upstream_model_id: str,
+    upstream_model_version: str,
+    label: str,
+) -> None:
+    # 基础模型: 不带分辨率/比例后缀。分辨率由请求 quality(1k/2k/4k) 决定,
+    # 比例由请求 aspect_ratio 或 size 决定(不写死 aspect_ratio → resolver 用请求值)。
+    # 目的: 下游只用一个模型名 + 传参自适应,不必为每个 res×ratio 组合各配一个模型。
+    MODEL_CATALOG[model_id] = {
+        "upstream_model": upstream_model,
+        "upstream_model_id": upstream_model_id,
+        "upstream_model_version": upstream_model_version,
+        "output_resolution": "2K",  # 默认;quality 参数可覆盖为 1K/4K
+        "dynamic": True,
+        "description": f"{label} (动态分辨率/比例,由请求参数决定)",
+    }
+
+
+_register_base_model(
+    "firefly-gpt-image",
+    upstream_model="openai:firefly:gpt-image",
+    upstream_model_id="gpt-image",
+    upstream_model_version="2",
+    label="Firefly GPT Image",
+)
+_register_base_model(
+    "firefly-nano-banana-pro",
+    upstream_model="google:firefly:colligo:nano-banana-pro",
+    upstream_model_id="gemini-flash",
+    upstream_model_version="nano-banana-2",
+    label="Firefly Nano Banana Pro",
+)
+_register_base_model(
+    "firefly-nano-banana2",
+    upstream_model="google:firefly:colligo:nano-banana-pro",
+    upstream_model_id="gemini-flash",
+    upstream_model_version="nano-banana-3",
+    label="Firefly Nano Banana 2",
+)
+
 DEFAULT_MODEL_ID = "firefly-nano-banana-pro-2k-16x9"
 
 VIDEO_MODEL_CATALOG: dict[str, dict] = {
