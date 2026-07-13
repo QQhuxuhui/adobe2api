@@ -146,6 +146,24 @@ _register_base_model(
     label="Firefly Nano Banana 2",
 )
 
+# OpenAI 兼容别名: 上游模型名以 "gpt-image-" 开头(sub2api /v1/images/generations
+# 要求上游模型是 gpt-image-* 才放行)。行为同 firefly-gpt-image(动态 gpt-image)。
+# sub2api 里把 gpt-image-2 映射成 gpt-image-2(恒等)即可同时过校验并被本服务接受。
+_register_base_model(
+    "gpt-image-1",
+    upstream_model="openai:firefly:gpt-image",
+    upstream_model_id="gpt-image",
+    upstream_model_version="2",
+    label="Firefly GPT Image (gpt-image-1 别名)",
+)
+_register_base_model(
+    "gpt-image-2",
+    upstream_model="openai:firefly:gpt-image",
+    upstream_model_id="gpt-image",
+    upstream_model_version="2",
+    label="Firefly GPT Image (gpt-image-2 别名)",
+)
+
 DEFAULT_MODEL_ID = "firefly-nano-banana-pro-2k-16x9"
 
 VIDEO_MODEL_CATALOG: dict[str, dict] = {

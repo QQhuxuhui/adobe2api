@@ -7,6 +7,25 @@ from fastapi import HTTPException
 from .catalog import DEFAULT_MODEL_ID, MODEL_CATALOG, SUPPORTED_RATIOS
 
 
+# 图像输出 token 数(按分辨率),用于在响应 usage 里上报,好让下游网关(new-api/sub2api)
+# 按 token 计费。量级对标 OpenAI gpt-image-1 的输出图像 token。可按成本/利润调整。
+IMAGE_OUTPUT_TOKENS = {"1K": 1000, "2K": 2000, "4K": 4200}
+
+
+def build_image_usage(prompt: str, output_resolution: str) -> dict:
+    """构造图像生成的 usage(token 计费用)。
+    prompt_tokens 按提示词粗估(~4 字符/token),completion_tokens 按分辨率给图像输出 token。
+    """
+    it = max(1, len(str(prompt or "")) // 4)
+    ot = IMAGE_OUTPUT_TOKENS.get(str(output_resolution or "2K").upper(), 2000)
+    return {
+        "prompt_tokens": it,
+        "completion_tokens": ot,
+        "total_tokens": it + ot,
+        "completion_tokens_details": {"image_tokens": ot},
+    }
+
+
 def resolve_model(model_id: Optional[str]) -> dict:
     if not model_id:
         return MODEL_CATALOG[DEFAULT_MODEL_ID]

@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from api.schemas import GenerateRequest
 from core.entity_store import entity_store
+from core.models.resolver import build_image_usage
 
 
 def build_generation_router(
@@ -796,11 +797,7 @@ def build_generation_router(
                             "finish_reason": "stop",
                         }
                     ],
-                    "usage": {
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0,
-                    },
+                    "usage": build_image_usage(prompt, output_resolution),
                 }
                 if bool(data.get("stream", False)):
                     return StreamingResponse(
