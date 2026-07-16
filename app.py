@@ -23,6 +23,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from api.routes.admin import build_admin_router
 from api.routes.entity import build_entity_router
 from api.routes.generation import build_generation_router
+from api.streaming import sse_chat_stream
 
 try:
     from PIL import Image
@@ -1256,46 +1257,6 @@ def _video_ext_from_meta(meta: dict) -> str:
     return "mp4"
 
 
-def _sse_chat_stream(payload: dict):
-    import json
-
-    cid = payload["id"]
-    created = payload["created"]
-    model = payload["model"]
-    content = payload["choices"][0]["message"]["content"]
-
-    first = {
-        "id": cid,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "delta": {"role": "assistant", "content": content},
-                "finish_reason": None,
-            }
-        ],
-    }
-    last = {
-        "id": cid,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop",
-            }
-        ],
-    }
-
-    yield f"data: {json.dumps(first, ensure_ascii=False)}\n\n"
-    yield f"data: {json.dumps(last, ensure_ascii=False)}\n\n"
-    yield "data: [DONE]\n\n"
-
-
 _reconcile_generated_storage(force=True)
 
 
@@ -1338,7 +1299,7 @@ app.include_router(
         prepare_video_source_image=_prepare_video_source_image,
         video_ext_from_meta=_video_ext_from_meta,
         extract_prompt_from_messages=_extract_prompt_from_messages,
-        sse_chat_stream=_sse_chat_stream,
+        sse_chat_stream=sse_chat_stream,
         on_generated_file_written=_on_generated_file_written,
         quota_error_cls=QuotaExhaustedError,
         auth_error_cls=AuthError,
