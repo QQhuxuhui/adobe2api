@@ -209,6 +209,29 @@ def test_proxy_probe_requires_admin_auth(monkeypatch):
     assert session.calls == []
 
 
+def test_unauthenticated_malformed_proxy_request_returns_401_without_echo():
+    response = make_admin_client(authenticated=False).post(
+        "/api/v1/config/test-proxy",
+        json={"proxy": ["https://user:secret@proxy.example"]},
+    )
+
+    assert response.status_code == 401
+    assert "secret" not in response.text
+    assert "proxy.example" not in response.text
+
+
+def test_authenticated_malformed_proxy_request_is_sanitized():
+    response = make_admin_client().post(
+        "/api/v1/config/test-proxy",
+        json={"proxy": ["https://user:secret@proxy.example"]},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid proxy request"}
+    assert "secret" not in response.text
+    assert "proxy.example" not in response.text
+
+
 def test_proxy_test_frontend_contract():
     repo_root = Path(__file__).resolve().parent.parent
     html = (repo_root / "static" / "admin.html").read_text(encoding="utf-8")
@@ -219,8 +242,9 @@ def test_proxy_test_frontend_contract():
     assert 'id="proxyTestResult"' in html
     assert 'role="status"' in html
     assert 'aria-live="polite"' in html
-    assert '/static/admin.js?v=20260717-4' in html
-    assert 'confProxy.addEventListener("input", clearProxyTestResult)' in script
+    assert '/static/admin.js?v=20260717-6' in html
+    assert 'confProxy.addEventListener("input", invalidateProxyTestResult)' in script
+    assert "proxyTestGate.invalidate();" in script
     assert 'fetch("/api/v1/config/test-proxy"' in script
     assert "PROXY_TEST_ERROR_MESSAGES" in script
     assert 'testProxyBtn.textContent = "测试中..."' in script

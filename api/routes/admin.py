@@ -6,7 +6,7 @@ from typing import Any, Callable, List
 from urllib.parse import urlparse
 
 import requests
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 from starlette.responses import RedirectResponse
 
@@ -68,6 +68,14 @@ def build_admin_router(
 
     def proxy_latency_ms(started_at: float) -> int:
         return max(0, round((time.perf_counter() - started_at) * 1000))
+
+    async def parse_proxy_test_request(request: Request) -> ProxyTestRequest:
+        require_admin_auth(request)
+        try:
+            payload = await request.json()
+            return ProxyTestRequest.model_validate(payload)
+        except Exception:
+            raise HTTPException(status_code=422, detail="invalid proxy request")
 
     def delete_token_and_linked_profile(token_id: str) -> bool:
         token_info = token_manager.get_by_id(token_id)
@@ -448,8 +456,9 @@ def build_admin_router(
         }
 
     @router.post("/api/v1/config/test-proxy")
-    def test_proxy(req: ProxyTestRequest, request: Request):
-        require_admin_auth(request)
+    def test_proxy(
+        req: ProxyTestRequest = Depends(parse_proxy_test_request),
+    ):
         proxy = validate_proxy_url(req.proxy)
         via = "proxy" if proxy else "direct"
         proxies = {"http": proxy, "https": proxy} if proxy else None

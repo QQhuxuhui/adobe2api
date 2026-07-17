@@ -97,6 +97,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     resolveTokenFilter,
   } = window.AdminTokenFilters;
   const {
+    createLatestRequestGate,
+    fetchTokenList,
+    retainSelectedTokenIds,
+    runLatestRequest,
+    updateInputValue,
+  } = window.AdminUiState;
+  const {
     parseCookieFilesToItems,
     toCookieBatchItems,
   } = window.AdminCookieImport;
@@ -107,6 +114,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   let tokenCurrentPage = 1;
   let tokenTotalPages = 1;
   let tokenFilter = null;
+  const tokenLoadGate = createLatestRequestGate();
 
   const STATUS_MAP = {
     "active": "生效中",
@@ -117,21 +125,23 @@ document.addEventListener("DOMContentLoaded", async () => {
   };
 
   async function loadTokens() {
-    try {
-      const res = await fetch("/api/v1/tokens");
-      const data = await res.json();
-      const tokens = Array.isArray(data?.tokens)
-        ? data.tokens
-        : Array.isArray(data?.items)
-          ? data.items
-          : [];
-      renderTable(tokens, data?.summary || null);
-    } catch (err) {
-      console.error(err);
-      renderTokenSummary([]);
-      renderTokenPagination(0);
-      tbody.innerHTML = `<tr><td colspan="9" class="empty-state" style="color: var(--critical);">加载失败</td></tr>`;
-    }
+    return runLatestRequest(
+      tokenLoadGate,
+      () => fetchTokenList(fetch),
+      {
+        onSuccess: ({ tokens, summary }) => renderTable(tokens, summary),
+        onFailure: (err) => {
+          console.error(err);
+          latestTokens = [];
+          tokenSelectedIds.clear();
+          tokenCurrentPage = 1;
+          renderTokenSummary([]);
+          renderTokenPagination(0);
+          tbody.innerHTML = `<tr><td colspan="9" class="empty-state" style="color: var(--critical);">加载失败</td></tr>`;
+          syncTokenSelectAllState();
+        },
+      },
+    );
   }
 
   function getCurrentPageTokens(tokens = getFilteredTokens(latestTokens, tokenFilter)) {
@@ -362,12 +372,15 @@ document.addEventListener("DOMContentLoaded", async () => {
     latestTokens = Array.isArray(tokens) ? tokens : [];
     renderTokenSummary(latestTokens, summary);
     syncTokenFilterCards();
-    const availableIds = new Set(latestTokens.map((t) => String(t.id || "")).filter(Boolean));
-    Array.from(tokenSelectedIds).forEach((id) => {
-      if (!availableIds.has(id)) tokenSelectedIds.delete(id);
-    });
 
     const filteredTokens = getFilteredTokens(latestTokens, tokenFilter);
+    const retainedSelectedIds = new Set(
+      retainSelectedTokenIds(tokenSelectedIds, filteredTokens),
+    );
+    Array.from(tokenSelectedIds).forEach((id) => {
+      if (!retainedSelectedIds.has(id)) tokenSelectedIds.delete(id);
+    });
+
     renderTokenPagination(filteredTokens.length);
     const pageTokens = getCurrentPageTokens(filteredTokens);
 
@@ -500,8 +513,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   refreshBtn.addEventListener("click", async () => {
     showToast("Token 列表刷新中...", false, { duration: 0 });
     try {
-      await loadTokens();
-      showToast("Token 列表已刷新", false);
+      const loadResult = await loadTokens();
+      if (loadResult.status === "success") {
+        showToast("Token 列表已刷新", false);
+      } else if (loadResult.status === "failure") {
+        showToast("Token 列表刷新失败", true);
+      }
     } catch (err) {
       showToast("Token 列表刷新失败", true);
     }
@@ -900,11 +917,17 @@ document.addEventListener("DOMContentLoaded", async () => {
     connection_error: "目标连接失败",
     request_error: "网络请求失败",
   };
+  const proxyTestGate = createLatestRequestGate();
 
   function clearProxyTestResult() {
     if (!proxyTestResult) return;
     proxyTestResult.textContent = "";
     proxyTestResult.classList.remove("is-success", "is-error");
+  }
+
+  function invalidateProxyTestResult() {
+    proxyTestGate.invalidate();
+    clearProxyTestResult();
   }
 
   function showProxyTestResult(text, isError) {
@@ -966,11 +989,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   if (confProxy) {
-    confProxy.addEventListener("input", clearProxyTestResult);
+    confProxy.addEventListener("input", invalidateProxyTestResult);
   }
 
   if (testProxyBtn) {
     testProxyBtn.addEventListener("click", async () => {
+      const requestVersion = proxyTestGate.begin();
       const originalText = testProxyBtn.textContent || "测试连通性";
       testProxyBtn.disabled = true;
       testProxyBtn.setAttribute("aria-busy", "true");
@@ -983,6 +1007,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           body: JSON.stringify({ proxy: String(confProxy?.value || "").trim() }),
         });
         const data = await res.json();
+        if (!proxyTestGate.isCurrent(requestVersion)) return;
         if (!res.ok) {
           const detail = typeof data.detail === "string" ? data.detail : "代理地址无效";
           throw new Error(detail);
@@ -1001,6 +1026,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         const message = PROXY_TEST_ERROR_MESSAGES[data.error] || "连接失败";
         showProxyTestResult(`${message}（${latency}ms）`, true);
       } catch (err) {
+        if (!proxyTestGate.isCurrent(requestVersion)) return;
         showProxyTestResult(err.message || "代理测试失败", true);
       } finally {
         testProxyBtn.disabled = false;
@@ -1020,7 +1046,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         confAdminPassword.value = data.admin_password || "admin";
         confPublicBaseUrl.value = data.public_base_url || "";
         confUseProxy.checked = data.use_proxy || false;
-        confProxy.value = data.proxy || "";
+        updateInputValue(confProxy, data.proxy || "", invalidateProxyTestResult);
         confGenerateTimeout.value = Number(data.generate_timeout || 300);
         confGptImageQuality.value = String(data.gpt_image_quality || "low");
         confRetryEnabled.checked = Boolean(data.retry_enabled ?? true);
