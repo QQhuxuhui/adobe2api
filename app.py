@@ -22,6 +22,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from api.routes.admin import build_admin_router
 from api.routes.entity import build_entity_router
+from api.routes.gemini_native import build_gemini_native_router
 from api.routes.generation import build_generation_router
 from api.streaming import sse_chat_stream
 
@@ -159,6 +160,46 @@ def _extract_logging_fields(raw_body: bytes) -> dict[str, Optional[str]]:
         return {"model": None, "prompt_preview": None}
 
 
+def _resolve_request_operation(method: str, path: str) -> str:
+    normalized_method = str(method or "").upper()
+    if path == "/v1/chat/completions":
+        return "chat.completions"
+    if path == "/v1/images/generations":
+        return "images.generations"
+    if path == "/api/v1/generate":
+        return "api.generate"
+    if path == "/v1/entities" and normalized_method == "POST":
+        return "entities.create"
+    if path == "/v1beta/models" and normalized_method == "GET":
+        return "gemini.models.list"
+
+    prefix = "/v1beta/models/"
+    if not path.startswith(prefix):
+        return ""
+    tail = path[len(prefix):]
+    if normalized_method == "GET" and tail and ":" not in tail:
+        return "gemini.models.get"
+    if normalized_method != "POST":
+        return ""
+    model, separator, action = tail.rpartition(":")
+    if not separator or not model:
+        return ""
+    return {
+        "generateContent": "gemini.generateContent",
+        "streamGenerateContent": "gemini.streamGenerateContent",
+        "countTokens": "gemini.countTokens",
+    }.get(action, "")
+
+
+def _gemini_model_from_path(path: str) -> Optional[str]:
+    prefix = "/v1beta/models/"
+    if not path.startswith(prefix):
+        return None
+    tail = path[len(prefix):]
+    model = tail.rpartition(":")[0] if ":" in tail else tail
+    return model or None
+
+
 def _upsert_live_request(request: Request, patch: dict) -> None:
     try:
         log_id = str(getattr(request.state, "log_id", "") or "").strip()
@@ -167,6 +208,26 @@ def _upsert_live_request(request: Request, patch: dict) -> None:
         live_log_store.upsert(log_id, patch)
     except Exception:
         pass
+
+
+def _set_request_logging_fields(
+    request: Request,
+    model: Optional[str],
+    prompt: Optional[str],
+) -> None:
+    normalized_prompt = (
+        str(prompt or "").replace("\r", " ").replace("\n", " ").strip()
+    )
+    request.state.log_model = str(model or "").strip() or None
+    request.state.log_prompt_preview = normalized_prompt[:180] or None
+    _upsert_live_request(
+        request,
+        {
+            "model": request.state.log_model,
+            "prompt_preview": request.state.log_prompt_preview,
+            "ts": time.time(),
+        },
+    )
 
 
 def _set_request_preview(request: Request, url: str, kind: str = "image") -> None:
@@ -212,13 +273,10 @@ def _set_request_error_detail(
         if trace_text and trace_text.strip() == "NoneType: None":
             trace_text = None
 
-    op_map = {
-        "/v1/chat/completions": "chat.completions",
-        "/v1/images/generations": "images.generations",
-        "/api/v1/generate": "api.generate",
-    }
     path = str(getattr(getattr(request, "url", None), "path", "") or "")
-    operation = op_map.get(path, "")
+    operation = _resolve_request_operation(
+        str(getattr(request, "method", "") or ""), path
+    )
 
     record = ErrorDetailRecord(
         code=code,
@@ -429,28 +487,28 @@ async def request_logger(request: Request, call_next):
     error_text = None
     status_code = 500
 
-    op_map = {
-        "/v1/chat/completions": "chat.completions",
-        "/v1/images/generations": "images.generations",
-        "/v1/entities": "entities.create" if method == "POST" else "",
-    }
-    operation = op_map.get(path, "")
+    operation = _resolve_request_operation(method, path)
     should_log = bool(operation)
+    is_gemini = path == "/v1beta/models" or path.startswith("/v1beta/models/")
 
-    if method in {"POST", "PUT", "PATCH"} and should_log:
+    if should_log:
+        request.state.log_id = uuid.uuid4().hex[:12]
+        if is_gemini:
+            request.state.log_model = _gemini_model_from_path(path)
         try:
-            raw_body = await request.body()
-            request._body = raw_body
-            if path in {
-                "/v1/images/generations",
-                "/v1/chat/completions",
-                "/v1/entities",
-                "/api/v1/generate",
-            }:
+            if method in {"POST", "PUT", "PATCH"} and not is_gemini:
+                raw_body = await request.body()
+                request._body = raw_body
                 body_meta = _extract_logging_fields(raw_body)
                 request.state.log_model = body_meta.get("model")
                 request.state.log_prompt_preview = body_meta.get("prompt_preview")
-            request.state.log_id = uuid.uuid4().hex[:12]
+
+            body_meta = {
+                "model": getattr(request.state, "log_model", None),
+                "prompt_preview": getattr(
+                    request.state, "log_prompt_preview", None
+                ),
+            }
             log_id = str(getattr(request.state, "log_id", "") or "")
             if log_id:
                 live_log_store.upsert(
@@ -539,6 +597,12 @@ async def request_logger(request: Request, call_next):
                 )
                 token_source = getattr(request.state, "log_token_source", None)
                 token_attempt = getattr(request.state, "log_token_attempt", None)
+                final_model = getattr(request.state, "log_model", None) or body_meta.get(
+                    "model"
+                )
+                final_prompt = getattr(
+                    request.state, "log_prompt_preview", None
+                ) or body_meta.get("prompt_preview")
                 log_id = (
                     str(getattr(request.state, "log_id", "") or "")
                     or uuid.uuid4().hex[:12]
@@ -556,8 +620,8 @@ async def request_logger(request: Request, call_next):
                             operation=operation,
                             preview_url=preview_url,
                             preview_kind=preview_kind,
-                            model=body_meta.get("model"),
-                            prompt_preview=body_meta.get("prompt_preview"),
+                            model=final_model,
+                            prompt_preview=final_prompt,
                             error=error_final,
                             error_code=error_code,
                             task_status=task_status,
@@ -572,6 +636,7 @@ async def request_logger(request: Request, call_next):
                         )
                     ),
                 )
+            live_log_store.remove(log_id)
     return response
 
 
@@ -602,6 +667,8 @@ def _run_with_token_retries(
     run_once: Callable[[str], Any],
     set_request_error_detail: Optional[Callable[..., str]] = None,
     token_selector: Optional[Callable[[], Optional[str]]] = None,
+    reraise_domain: bool = False,
+    deadline: Optional[float] = None,
 ) -> Any:
     max_attempts = client.retry_max_attempts if client.retry_enabled else 1
     max_attempts = max(1, int(max_attempts))
@@ -609,13 +676,31 @@ def _run_with_token_retries(
     report_error = set_request_error_detail or _set_request_error_detail
     attempt = 0
     limited_retry_attempts = 0
-    tried_tokens: set[str] = set()
+    # Dedupe by account identity, not token value: an auto-refresh account whose
+    # cookie refresh succeeds gets a *new* token value, so keying on the raw value
+    # would let the same account be retried forever. profile_id is stable across
+    # refreshes; manual tokens fall back to their value.
+    tried_identities: set[str] = set()
+
+    def _identity_of(token_value: str) -> str:
+        meta = token_manager.get_meta_by_value(token_value)
+        return str(meta.get("refresh_profile_id") or "").strip() or token_value
+
+    def _ensure_deadline() -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise UpstreamTemporaryError(
+                "Gemini native request deadline exceeded",
+                status_code=503,
+                error_type="timeout",
+            )
 
     while True:
+        _ensure_deadline()
         attempt += 1
         token = ""
         fetch_attempts = 0
         while not token:
+            _ensure_deadline()
             fetch_attempts += 1
             candidate = (
                 token_selector()
@@ -625,14 +710,14 @@ def _run_with_token_retries(
             candidate = str(candidate or "").strip()
             if not candidate:
                 break
-            if candidate not in tried_tokens:
+            if _identity_of(candidate) not in tried_identities:
                 token = candidate
                 break
-            if fetch_attempts >= max(1, len(tried_tokens) + 1):
+            if fetch_attempts >= max(1, len(tried_identities) + 1):
                 break
         if not token:
             break
-        tried_tokens.add(token)
+        tried_identities.add(_identity_of(token))
         token_meta = _set_request_token_context(request, token, attempt)
         attempt_started = time.time()
         retryable = False
@@ -641,6 +726,7 @@ def _run_with_token_retries(
         retry_error_text = ""
 
         try:
+            _ensure_deadline()
             result = run_once(token)
             token_manager.report_success(token)
             _append_attempt_log(
@@ -779,6 +865,8 @@ def _run_with_token_retries(
                 error_code=err_code,
                 task_status_override="FAILED",
             )
+            if reraise_domain:
+                raise
             raise HTTPException(status_code=status_code, detail=detail)
         except HTTPException as exc:
             err_code = report_error(
@@ -840,11 +928,23 @@ def _run_with_token_retries(
                 error=retry_error_text or f"retry attempt {attempt}: {retry_reason}",
             )
             if delay > 0:
-                time.sleep(delay)
+                sleep_for = delay
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        _ensure_deadline()
+                    sleep_for = min(sleep_for, remaining)
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                _ensure_deadline()
             continue
         break
 
     if last_exc is not None:
+        if reraise_domain and isinstance(
+            last_exc, (AuthError, QuotaExhaustedError, UpstreamTemporaryError)
+        ):
+            raise last_exc
         if isinstance(last_exc, AuthError):
             raise HTTPException(
                 status_code=401, detail="All available tokens are invalid or expired"
@@ -860,6 +960,12 @@ def _run_with_token_retries(
                 detail="Upstream is temporarily unavailable. Please retry later.",
             )
         raise last_exc
+    if reraise_domain:
+        raise UpstreamTemporaryError(
+            "No active tokens available in the pool",
+            status_code=503,
+            error_type="upstream_unavailable",
+        )
     raise HTTPException(
         status_code=503, detail="No active tokens available in the pool"
     )
@@ -1304,6 +1410,26 @@ app.include_router(
         quota_error_cls=QuotaExhaustedError,
         auth_error_cls=AuthError,
         upstream_temp_error_cls=UpstreamTemporaryError,
+        logger=logger,
+    )
+)
+
+app.include_router(
+    build_gemini_native_router(
+        config_manager=config_manager,
+        client=client,
+        generated_dir=GENERATED_DIR,
+        run_with_token_retries=_run_with_token_retries,
+        set_request_error_detail=_set_request_error_detail,
+        set_request_task_progress=_set_request_task_progress,
+        set_request_logging_fields=_set_request_logging_fields,
+        set_request_preview=_set_request_preview,
+        public_image_url=_public_image_url,
+        on_generated_file_written=_on_generated_file_written,
+        quota_error_cls=QuotaExhaustedError,
+        auth_error_cls=AuthError,
+        upstream_temp_error_cls=UpstreamTemporaryError,
+        adobe_error_cls=AdobeRequestError,
         logger=logger,
     )
 )

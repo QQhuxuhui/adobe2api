@@ -6,6 +6,7 @@
   "proxy": "",
   "use_proxy": false,
   "generate_timeout": 300,
+  "gemini_native_deadline_seconds": 500,
   "refresh_interval_hours": 15,
   "retry_enabled": true,
   "retry_max_attempts": 3,

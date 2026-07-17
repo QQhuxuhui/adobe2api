@@ -4,11 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>管理登录 - Adobe2API</title>
-  <link rel="stylesheet" href="/static/admin.css" />
+  <link rel="stylesheet" href="/static/admin.css?v=20260713-1" />
 </head>
 <body>
-  <div class="bg-orb bg-orb-a"></div>
-  <div class="bg-orb bg-orb-b"></div>
 
   <main class="shell" style="max-width: 520px;">
     <section class="card" style="padding: 26px;">
@@ -41,7 +39,7 @@
 
       function showMsg(text, isError) {
         loginMsg.textContent = text;
-        loginMsg.style.color = isError ? "#ffb4bc" : "#4de2c4";
+        loginMsg.style.color = isError ? "var(--critical)" : "var(--good)";
       }
 
       async function checkAlreadyLogin() {

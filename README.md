@@ -20,6 +20,15 @@ English README: `README_EN.md`
 - Token 池管理（手动 Token + 自动刷新 Token）
 - 管理后台 Web UI：Token / 配置 / 日志 / 刷新配置导入
 
+## 更新记录
+
+### 2026-07-13（镜像 `v9`，界面 `20260713-2`）
+
+- **认证失败自动标记与恢复**：自动刷新账号连续刷新失败达到阈值后自动标记为「已失效」并停止参与轮询，修复了失效账号仍显示「生效中」、以及 401 反复重试甚至死循环的问题。阈值可在「系统配置 → 刷新与存储」中配置（默认 3 次）；下次刷新成功会自动恢复，也可在 Token 列表手动「启用」恢复。
+- **管理后台界面重构**：改为白色 SaaS 风格；Token 积分改用进度条 + 数字展示，表格上方新增账号总数 / 生效中 / 无积分账号 / 异常账号统计卡，以及积分总量与可用余额的横向柱状图。
+- **账号邮箱去重**：导入 Cookie 时按邮箱去重（同邮箱更新原账号而非新增）；工具栏新增「邮箱去重」按钮，可对既有账号按邮箱合并，保留最近导入的一个。
+- **账号导入时间**：Token 列表展示每个自动刷新账号的导入时间。
+
 ## 1）部署方式
 
 ### A. 本地开发/运行
@@ -365,6 +374,92 @@ curl -X POST "http://127.0.0.1:6001/v1/images/generations" \
     "prompt": "futuristic city skyline at dusk"
   }'
 ```
+
+### 3.5 Gemini 原生接口
+
+该入口用于接入 sub2api 的 Gemini APIKey 账号类型，与现有 OpenAI 兼容接口共用 Adobe Token 池、重试和生成文件存储。
+
+支持的端点：
+
+- `GET /v1beta/models`
+- `GET /v1beta/models/{model}`
+- `POST /v1beta/models/{model}:generateContent`
+- `POST /v1beta/models/{model}:streamGenerateContent?alt=sse`
+- `POST /v1beta/models/{model}:countTokens`
+
+鉴权使用 `X-Goog-Api-Key: <api_key>` 或查询参数 `?key=<api_key>`，值仍来自 `config/config.json` 的 `api_key`。
+
+图像模型映射：
+
+| Gemini 模型 | Adobe 上游 | usage 画像 |
+|---|---|---|
+| `gemini-3-pro-image` | `gemini-flash` / `nano-banana-2` | pro |
+| `gemini-3-pro-image-preview` | `gemini-flash` / `nano-banana-2` | pro |
+| `gemini-3.1-flash-image` | `gemini-flash` / `nano-banana-3` | flash |
+| `gemini-3.1-flash-image-preview` | `gemini-flash` / `nano-banana-3` | flash |
+
+测活文本模型 `gemini-2.0-flash`、`gemini-2.5-flash`、`gemini-3-pro-preview`、`gemini-3.1-pro-preview` 返回固定短文本 `ok`，不调用 Adobe，且不接受输入图。
+
+请求约束：
+
+- `generationConfig.imageConfig.aspectRatio` 默认 `1:1`；pro 支持 `1:1`、`16:9`、`9:16`、`4:3`、`3:4`，flash 额外支持 `1:8`、`1:4`、`4:1`、`8:1`
+- `generationConfig.imageConfig.imageSize` 默认 `1K`，支持 `1K` / `2K` / `4K`
+- `generationConfig.candidateCount` 只能省略或设为 `1`
+- 请求体最大 48 MiB；最多使用前 6 张 inlineData 图片；单图解码后最大 10 MiB；图片总量最大 30 MiB
+- 不支持 OAuth / Code Assist 包裹、`fileData`、`0.5K` 和多候选
+
+模型列表：
+
+```bash
+curl "http://127.0.0.1:6001/v1beta/models" \
+  -H "X-Goog-Api-Key: <service_api_key>"
+```
+
+本地 token 估算：
+
+```bash
+curl -X POST "http://127.0.0.1:6001/v1beta/models/gemini-3-pro-image:countTokens?key=<service_api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [{"parts": [{"text": "a detailed mountain landscape"}]}]
+  }'
+```
+
+非流式生成：
+
+```bash
+curl -X POST "http://127.0.0.1:6001/v1beta/models/gemini-3-pro-image:generateContent" \
+  -H "X-Goog-Api-Key: <service_api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [{"parts": [{"text": "a detailed mountain landscape"}]}],
+    "generationConfig": {
+      "imageConfig": {"aspectRatio": "16:9", "imageSize": "2K"},
+      "candidateCount": 1
+    }
+  }'
+```
+
+流式测活或生成：
+
+```bash
+curl -N -X POST "http://127.0.0.1:6001/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse" \
+  -H "X-Goog-Api-Key: <service_api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{"contents": [{"parts": [{"text": "ping"}]}]}'
+```
+
+流式接口会在生成全部完成后输出一个完整 `data:` 事件，不发送 keepalive 或 `[DONE]`。非流式接口把 PNG base64 放入 JSON，因此部署 sub2api 时必须同时满足：
+
+```yaml
+gateway:
+  response_header_timeout: 560s
+  upstream_response_read_max_bytes: 134217728
+```
+
+- adobe2api 的 `gemini_native_deadline_seconds` 默认是 `500`，必须保证 sub2api 的实际 `response_header_timeout >= gemini_native_deadline_seconds + 60s`
+- `upstream_response_read_max_bytes` 必须至少为 128 MiB；默认 8 MiB 会截断较大的 2K / 4K 非流式响应
+- 修改 deadline 后要同步提高 response header timeout，并在真实 sub2api 链路执行一次 base64 至少 8 MiB 的 4K 非流式 smoke test
 
 ## 4）Cookie 导入
 

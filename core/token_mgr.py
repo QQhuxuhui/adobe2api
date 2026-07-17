@@ -330,7 +330,9 @@ class TokenManager:
                     t["error_until"] = 0
             self.save()
 
-    def handle_auth_failure(self, value: str) -> Dict:
+    def handle_auth_failure(
+        self, value: str, *, refresh_credits: bool = True
+    ) -> Dict:
         token_value = str(value or "").strip()
         linked_profile_id = ""
         linked_auto_refresh = False
@@ -355,12 +357,27 @@ class TokenManager:
         try:
             from core.refresh_mgr import refresh_manager
 
-            refresh_result = refresh_manager.refresh_once(linked_profile_id)
+            refresh_result = refresh_manager.refresh_once(
+                linked_profile_id,
+                refresh_credits=refresh_credits,
+            )
         except Exception as exc:
-            self.report_error(token_value)
+            fails_now = self.report_error(token_value)
+            threshold = self._auth_failure_threshold()
+            if fails_now >= threshold:
+                self.report_invalid(token_value)
+                return {
+                    "status": "invalid",
+                    "message": (
+                        f"auto refresh failed {fails_now} times "
+                        f"(threshold {threshold}): {exc}"
+                    ),
+                    "http_status": 401,
+                    "profile_id": linked_profile_id,
+                }
             return {
                 "status": "retry",
-                "message": f"auto refresh failed: {exc}",
+                "message": f"auto refresh failed ({fails_now}/{threshold}): {exc}",
                 "http_status": None,
                 "profile_id": linked_profile_id,
             }
@@ -373,13 +390,29 @@ class TokenManager:
             "result": refresh_result,
         }
 
-    def report_error(self, value: str):
+    @staticmethod
+    def _auth_failure_threshold() -> int:
+        from core.config_mgr import config_manager
+
+        raw = config_manager.get("auth_failure_threshold", 3)
+        try:
+            threshold = int(str(raw).strip())
+        except Exception:
+            return 3
+        if threshold < 1:
+            return 1
+        return threshold
+
+    def report_error(self, value: str) -> int:
+        fails_now = 0
         with self._lock:
             for t in self.tokens:
                 if t["value"] == value:
                     t["fails"] += 1
                     t["updated_at"] = time.time()
+                    fails_now = int(t["fails"])
             self.save()
+        return fails_now
 
     def report_success(self, value: str):
         with self._lock:

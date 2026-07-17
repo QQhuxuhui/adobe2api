@@ -7,16 +7,13 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;700;800&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/admin.css?v=20260302-4" />
+  <link rel="stylesheet" href="/static/admin.css?v=20260717-1" />
 </head>
 <body>
-  <div class="bg-orb bg-orb-a"></div>
-  <div class="bg-orb bg-orb-b"></div>
-
   <main class="shell">
-    <header class="header card" style="text-align: center; padding-bottom: 16px;">
-      <h1 style="font-size: 24px; font-weight: 800; letter-spacing: 0.05em;">Adobe2API</h1>
-      <p class="muted" style="margin-top: 4px;">Firefly 图像生成 API 中转服务</p>
+    <header class="header card">
+      <h1>Adobe2API</h1>
+      <p class="muted">Firefly 图像生成 API 中转服务</p>
     </header>
 
     <div class="tabs">
@@ -43,18 +40,66 @@
               <button id="exportTokensBtn" class="secondary">导出 Token</button>
               <button id="exportCookiesBtn" class="secondary">导出 Cookie</button>
               <button id="deleteTokensBatchBtn" class="danger">批量删除</button>
+              <button id="dedupeByEmailBtn" class="secondary">邮箱去重</button>
               <button id="refreshCreditsBatchBtn" class="secondary">批量刷新积分</button>
               <button id="refreshBtn" class="secondary">刷新列表</button>
             </div>
-            <div id="tokenCreditsSummary" class="token-credits-summary">
-              可用积分总量：<strong id="tokenAvailableCreditsTotal">-</strong>
-            </div>
           </div>
         </div>
-        <div id="tokenSummary" class="token-summary">
-          <span>Token 总数：<strong id="tokenTotalCount">0</strong></span>
-          <span>当前生效：<strong id="tokenActiveCount">0</strong></span>
+
+        <div class="token-overview">
+          <div class="token-stat-grid">
+            <button class="stat-card" type="button" data-token-filter="" aria-pressed="true">
+              <span class="stat-label">账号总数</span>
+              <span id="tokenTotalCount" class="stat-value">0</span>
+              <span id="tokenAutoRefreshFoot" class="stat-foot">自动刷新 -</span>
+            </button>
+            <button class="stat-card" type="button" data-token-filter="active" aria-pressed="false">
+              <span class="stat-label">生效中</span>
+              <span id="tokenActiveCount" class="stat-value">0</span>
+              <span id="tokenActiveFoot" class="stat-foot">占比 -</span>
+            </button>
+            <button class="stat-card" type="button" data-token-filter="zero_credit" aria-pressed="false">
+              <span class="stat-label">无积分账号</span>
+              <span id="tokenZeroCreditCount" class="stat-value">0</span>
+              <span id="tokenZeroCreditFoot" class="stat-foot">余额为 0</span>
+            </button>
+            <button class="stat-card" type="button" data-token-filter="broken" aria-pressed="false">
+              <span class="stat-label">异常账号</span>
+              <span id="tokenBrokenCount" class="stat-value">0</span>
+              <span id="tokenBrokenFoot" class="stat-foot">失效 / 过期 / 积分异常</span>
+            </button>
+          </div>
+
+          <figure class="credits-chart" id="creditsChart">
+            <div class="credits-chart-head">
+              <span class="credits-chart-title">积分总量与可用余额</span>
+              <span id="creditsChartSub" class="credits-chart-sub">-</span>
+            </div>
+            <div class="credits-bars">
+              <div class="credits-bar-row is-total">
+                <span class="credits-bar-name">总量</span>
+                <div class="credits-bar-track">
+                  <div id="creditsTotalBar" class="credits-bar-fill" style="width: 0%;"></div>
+                </div>
+                <span id="creditsTotalValue" class="credits-bar-value">-</span>
+              </div>
+              <div class="credits-bar-row">
+                <span class="credits-bar-name">余额</span>
+                <div class="credits-bar-track">
+                  <div id="creditsAvailableBar" class="credits-bar-fill" style="width: 0%;"></div>
+                </div>
+                <span id="creditsAvailableValue" class="credits-bar-value">-</span>
+              </div>
+            </div>
+            <figcaption class="credits-chart-foot">
+              <span class="legend-key"><span class="legend-swatch total"></span>总量</span>
+              <span class="legend-key"><span class="legend-swatch available"></span>可用余额</span>
+              <span id="creditsChartNote"></span>
+            </figcaption>
+          </figure>
         </div>
+
         <div class="table-wrapper">
           <table id="tokenTable">
             <thead>
@@ -134,7 +179,11 @@
 
             <div class="form-group">
               <label for="confProxy">代理服务器地址 (Proxy URL)</label>
-              <input type="text" id="confProxy" class="input-text" placeholder="例如：http://127.0.0.1:7890" />
+              <div class="proxy-test-row">
+                <input type="text" id="confProxy" class="input-text" placeholder="例如：http://127.0.0.1:7890" />
+                <button id="testProxyBtn" class="secondary" type="button">测试连通性</button>
+              </div>
+              <p id="proxyTestResult" class="msg proxy-test-result" role="status" aria-live="polite"></p>
             </div>
 
             <div class="form-group">
@@ -365,6 +414,7 @@
 
   <div id="appToast" class="toast" role="status" aria-live="polite"></div>
 
-  <script src="/static/admin.js?v=20260302-7"></script>
+  <script src="/static/admin_token_filters.js?v=20260717-1"></script>
+  <script src="/static/admin.js?v=20260717-3"></script>
 </body>
 </html>

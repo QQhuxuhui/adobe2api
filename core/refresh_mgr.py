@@ -17,6 +17,12 @@ CONFIG_DIR = BASE_DIR / "config"
 PROFILE_FILE = CONFIG_DIR / "refresh_profile.json"
 
 
+class CreditsAuthError(RuntimeError):
+    def __init__(self, message: str, *, status_code: int):
+        super().__init__(message)
+        self.status_code = int(status_code)
+
+
 class RefreshManager:
     DEFAULT_REFRESH_URL = "https://adobeid-na1.services.adobe.com/ims/check/v6/token?jslVersion=v2-v0.48.0-1-g1e322cb"
     DEFAULT_SCOPE = "AdobeID,firefly_api,openid"
@@ -204,6 +210,7 @@ class RefreshManager:
             "name": profile.get("name"),
             "enabled": bool(profile.get("enabled", True)),
             "imported_at": profile.get("imported_at"),
+            "imported_at_text": self._format_ts(profile.get("imported_at")),
             "endpoint": {
                 "url": endpoint.get("url", ""),
                 "client_id": form.get("client_id", ""),
@@ -322,6 +329,16 @@ class RefreshManager:
             "updated_at": int(time.time()),
         }
 
+    def _find_profile_by_email_locked(self, email_value: str) -> Optional[Dict]:
+        normalized = self._normalize_email(email_value)
+        if not normalized:
+            return None
+        for p in self._profiles:
+            account = p.get("account") if isinstance(p.get("account"), dict) else {}
+            if self._normalize_email(account.get("email")) == normalized:
+                return p
+        return None
+
     def import_cookie(self, cookie_input, name: Optional[str] = None) -> Dict:
         cookie = self._cookie_string_from_input(cookie_input)
         if not cookie:
@@ -386,9 +403,104 @@ class RefreshManager:
         }
 
         with self._lock:
+            existing = self._find_profile_by_email_locked(account.get("email"))
+            if existing is not None:
+                existing["enabled"] = True
+                existing["imported_at"] = now_ts
+                existing["endpoint"] = validated["endpoint"]
+                if firefly_headers:
+                    existing["firefly_headers"] = firefly_headers
+                current_account = (
+                    existing.get("account")
+                    if isinstance(existing.get("account"), dict)
+                    else {}
+                )
+                existing["account"] = {
+                    "display_name": str(
+                        account.get("display_name")
+                        or current_account.get("display_name")
+                        or ""
+                    ).strip(),
+                    "email": str(
+                        account.get("email") or current_account.get("email") or ""
+                    ).strip(),
+                    "user_id": str(current_account.get("user_id") or "").strip(),
+                    "source": str(account.get("source") or "").strip(),
+                    "updated_at": account.get("updated_at"),
+                }
+                existing["state"] = dict(new_profile["state"])
+                self._save_profiles()
+                summary = self._summary_locked(existing)
+                summary["import_action"] = "updated"
+                return summary
+
             self._profiles.append(new_profile)
             self._save_profiles()
-            return self._summary_locked(new_profile)
+            summary = self._summary_locked(new_profile)
+            summary["import_action"] = "created"
+            return summary
+
+    def dedupe_by_email(self) -> Dict:
+        removed: List[Dict] = []
+        with self._lock:
+            groups: Dict[str, List[Dict]] = {}
+            for p in self._profiles:
+                account = (
+                    p.get("account") if isinstance(p.get("account"), dict) else {}
+                )
+                email = self._normalize_email(account.get("email"))
+                if not email:
+                    continue
+                groups.setdefault(email, []).append(p)
+
+            remove_ids = set()
+            for email, plist in groups.items():
+                if len(plist) < 2:
+                    continue
+                keep = max(
+                    enumerate(plist),
+                    key=lambda x: (int(x[1].get("imported_at") or 0), x[0]),
+                )[1]
+                for p in plist:
+                    if p is keep:
+                        continue
+                    pid = str(p.get("id") or "").strip()
+                    remove_ids.add(pid)
+                    removed.append(
+                        {
+                            "id": pid,
+                            "name": str(p.get("name") or "").strip(),
+                            "email": email,
+                            "kept_id": str(keep.get("id") or "").strip(),
+                        }
+                    )
+
+            if remove_ids:
+                self._profiles = [
+                    p
+                    for p in self._profiles
+                    if str(p.get("id") or "").strip() not in remove_ids
+                ]
+                self._save_profiles()
+
+        for item in removed:
+            token_manager.remove_auto_refresh_by_profile(item["id"])
+
+        return {"removed_count": len(removed), "removed": removed}
+
+    def get_profile_import_info(self, profile_id: str) -> Dict:
+        pid = str(profile_id or "").strip()
+        if not pid:
+            return {}
+        with self._lock:
+            target = self._find_profile_locked(pid)
+            if not target:
+                return {}
+            imported_at = target.get("imported_at")
+        return {
+            "imported_at": imported_at,
+            "imported_at_text": self._format_ts(imported_at),
+        }
 
     def export_cookies(self, ids: Optional[List[str]] = None) -> List[Dict]:
         selected_ids = None
@@ -607,6 +719,11 @@ class RefreshManager:
             timeout=20,
             proxies=self._requests_proxies(),
         )
+        if resp.status_code in {401, 403}:
+            raise CreditsAuthError(
+                f"credits request failed: {resp.status_code}",
+                status_code=resp.status_code,
+            )
         if resp.status_code != 200:
             raise RuntimeError(f"credits request failed: {resp.status_code}")
         try:
@@ -623,13 +740,43 @@ class RefreshManager:
             "updated_at": int(time.time()),
         }
 
-    def refresh_credits_for_token_id(self, token_id: str) -> Dict:
+    def refresh_credits_for_token_id(
+        self, token_id: str, handle_auth: bool = False
+    ) -> Dict:
         token_info = token_manager.get_by_id(token_id)
         if not token_info:
             raise KeyError("token not found")
+
         token_value = str(token_info.get("value") or "").strip()
         account_id = self._extract_account_id(token_value)
-        credits = self._fetch_credits_balance(token_value, account_id)
+        try:
+            credits = self._fetch_credits_balance(token_value, account_id)
+        except CreditsAuthError as exc:
+            if not handle_auth:
+                raise
+
+            auth_result = token_manager.handle_auth_failure(
+                token_value,
+                refresh_credits=False,
+            )
+            auth_status = str(auth_result.get("status") or "").strip().lower()
+            if auth_status != "refreshed":
+                message = str(auth_result.get("message") or str(exc)).strip()
+                raise CreditsAuthError(
+                    message,
+                    status_code=exc.status_code,
+                ) from exc
+
+            refreshed_info = token_manager.get_by_id(token_id)
+            if not refreshed_info:
+                raise KeyError("token not found")
+            refreshed_value = str(refreshed_info.get("value") or "").strip()
+            refreshed_account_id = self._extract_account_id(refreshed_value)
+            credits = self._fetch_credits_balance(
+                refreshed_value,
+                refreshed_account_id,
+            )
+
         token_manager.set_credits(token_id, credits)
         return {
             "token_id": token_id,
@@ -668,7 +815,7 @@ class RefreshManager:
                 target["name"] = display_name or email
             self._save_profiles()
 
-    def refresh_once(self, profile_id: str) -> Dict:
+    def refresh_once(self, profile_id: str, *, refresh_credits: bool = True) -> Dict:
         snapshot = self._prepare_refresh(profile_id)
         resp = requests.post(
             snapshot["url"],
@@ -728,7 +875,7 @@ class RefreshManager:
 
         credits_error = ""
         token_id = str(token_record.get("id") or "").strip()
-        if token_id:
+        if refresh_credits and token_id:
             try:
                 self.refresh_credits_for_token_id(token_id)
             except Exception as exc:

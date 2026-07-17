@@ -1,6 +1,6 @@
 from typing import Any, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
 
 class GenerateRequest(BaseModel):
@@ -26,6 +26,10 @@ class TokenCreditsBatchRefreshRequest(BaseModel):
     ids: Optional[List[str]] = None
 
 
+class ProxyTestRequest(BaseModel):
+    proxy: str = ""
+
+
 class ConfigUpdateRequest(BaseModel):
     api_key: Optional[str] = None
     admin_username: Optional[str] = None
@@ -34,6 +38,7 @@ class ConfigUpdateRequest(BaseModel):
     proxy: Optional[str] = None
     use_proxy: Optional[bool] = None
     generate_timeout: Optional[int] = None
+    gemini_native_deadline_seconds: Optional[StrictInt] = None
     refresh_interval_hours: Optional[int] = None
     retry_enabled: Optional[bool] = None
     retry_max_attempts: Optional[int] = None

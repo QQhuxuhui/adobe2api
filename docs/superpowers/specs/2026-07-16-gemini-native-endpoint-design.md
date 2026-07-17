@@ -1,10 +1,11 @@
 # adobe2api Gemini 原生协议入口（接入 sub2api gemini 类账号）
 
 日期：2026-07-16
-状态：设计已确认（v4，经三轮内部复审修正）。累计修正：SSE 先生成后开流、
+状态：设计已确认（v5，经四轮内部复审修正）。累计修正：SSE 先生成后开流、
 contents 全量扁平化、比例族独立白名单、错误码 reraise_domain 适配、测活白名单、
 usage 精确公式（pro/flash 结构分离）、输入图限额、绝对 deadline 透传封顶、
-base64 大响应部署前置、落盘读回、JSON 结构校验、测活模型拒图、FastAPI 术语。
+base64 大响应部署前置、落盘读回、JSON 结构校验、测活模型拒图、FastAPI 术语、
+解析前请求体限流、深层 part 类型校验、重试退避 deadline、Gemini 请求日志接入。
 
 ## 背景
 
@@ -40,8 +41,9 @@ OpenAI 协议，接不进这个池子。本设计给 adobe2api 加一个 Gemini 
 
 FastAPI 路径段含冒号：用单段参数捕获后按 `:` 拆分 model 与 action。
 **请求体不用 `data: dict` 声明**（否则 FastAPI 在进适配层前就返回默认 422
-`{"detail":...}`）——改用 `body = await request.json()` 手动解析，
-`JSONDecodeError` → 400 INVALID_ARGUMENT（复审 #3）。
+`{"detail":...}`）。也不直接用 `await request.json()`：它会先无界读取整个 body。
+改用下文的有限流式读取器取得 raw bytes，再 `json.loads(raw_body)`；
+`JSONDecodeError` / `UnicodeDecodeError` → 400 INVALID_ARGUMENT。
 
 鉴权：`x-goog-api-key` 头或 `?key=` 查询参数，校验 `config.api_key`。
 
@@ -52,7 +54,7 @@ QuotaExhausted/Auth/UpstreamTemporary 吞成内部 `last_exc` 并重试，最终
 HTTP 503/401 的 FastAPI `{"detail":...}` HTTPException——**路由拿不到原始领域异常，
 无法区分「配额尽(429)」与「临时错误(503)」**，且错误结构不符 Gemini 合同。
 
-实现选择（复审 #1，三选一中取最小改动 + 单一重试实现）：
+实现选择（复审 #1，采用最小改动并保持单一重试实现）：
 
 - **给 `_run_with_token_retries` 加 `reraise_domain: bool = False` 参数**：
   为 True 时，在函数末尾**重新抛出原始 `last_exc`**（QuotaExhaustedError /
@@ -111,9 +113,24 @@ TEST_TEXT_MODELS = {
 
 ## 请求解析（复审 #2、#5）
 
+### 解析前请求体限流（复审 #1）
+
+Gemini POST 入口定义 `GEMINI_NATIVE_MAX_BODY_BYTES = 48 MiB`。该值可容纳本设计最多
+30 MiB 解码后图片（base64 约 40 MiB）及 JSON/prompt 开销，同时避免攻击者让服务先
+分配数百 MiB 再拒绝：
+
+1. `Content-Length` 存在且大于 48 MiB 时立即返回 400 INVALID_ARGUMENT；
+2. 不信任或缺失 `Content-Length`，继续通过 `request.stream()` 累计读取；一旦累计值
+   超限立即停止并返回 400；
+3. 只在有限读取完成后执行 `json.loads(raw_body)`，不得先调用 `request.body()` 或
+   `request.json()`。
+
+若接入请求日志中间件，中间件也不得在此限流器之前无界读取 Gemini body；具体见
+「可观测性接入」。
+
 ### 结构与类型校验（复审 #5，在取字段前做，全部 400 INVALID_ARGUMENT）
 
-`body = await request.json()` 可能抛 `JSONDecodeError`（坏 JSON）或
+有限读取完成后，`json.loads(raw_body)` 可能抛 `JSONDecodeError`（坏 JSON）或
 `UnicodeDecodeError`（非法 UTF-8）→ 400。解析成功后逐层校验，不可直接 `.get()`
 （否则数组/字符串体会在 `.get()` 处变 500）：
 
@@ -122,6 +139,9 @@ TEST_TEXT_MODELS = {
 - 每个 content 必须是 object，其 `parts` 必须是数组；
 - `systemInstruction`（若有）必须是 object，其 `parts` 为数组；
 - `generationConfig`/`imageConfig`（若有）必须是 object。
+- 每个 `parts[]` 元素必须是 object；若含 `text`，值必须是字符串；若含
+  `inlineData`/`inline_data`，容器必须是 object，且 `data`、`mimeType` 必须是非空字符串。
+  未识别但结构合法的 part（如 `fileData`/functionCall）按本设计的 YAGNI 规则忽略。
 
 任一不满足 → 400 Google 错误。测试覆盖 `[]`、`null`、`contents` 为字符串/对象、
 `parts` 非数组、非法 UTF-8 字节。
@@ -141,6 +161,8 @@ Adobe `client.generate` 只接受单 prompt 字符串 + 若干输入图，因此
   缺省 `1:1`；非白名单值 400。
 - `imageConfig.imageSize`：`1K`/`2K`/`4K`（大小写不敏感）；缺省 `1K`（Google 官方
   默认）；其它值（含 `0.5K`，Adobe 无此档）400。
+- `generationConfig.candidateCount`：缺省或 `1`；其它值 400。入口只产一个候选，不能
+  静默忽略客户端请求的多候选语义。
 
 ### 输入图资源限制（复审 #4、#7）
 
@@ -148,8 +170,10 @@ Adobe `client.generate` 只接受单 prompt 字符串 + 若干输入图，因此
   **不复用** `_normalize_image_mime`（该函数会把未知 MIME 静默改成 jpeg，
   见 `app.py:955`）；校验通过后再调它做 jpg→jpeg 归一化。不改动这个公共函数，
   以免影响现有 OpenAI 路径。
-- 严格 base64 解码（`validate=True`），失败 400；
-- 单图 ≤ 10MB（沿用 `app.py` 现值）；单请求输入图总量 ≤ 30MB，超出 400；
+- 严格 base64 解码（`validate=True`），失败 400；解码前先按编码长度预检：单图
+  `data` 字符数不得超过 `4 * ceil(10 MiB / 3)`，超出直接 400，避免先解码超大字符串；
+- 单图 ≤ 10 MiB（沿用 `app.py` 的 `10 * 1024 * 1024`）；单请求输入图总量 ≤ 30 MiB，
+  超出 400；
 - 最多 6 张（超出部分忽略，不报错，与 OpenAI 路径一致）。
 
 解码/校验（纯本地、无网络）在进入重试循环前做一次；**上传** `client.upload_image`
@@ -183,7 +207,7 @@ Adobe `client.generate` 只接受单 prompt 字符串 + 若干输入图，因此
 
 ```
 images = 解码+校验输入图(body)            # 一次，纯本地，无网络；失败前置 400（见输入图限额）
-deadline = now() + GEMINI_NATIVE_DEADLINE
+deadline = monotonic() + gemini_native_deadline_seconds
 def run_once(token):
     source_ids = [client.upload_image(token, b, mime, deadline=deadline)  # 每 token 重传
                   for b, mime in images]
@@ -194,13 +218,13 @@ def run_once(token):
         client.generate(token=..., source_image_ids=source_ids,
                         out_path=out_path, deadline=deadline)   # 返回 None,已落盘
         img_bytes = out_path.read_bytes()                       # 读回用于 base64
-    except BaseException:
+    except Exception:
         out_path.unlink(missing_ok=True)                        # 失败清理残留
         raise
     new_size = out_path.stat().st_size
     on_generated_file_written(out_path, old_size, new_size)     # 存储统计 + 触发清理
     return 组装 Gemini 响应(img_bytes, 模型名, usage)
-result = run_with_token_retries(run_once=run_once, reraise_domain=True)
+result = run_with_token_retries(run_once=run_once, reraise_domain=True, deadline=deadline)
 ```
 
 上传**在 run_once 内**：Adobe 图片 ID 与账号上下文相关，重试换 token 必须用新 token
@@ -216,15 +240,21 @@ sub2api 默认 `gateway.response_header_timeout = 600s`；而 adobe2api 底层 H
 
 方案：**绝对 deadline 透传**。
 
-- Gemini 入口设总截止预算 `GEMINI_NATIVE_DEADLINE`（默认 500s，< 600s 留裕量），
-  在进入重试循环前算出绝对时刻 `deadline`；
+- Gemini 入口新增配置 `gemini_native_deadline_seconds`（默认 500s），写入
+  `core/config_mgr.py` 与 `config/config.example.json`；使用 `time.monotonic()` 在进入重试
+  循环前算出绝对时刻 `deadline`；配置必须为正数。部署时必须满足
+  `gemini_native_deadline_seconds + 60s <= sub2api 实际 gateway.response_header_timeout`，
+  预留文件读回、base64/JSON 组装和调度裕量，不能只假设对方保持默认 600s；
 - 给 `client.upload_image` / `client.generate` 及其底层 `_get/_post_json/_post_bytes/
   _download_to_file` 增加**可选 `deadline` 参数**（默认 None = 现状，OpenAI/视频路径
-  不受影响）；每次网络调用实际 timeout = `min(该调用固定超时, deadline - now())`；
-  `deadline` 已过 → 直接抛 `UpstreamTemporaryError`；
+  不受影响）；curl session 路径同样使用计算后的 timeout。每次网络调用实际
+  `timeout = min(该调用固定超时, deadline - monotonic())`；`deadline` 已过 → 直接抛
+  `UpstreamTemporaryError`；
 - `generate` 轮询超时（现抛 `AdobeRequestError`）在超预算场景**显式转
   `UpstreamTemporaryError`**，以映射 503（而非落到通用 500）；
-- 重试循环每次尝试前检查 remaining，不足最小起步量则停止 → 503。
+- `_run_with_token_retries` 同时增加可选 `deadline`：每次取 token/开始尝试前检查
+  remaining；重试退避改为 `sleep(min(delay, remaining))`，睡眠后再次检查；预算耗尽
+  重新抛 `UpstreamTemporaryError` → 503。默认 `deadline=None` 时现有路径行为不变。
 
 此约束对流式/非流式都适用（都是先生成后响应）。
 
@@ -249,9 +279,11 @@ sub2api 默认 `gateway.response_header_timeout = 600s`；而 adobe2api 底层 H
 **部署前置条件（复审 #2）**：非流式响应把整张图 base64 编进 JSON；sub2api 非流式
 走 `ReadUpstreamResponseBody`，受 `gateway.upstream_response_read_max_bytes` 限制
 （部署样例仅 **8 MiB**，`deploy/config.example.yaml:160`）。2K/4K PNG 的 base64
-很容易超 8 MiB → 被截断/报错。**必须**在 sub2api 侧把该值调到覆盖最大图（建议
-≥ 64 MiB）。流式路径逐行读、不受此总体上限约束，是大图更稳的选择。文档与 E2E
-须包含一个大响应（≥8 MiB base64）用例。
+很容易超 8 MiB → 被截断/报错。**必须**在 sub2api 侧把该值调到至少 **128 MiB**：
+fork 源码已估算单张 4K PNG 最坏约 67 MiB base64，再加 JSON 包装后 64 MiB 仍不足。
+流式路径逐行读、不受此总体上限约束，是大图更稳的选择。部署说明必须同时列出
+`response_header_timeout >= gemini_native_deadline_seconds + 60s` 与此 128 MiB 要求；
+真实链路至少做一次经 sub2api 的大响应 smoke test，而不只测 adobe2api 进程内响应。
 
 流式（`alt=sse`，复审 #1）：采用**先生成再开流**。Adobe 生图是一次性阻塞调用
 （非逐 token），所以：
@@ -268,7 +300,9 @@ sub2api 默认 `gateway.response_header_timeout = 600s`；而 adobe2api 底层 H
 与 sub2api 零改动冲突（其流式分支不识别流内 error 对象，仍返回成功 ForwardResult）。
 
 **权衡（已确认接受）**：生成期间连接无字节下发，极端慢生成有代理空闲超时风险；
-由上面的总超时预算（<600s）兜底，保证在 sub2api 断连前返回。
+由上面的总超时预算兜底；仅当部署满足
+`gemini_native_deadline_seconds + 60s <= 实际 response_header_timeout` 时，才能为
+响应组装留出裕量并在 sub2api 的响应头超时前返回。
 
 countTokens：`{"totalTokens": <文本 estimate + 输入图 token>,
 "promptTokensDetails":[{TEXT},{IMAGE?}]}`，按下方公式，遍历全部 contents，不打 Adobe。
@@ -333,11 +367,25 @@ IMAGE=1680 → text=411，且 **无 thoughts、无 serviceTier、`trafficType:"O
 
 见「错误码适配层」表。要点：所有失败都在 **SSE 开流前** 决定（先生成再开流），
 因此永远能返回正确 HTTP 状态 + Google 错误结构；不存在「流内 error」路径。
-Token 配额尽→429，上游临时错误/超预算→503，参数/JSON/结构/无文本→400，
+Token 配额尽→429，上游临时错误/超预算→503，参数/JSON/结构/无文本且无图片→400，
 未知 model/action→404，鉴权→401，其它→500。
 
 注：`generate` 超时/网络类现抛 `UpstreamTemporaryError`（→503）；轮询超预算路径
 显式转 `UpstreamTemporaryError`；纯 `AdobeRequestError`（如 job failed）→500 INTERNAL。
+
+## 可观测性接入
+
+现有 `request_logger` 和 `_set_request_error_detail` 的 `op_map` 只识别固定 OpenAI 路径，
+动态 `/v1beta/models/...` 默认不会进入管理后台日志。实现时增加 Gemini 路径识别：
+
+- 根据 method + action 记录 `gemini.generateContent`、`gemini.streamGenerateContent`、
+  `gemini.countTokens`、`gemini.models.list/get`；
+- model 从 URL 路径取得，prompt preview 从已完成限流与结构校验的 `contents` 扁平结果取得；
+- 日志中间件对 Gemini 路径**不得先调用 `request.body()`**。由路由的有限读取器设置
+  `request._body` 以及 `request.state.log_model/log_prompt_preview`，middleware 在响应收尾
+  时从 state 读取；这样日志功能不会绕过 48 MiB 限制；
+- 罐头测活、countTokens、解析失败和上游重试都应有 operation/status 记录，但日志不得
+  保存 inlineData/base64 原文。
 
 ## 测试
 
@@ -353,10 +401,14 @@ Token 配额尽→429，上游临时错误/超预算→503，参数/JSON/结构/
   total 自洽；输入图 pro 560、flash 1120 每张；罐头 usage 确定值；
 - 空文本+仅输入图（#7）：text_in=0，promptTokensDetails 不含 TEXT 或为空；
 - JSON 结构/类型校验（#5）：顶层 `[]`/`null`/字符串 → 400；`contents` 缺失/空/非数组
-  → 400；`content`/`parts` 类型错 → 400；非法 UTF-8 字节 → 400；
+  → 400；`content`/`parts` 类型错 → 400；`parts[]` 元素非 object、`text`/inlineData
+  子字段类型错 → 400；非法 UTF-8 字节 → 400；
+- 请求体限流（#1）：伪造超大 `Content-Length` 与 chunked/无长度实际超 48 MiB 均在
+  JSON 解析前 → 400；单图 base64 编码长度超界时不调用 `b64decode`；
 - 比例白名单（#3）：pro 允许 5 个、flash 允许 9 个；给 pro 传 `1:8` → 400；
   给某族传其白名单外比例 → 400（不回退 16:9）；默认 1:1；
 - imageSize：默认 1K；`0.5K`/非法 → 400；
+- candidateCount：缺省/1 正常，`>1` 或其它非法值 → 400，不静默降为单候选；
 - 落盘（#3）：generate 传 out_path 返回 None → 从文件读回 bytes 做 base64；
   失败删残留；`on_generated_file_written` 被调用；
 - 罐头文本（#4）：`CANNED_TEXT="ok"`、candidatesTokenCount=1、totalTokenCount 自洽；
@@ -368,16 +420,21 @@ Token 配额尽→429，上游临时错误/超预算→503，参数/JSON/结构/
 - 重试重传（#6）：桩第一个 token 的 upload/generate 失败，断言换 token 后
   `upload_image` 被再次调用（重传），不是循环外只上传一次；
 - 总超时（#1/#5）：桩慢上传/慢 submit/慢生成（不止桩 generate），断言 deadline
-  透传后各调用 timeout=min(固定,remaining)、预算耗尽停止重试并 503、总耗时 < 预算；
-- 输入图限额（#4/#7）：>10MB 单图→400、总量>30MB→400、非白名单 MIME→400
-  （且未污染公共 `_normalize_image_mime`）、坏 base64→400。
+  透传后各调用 timeout=min(固定,remaining)、curl session 同样受限、重试 sleep 不越界、
+  预算耗尽停止重试并 503、总耗时不超过预算（允许极小调度误差）；
+- 输入图限额（#4/#7）：>10 MiB 单图→400、总量>30 MiB→400、非白名单 MIME→400
+  （且未污染公共 `_normalize_image_mime`）、坏 base64→400；
+- 共享路径回归：`reraise_domain=False` 与 `deadline=None` 时，现有 OpenAI 401/503、
+  固定网络超时、重试/Token 标记/落盘行为不变；
+- 可观测性：动态 Gemini 路径 operation/model/prompt preview 正确，罐头/countTokens/失败
+  均记日志，且日志与错误详情不含 inlineData/base64。
 
 in-process E2E（打桩 `client.generate`/`upload_image`，桩落盘写真实文件）：
 
 - 非流式成功：结构完整、`modelVersion` 回显、base64 可解码、usageMetadata 自洽、
   临时文件被 `on_generated_file_written` 记账；
-- 大响应（#2）：桩生成一张 base64 ≥ 8 MiB 的图，断言非流式响应体完整返回
-  （提醒：真实链路需 sub2api `upstream_response_read_max_bytes` ≥ 该值）；
+- 大响应（#2）：进程内桩生成一张 base64 ≥ 8 MiB 的图，断言非流式响应体完整；另在
+  部署 smoke test 中经 sub2api 转发同一请求，确认配置为 128 MiB 后不被截断；
 - 流式成功（#1）：先生成后开流，输出单个完整 `data:` chunk、无 keepalive、无 [DONE]；
 - 流式失败（#1）：桩 generate 抛 UpstreamTemporaryError → 返回 **HTTP 503 + Google 错误**，
   未进入 SSE（Content-Type 非 event-stream）；
@@ -386,5 +443,5 @@ in-process E2E（打桩 `client.generate`/`upload_image`，桩落盘写真实文
 ## 不做（YAGNI）
 
 - OAuth/Code Assist 包裹格式（用户只用 APIKey 账号型）；
-- `0.5K` 尺寸档；`fileData`（URL 引用）输入图；多候选 `candidateCount>1`；
+- `0.5K` 尺寸档；`fileData`（URL 引用）输入图；多候选（`candidateCount>1` 明确返回 400）；
 - sub2api 侧任何改动。

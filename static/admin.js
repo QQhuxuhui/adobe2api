@@ -64,6 +64,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const exportTokensBtn = document.getElementById("exportTokensBtn");
   const exportCookiesBtn = document.getElementById("exportCookiesBtn");
   const deleteTokensBatchBtn = document.getElementById("deleteTokensBatchBtn");
+  const dedupeByEmailBtn = document.getElementById("dedupeByEmailBtn");
   const refreshModal = document.getElementById("refreshModal");
   const refreshModalCloseBtn = document.getElementById("refreshModalCloseBtn");
   const refreshBtn = document.getElementById("refreshBtn");
@@ -72,17 +73,36 @@ document.addEventListener("DOMContentLoaded", async () => {
   const tbody = document.querySelector("#tokenTable tbody");
   const tokenTotalCount = document.getElementById("tokenTotalCount");
   const tokenActiveCount = document.getElementById("tokenActiveCount");
-  const tokenAvailableCreditsTotal = document.getElementById("tokenAvailableCreditsTotal");
+  const tokenZeroCreditCount = document.getElementById("tokenZeroCreditCount");
+  const tokenBrokenCount = document.getElementById("tokenBrokenCount");
+  const tokenAutoRefreshFoot = document.getElementById("tokenAutoRefreshFoot");
+  const tokenActiveFoot = document.getElementById("tokenActiveFoot");
+  const tokenZeroCreditFoot = document.getElementById("tokenZeroCreditFoot");
+  const tokenBrokenFoot = document.getElementById("tokenBrokenFoot");
+  const creditsChartSub = document.getElementById("creditsChartSub");
+  const creditsChartNote = document.getElementById("creditsChartNote");
+  const creditsTotalBar = document.getElementById("creditsTotalBar");
+  const creditsAvailableBar = document.getElementById("creditsAvailableBar");
+  const creditsTotalValue = document.getElementById("creditsTotalValue");
+  const creditsAvailableValue = document.getElementById("creditsAvailableValue");
   const tokenPagination = document.getElementById("tokenPagination");
   const tokenPrevBtn = document.getElementById("tokenPrevBtn");
   const tokenNextBtn = document.getElementById("tokenNextBtn");
   const tokenPageInfo = document.getElementById("tokenPageInfo");
+  const tokenFilterCards = document.querySelectorAll("[data-token-filter]");
+  const {
+    getFilteredTokens,
+    hasKnownCredits,
+    matchesTokenFilter,
+    resolveTokenFilter,
+  } = window.AdminTokenFilters;
   const tokenSelectedIds = new Set();
   let logsAutoTimer = null;
   let latestTokens = [];
   const TOKENS_PAGE_SIZE = 20;
   let tokenCurrentPage = 1;
   let tokenTotalPages = 1;
+  let tokenFilter = null;
 
   const STATUS_MAP = {
     "active": "生效中",
@@ -106,11 +126,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       console.error(err);
       renderTokenSummary([]);
       renderTokenPagination(0);
-      tbody.innerHTML = `<tr><td colspan="9" class="empty-state" style="color: #ffb4bc;">加载失败</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="9" class="empty-state" style="color: var(--critical);">加载失败</td></tr>`;
     }
   }
 
-  function getCurrentPageTokens(tokens = latestTokens) {
+  function getCurrentPageTokens(tokens = getFilteredTokens(latestTokens, tokenFilter)) {
     const list = Array.isArray(tokens) ? tokens : [];
     const start = (tokenCurrentPage - 1) * TOKENS_PAGE_SIZE;
     return list.slice(start, start + TOKENS_PAGE_SIZE);
@@ -118,21 +138,87 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   function renderTokenSummary(tokens, summary = null) {
     const list = Array.isArray(tokens) ? tokens : [];
-    const fallbackTotal = list.length;
-    const fallbackActive = list.filter((t) => String(t?.status || "").toLowerCase() === "active").length;
-    const fallbackCreditsTotal = list.reduce((sum, token) => {
-      const available = Number(token?.credits_available);
-      return Number.isFinite(available) ? sum + available : sum;
-    }, 0);
-    const total = Number.isFinite(Number(summary?.total)) ? Number(summary.total) : fallbackTotal;
-    const active = Number.isFinite(Number(summary?.active)) ? Number(summary.active) : fallbackActive;
-    const creditsTotal = Number.isFinite(Number(summary?.credits_available_total))
-      ? Number(summary.credits_available_total)
-      : fallbackCreditsTotal;
+    const total = list.length;
+    const active = list.filter((token) => matchesTokenFilter(token, "active")).length;
+
+    let creditsTotalSum = 0;
+    let creditsAvailableSum = 0;
+    let zeroCredit = 0;
+    let unknownCredit = 0;
+    let broken = 0;
+    let autoRefresh = 0;
+
+    list.forEach((token) => {
+      const available = token?.credits_available;
+      const capacity = token?.credits_total;
+      if (hasKnownCredits(capacity)) creditsTotalSum += Number(capacity);
+      if (hasKnownCredits(available)) {
+        creditsAvailableSum += Number(available);
+      } else {
+        unknownCredit += 1;
+      }
+      if (matchesTokenFilter(token, "zero_credit")) zeroCredit += 1;
+      if (matchesTokenFilter(token, "broken")) broken += 1;
+      if (token?.auto_refresh) autoRefresh += 1;
+    });
+
+    const summaryAvailable = Number(summary?.credits_available_total);
+    if (Number.isFinite(summaryAvailable)) creditsAvailableSum = summaryAvailable;
+
     if (tokenTotalCount) tokenTotalCount.textContent = String(total);
     if (tokenActiveCount) tokenActiveCount.textContent = String(active);
-    if (tokenAvailableCreditsTotal) {
-      tokenAvailableCreditsTotal.textContent = formatCreditsTotal(creditsTotal);
+    if (tokenZeroCreditCount) {
+      tokenZeroCreditCount.textContent = String(zeroCredit);
+      tokenZeroCreditCount.classList.toggle("is-critical", zeroCredit > 0);
+    }
+    if (tokenBrokenCount) {
+      tokenBrokenCount.textContent = String(broken);
+      tokenBrokenCount.classList.toggle("is-critical", broken > 0);
+    }
+
+    if (tokenAutoRefreshFoot) {
+      tokenAutoRefreshFoot.textContent = `自动刷新 ${autoRefresh} 个`;
+    }
+    if (tokenActiveFoot) {
+      const pct = total > 0 ? Math.round((active / total) * 100) : 0;
+      tokenActiveFoot.textContent = total > 0 ? `占账号总数 ${pct}%` : "暂无账号";
+    }
+    if (tokenZeroCreditFoot) {
+      tokenZeroCreditFoot.textContent = unknownCredit > 0
+        ? `余额为 0，另有 ${unknownCredit} 个未获取`
+        : "余额为 0";
+    }
+    if (tokenBrokenFoot) {
+      tokenBrokenFoot.textContent = "失效 / 过期 / 积分异常";
+    }
+
+    renderCreditsChart(creditsTotalSum, creditsAvailableSum, unknownCredit);
+  }
+
+  function renderCreditsChart(totalCredits, availableCredits, unknownCount = 0) {
+    const capacity = Math.max(0, Number(totalCredits) || 0);
+    const available = Math.max(0, Math.min(Number(availableCredits) || 0, capacity || Infinity));
+    const used = Math.max(0, capacity - available);
+    // Both bars share one scale: the total is the 100% reference, the balance is measured against it.
+    const availablePct = capacity > 0 ? (available / capacity) * 100 : 0;
+
+    if (creditsTotalBar) creditsTotalBar.style.width = capacity > 0 ? "100%" : "0%";
+    if (creditsAvailableBar) {
+      creditsAvailableBar.style.width = `${availablePct}%`;
+    }
+    if (creditsTotalValue) {
+      creditsTotalValue.textContent = capacity > 0 ? formatCreditsTotal(capacity) : "-";
+    }
+    if (creditsAvailableValue) {
+      creditsAvailableValue.textContent = capacity > 0 ? formatCreditsTotal(available) : "-";
+    }
+    if (creditsChartSub) {
+      creditsChartSub.textContent = capacity > 0
+        ? `已用 ${formatCreditsTotal(used)}（${Math.round((used / capacity) * 100)}%）`
+        : "暂无积分数据";
+    }
+    if (creditsChartNote) {
+      creditsChartNote.textContent = unknownCount > 0 ? `${unknownCount} 个账号积分未获取` : "";
     }
   }
 
@@ -158,6 +244,36 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (tokenNextBtn) tokenNextBtn.disabled = tokenCurrentPage >= tokenTotalPages;
     if (tokenPagination) tokenPagination.style.display = total > TOKENS_PAGE_SIZE ? "flex" : "none";
   }
+
+  function syncTokenFilterCards() {
+    tokenFilterCards.forEach((card) => {
+      const cardFilter = String(card.dataset.tokenFilter || "") || null;
+      const isActive = cardFilter === tokenFilter;
+      card.classList.toggle("is-active", isActive);
+      card.setAttribute("aria-pressed", isActive ? "true" : "false");
+    });
+  }
+
+  function setTokenFilter(requestedFilter) {
+    const nextFilter = resolveTokenFilter(tokenFilter, requestedFilter);
+    if (nextFilter === tokenFilter) {
+      syncTokenFilterCards();
+      return;
+    }
+
+    tokenFilter = nextFilter;
+    tokenCurrentPage = 1;
+    tokenSelectedIds.clear();
+    syncTokenFilterCards();
+    renderTable(latestTokens, null);
+  }
+
+  tokenFilterCards.forEach((card) => {
+    card.addEventListener("click", () => {
+      const requestedFilter = String(card.dataset.tokenFilter || "") || null;
+      setTokenFilter(requestedFilter);
+    });
+  });
 
   function syncTokenSelectAllState() {
     if (!tokenSelectAll) return;
@@ -187,7 +303,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   function formatExpiry(token) {
     if (!token || token.expires_at == null) {
-      return '<span style="color:#7f96ad;">未知</span>';
+      return '<span class="expiry-sub">未知</span>';
     }
     const remain = Number(token.remaining_seconds || 0);
     const abs = Math.abs(remain);
@@ -195,13 +311,12 @@ document.addEventListener("DOMContentLoaded", async () => {
     const hours = Math.floor((abs % 86400) / 3600);
     const mins = Math.floor((abs % 3600) / 60);
     const rel = days > 0 ? `${days}天${hours}小时` : `${hours}小时${mins}分`;
+    const stampSafe = escapeHtml(token.expires_at_text || "-");
     if (remain <= 0 || token.is_expired) {
-      return `<span style="color:#ffb4bc;">已过期 (${token.expires_at_text || '-'})</span>`;
+      return `<span class="expiry-gone">已过期</span><br><span class="expiry-sub">${stampSafe}</span>`;
     }
-    if (remain < 3600 * 6) {
-      return `<span style="color:#ffca58;">剩余 ${rel}<br><span style="color:#7f96ad;">${token.expires_at_text || '-'}</span></span>`;
-    }
-    return `<span style="color:#a8bfd8;">剩余 ${rel}<br><span style="color:#7f96ad;">${token.expires_at_text || '-'}</span></span>`;
+    const cls = remain < 3600 * 6 ? "expiry-soon" : "expiry-ok";
+    return `<span class="${cls}">剩余 ${rel}</span><br><span class="expiry-sub">${stampSafe}</span>`;
   }
 
   function formatCredits(token) {
@@ -211,29 +326,55 @@ document.addEventListener("DOMContentLoaded", async () => {
     const err = String(token?.credits_error || "").trim();
 
     if (err) {
-      return `<span style="color:#ffb4bc;">刷新失败</span><br><span style="color:#7f96ad;">${escapeHtml(err)}</span>`;
+      return `<div class="credit-meter-error">刷新失败</div><div class="credit-meter-foot">${escapeHtml(truncateText(err, 40))}</div>`;
     }
-    if (!Number.isFinite(available) || !Number.isFinite(total)) {
-      return `<span style="color:#7f96ad;">未获取</span>`;
+    if (!Number.isFinite(available) || !Number.isFinite(total) || total <= 0) {
+      return `<span class="credit-meter-empty">未获取</span>`;
     }
 
-    const resetText = availableUntil ? new Date(availableUntil).toLocaleString() : "-";
-    return `<span style="color:#a8bfd8;">${available} / ${total}</span><br><span style="color:#7f96ad;">重置 ${resetText}</span>`;
+    const safeAvailable = Math.max(0, Math.min(available, total));
+    const pct = (safeAvailable / total) * 100;
+    // Meter fill carries severity; the track is a lighter step of the same ramp.
+    const severity = safeAvailable <= 0 ? "is-critical" : pct <= 20 ? "is-warning" : "";
+    const resetText = availableUntil
+      ? new Date(availableUntil).toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" })
+      : "";
+
+    return `
+      <div class="credit-meter">
+        <div class="credit-meter-head">
+          <span class="credit-meter-value">${formatCreditsTotal(safeAvailable)} / ${formatCreditsTotal(total)}</span>
+          <span class="credit-meter-pct">${Math.round(pct)}%</span>
+        </div>
+        <div class="credit-meter-track ${severity}">
+          <div class="credit-meter-fill ${severity}" style="width: ${pct}%;"></div>
+        </div>
+        ${resetText ? `<div class="credit-meter-foot">重置 ${escapeHtml(resetText)}</div>` : ""}
+      </div>
+    `;
   }
 
   function renderTable(tokens, summary = null) {
     latestTokens = Array.isArray(tokens) ? tokens : [];
     renderTokenSummary(latestTokens, summary);
+    syncTokenFilterCards();
     const availableIds = new Set(latestTokens.map((t) => String(t.id || "")).filter(Boolean));
     Array.from(tokenSelectedIds).forEach((id) => {
       if (!availableIds.has(id)) tokenSelectedIds.delete(id);
     });
 
-    renderTokenPagination(latestTokens.length);
-    const pageTokens = getCurrentPageTokens();
+    const filteredTokens = getFilteredTokens(latestTokens, tokenFilter);
+    renderTokenPagination(filteredTokens.length);
+    const pageTokens = getCurrentPageTokens(filteredTokens);
 
     if (!latestTokens.length) {
       tbody.innerHTML = `<tr><td colspan="9" class="empty-state">当前没有可用的 Token，请在上方添加。</td></tr>`;
+      syncTokenSelectAllState();
+      return;
+    }
+
+    if (!filteredTokens.length) {
+      tbody.innerHTML = `<tr><td colspan="9" class="empty-state">该筛选下暂无账号</td></tr>`;
       syncTokenSelectAllState();
       return;
     }
@@ -252,15 +393,23 @@ document.addEventListener("DOMContentLoaded", async () => {
       const tokenProfileEmail = String(t.refresh_profile_email || "").trim();
       const refreshProfileNameSafe = escapeHtml(tokenProfileName);
       const refreshProfileEmailSafe = escapeHtml(tokenProfileEmail);
-      const accountName = refreshProfileNameSafe || '<span style="color:#7f96ad;">手动 Token</span>';
-      const accountEmail = refreshProfileEmailSafe || '<span style="color:#7f96ad;">-</span>';
+      const accountName = refreshProfileNameSafe
+        ? `<span class="account-name">${refreshProfileNameSafe}</span>`
+        : '<span class="account-name">手动 Token</span>';
+      const accountEmail = refreshProfileEmailSafe
+        ? `<span class="account-email">${refreshProfileEmailSafe}</span>`
+        : '<span class="account-meta">无绑定邮箱</span>';
       const autoEnabled = t.auto_refresh && t.auto_refresh_enabled !== false;
       const autoRefreshCell = t.auto_refresh
         ? `<div style="display: flex; align-items: center;"><button class="switch-btn ${autoEnabled ? "on" : "off"}" onclick="toggleAutoRefresh('${t.id}', ${autoEnabled ? "false" : "true"})" title="${autoEnabled ? "点击关闭自动刷新" : "点击开启自动刷新"}"><span class="switch-knob"></span></button><span class="switch-text">${autoEnabled ? "开启" : "关闭"}</span></div>`
-        : `<div style="display: flex; align-items: center;"><button class="switch-btn off" disabled title="手动 token 不支持自动刷新"><span class="switch-knob"></span></button><span class="switch-text" style="color:#7f96ad;">手动</span></div>`;
+        : `<div style="display: flex; align-items: center;"><button class="switch-btn off" disabled title="手动 token 不支持自动刷新"><span class="switch-knob"></span></button><span class="switch-text">手动</span></div>`;
       
       const d = new Date(t.added_at * 1000);
       const dateStr = d.toLocaleString();
+      const importedAtText = String(t.refresh_profile_imported_at_text || "").trim();
+      const importedLine = importedAtText
+        ? `<br><span class="account-meta">导入 ${escapeHtml(importedAtText)}</span>`
+        : "";
 
       const refreshTokenBtn = t.auto_refresh
         ? `<button class="action-mini" onclick="refreshToken('${t.id}')">刷新Token</button>`
@@ -279,13 +428,13 @@ document.addEventListener("DOMContentLoaded", async () => {
 
       tr.innerHTML = `
         <td><input type="checkbox" class="token-select" data-id="${tokenId}" ${selectedAttr} /></td>
-        <td style="color: #a8bfd8; font-size: 12px;" title="添加时间: ${dateStr}">${accountName}<br>${accountEmail}</td>
+        <td title="添加时间: ${dateStr}">${accountName}<br>${accountEmail}${importedLine}</td>
         <td class="token-val">${t.value}</td>
         <td><span class="status-badge ${statusClass}">${displayStatus}</span></td>
         <td>${autoRefreshCell}</td>
-        <td style="font-size:12px; line-height:1.35;">${formatCredits(t)}</td>
-        <td style="color: ${t.fails > 0 ? '#ffb4bc' : '#a8bfd8'};">${t.fails}</td>
-        <td style="font-size:12px; line-height:1.35;">${formatExpiry(t)}</td>
+        <td>${formatCredits(t)}</td>
+        <td class="${t.fails > 0 ? "expiry-gone" : ""}">${t.fails}</td>
+        <td style="line-height:1.4;">${formatExpiry(t)}</td>
         <td>${actionsGrid}</td>
       `;
       tbody.appendChild(tr);
@@ -478,18 +627,19 @@ document.addEventListener("DOMContentLoaded", async () => {
         try {
           const body = await res.json();
           detail = body.detail || JSON.stringify(body);
-        } catch (_) {
+        } catch (parseError) {
           detail = await res.text();
         }
         alert(detail || "刷新积分失败");
         showToast(`刷新积分失败：${detail || "unknown error"}`, true);
         return;
       }
-      await loadTokens();
       showToast("Token 积分刷新成功", false);
     } catch (err) {
       alert("刷新积分失败");
       showToast("Token 积分刷新失败", true);
+    } finally {
+      await loadTokens();
     }
   };
 
@@ -599,6 +749,43 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
   }
 
+  if (dedupeByEmailBtn) {
+    dedupeByEmailBtn.addEventListener("click", async () => {
+      if (!confirm("将按邮箱对账号去重：同一邮箱仅保留最近导入的账号，其余重复账号及其 Token 将被删除。是否继续？")) return;
+      dedupeByEmailBtn.disabled = true;
+      showToast("邮箱去重中...", false, { duration: 0 });
+      try {
+        const res = await fetch("/api/v1/refresh-profiles/dedupe-by-email", {
+          method: "POST",
+        });
+        if (!res.ok) {
+          let detail = "邮箱去重失败";
+          try {
+            const body = await res.json();
+            detail = body.detail || JSON.stringify(body);
+          } catch (_) {
+            detail = await res.text();
+          }
+          throw new Error(detail || "邮箱去重失败");
+        }
+        const data = await res.json();
+        const removedCount = Number(data.removed_count || 0);
+        showToast(
+          removedCount > 0
+            ? `邮箱去重完成：删除 ${removedCount} 个重复账号`
+            : "没有发现重复邮箱的账号",
+          false,
+          { duration: 5000 }
+        );
+        await loadTokens();
+      } catch (err) {
+        showToast(err.message || "邮箱去重失败", true, { duration: 5000 });
+      } finally {
+        dedupeByEmailBtn.disabled = false;
+      }
+    });
+  }
+
   if (exportTokensBtn) {
     exportTokensBtn.addEventListener("click", async () => {
       exportTokensBtn.disabled = true;
@@ -679,6 +866,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   const confPublicBaseUrl = document.getElementById("confPublicBaseUrl");
   const confUseProxy = document.getElementById("confUseProxy");
   const confProxy = document.getElementById("confProxy");
+  const testProxyBtn = document.getElementById("testProxyBtn");
+  const proxyTestResult = document.getElementById("proxyTestResult");
   const confGenerateTimeout = document.getElementById("confGenerateTimeout");
   const confGptImageQuality = document.getElementById("confGptImageQuality");
   const confRetryEnabled = document.getElementById("confRetryEnabled");
@@ -701,6 +890,25 @@ document.addEventListener("DOMContentLoaded", async () => {
   const importCookieBtn = document.getElementById("importCookieBtn");
   const refreshMsg = document.getElementById("refreshMsg");
   let currentBatchConcurrency = 5;
+  const PROXY_TEST_ERROR_MESSAGES = {
+    timeout: "连接超时",
+    proxy_error: "代理连接失败",
+    connection_error: "目标连接失败",
+    request_error: "网络请求失败",
+  };
+
+  function clearProxyTestResult() {
+    if (!proxyTestResult) return;
+    proxyTestResult.textContent = "";
+    proxyTestResult.classList.remove("is-success", "is-error");
+  }
+
+  function showProxyTestResult(text, isError) {
+    if (!proxyTestResult) return;
+    proxyTestResult.textContent = text;
+    proxyTestResult.classList.toggle("is-success", !isError);
+    proxyTestResult.classList.toggle("is-error", isError);
+  }
   // Logs
   const logsTbody = document.querySelector("#logsTable tbody");
   const refreshLogsBtn = document.getElementById("refreshLogsBtn");
@@ -751,6 +959,51 @@ document.addEventListener("DOMContentLoaded", async () => {
     switchConfigPane(
       String(currentActive?.dataset?.target || configCatBtns[0]?.dataset?.target || "")
     );
+  }
+
+  if (confProxy) {
+    confProxy.addEventListener("input", clearProxyTestResult);
+  }
+
+  if (testProxyBtn) {
+    testProxyBtn.addEventListener("click", async () => {
+      const originalText = testProxyBtn.textContent || "测试连通性";
+      testProxyBtn.disabled = true;
+      testProxyBtn.setAttribute("aria-busy", "true");
+      testProxyBtn.textContent = "测试中...";
+      clearProxyTestResult();
+      try {
+        const res = await fetch("/api/v1/config/test-proxy", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ proxy: String(confProxy?.value || "").trim() }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          const detail = typeof data.detail === "string" ? data.detail : "代理地址无效";
+          throw new Error(detail);
+        }
+
+        const latency = Math.max(0, Math.round(Number(data.latency_ms || 0)));
+        if (data.ok) {
+          const routeText = data.via === "proxy" ? "经代理" : "直连";
+          showProxyTestResult(
+            `连通（HTTP ${Number(data.status_code)}，${latency}ms，${routeText}）`,
+            false,
+          );
+          return;
+        }
+
+        const message = PROXY_TEST_ERROR_MESSAGES[data.error] || "连接失败";
+        showProxyTestResult(`${message}（${latency}ms）`, true);
+      } catch (err) {
+        showProxyTestResult(err.message || "代理测试失败", true);
+      } finally {
+        testProxyBtn.disabled = false;
+        testProxyBtn.setAttribute("aria-busy", "false");
+        testProxyBtn.textContent = originalText;
+      }
+    });
   }
 
   async function loadConfig() {
@@ -1084,6 +1337,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         total: items.length,
         completed: 0,
         imported: 0,
+        deduped: 0,
         failed: 0,
         refreshFailed: 0,
       };
@@ -1092,7 +1346,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       const updateImportProgress = () => {
         showMsg(
           refreshMsg,
-          `已解析 ${progress.total} 个 Cookie，处理中 ${progress.completed}/${progress.total}，导入成功 ${progress.imported}，导入失败 ${progress.failed}，刷新失败 ${progress.refreshFailed}（并行 ${workerCount} 个）...`,
+          `已解析 ${progress.total} 个 Cookie，处理中 ${progress.completed}/${progress.total}，导入成功 ${progress.imported}（含去重更新 ${progress.deduped}），导入失败 ${progress.failed}，刷新失败 ${progress.refreshFailed}（并行 ${workerCount} 个）...`,
           progress.failed > 0 || progress.refreshFailed > 0,
           { duration: 0 }
         );
@@ -1130,6 +1384,9 @@ document.addEventListener("DOMContentLoaded", async () => {
             const result = await importOne(items[currentIndex]);
             results[currentIndex] = result;
             progress.imported += 1;
+            if (String(result?.profile?.import_action || "") === "updated") {
+              progress.deduped += 1;
+            }
             if (String(result.refresh_error || "").trim()) {
               progress.refreshFailed += 1;
             }
@@ -1148,7 +1405,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (items.length > 1) {
         showMsg(
           refreshMsg,
-          `批量 Cookie 导入完成：成功 ${progress.imported}，导入失败 ${progress.failed}，刷新失败 ${progress.refreshFailed}`,
+          `批量 Cookie 导入完成：成功 ${progress.imported}（含去重更新 ${progress.deduped}），导入失败 ${progress.failed}，刷新失败 ${progress.refreshFailed}`,
           progress.failed > 0 || progress.refreshFailed > 0,
           { duration: 8000 }
         );
@@ -1158,10 +1415,13 @@ document.addEventListener("DOMContentLoaded", async () => {
         if (singleResult?.error) {
           throw singleResult.error;
         }
+        const dedupNote = String(singleResult?.profile?.import_action || "") === "updated"
+          ? "（邮箱已存在，已更新原账号）"
+          : "";
         if (refreshError) {
-          showMsg(refreshMsg, `Cookie 导入成功，但自动刷新失败：${refreshError}`, true, { duration: 8000 });
+          showMsg(refreshMsg, `Cookie 导入成功${dedupNote}，但自动刷新失败：${refreshError}`, true, { duration: 8000 });
         } else {
-          showMsg(refreshMsg, "Cookie 导入成功，并已自动刷新", false, { duration: 8000 });
+          showMsg(refreshMsg, `Cookie 导入成功${dedupNote}，并已自动刷新`, false, { duration: 8000 });
         }
       }
       if (cookieInput) cookieInput.value = "";
@@ -1249,7 +1509,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         renderLogStats(null);
       }
     } catch (err) {
-      logsTbody.innerHTML = `<tr><td colspan="8" class="empty-state" style="color: #ffb4bc;">${err.message || "日志加载失败"}</td></tr>`;
+      logsTbody.innerHTML = `<tr><td colspan="8" class="empty-state" style="color: var(--critical);">${err.message || "日志加载失败"}</td></tr>`;
       logsRunningTotal = 0;
       logsTotalPages = Math.max(1, logsCurrentPage || 1);
       renderLogsPagination();
@@ -1327,7 +1587,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     const taskProgressRaw = Number(item.task_progress);
     const progressCell = taskStatus === "IN_PROGRESS"
       ? `<span class="status-badge status-active">${Number.isFinite(taskProgressRaw) ? Math.round(taskProgressRaw) : 0}%</span>`
-      : `<span style="color:#7f96ad;">-</span>`;
+      : `<span class="account-meta">-</span>`;
     const previewUrl = normalizePreviewUrl(String(item.preview_url || "").trim());
     const previewKind = String(item.preview_kind || "").trim();
     const tokenName = String(item.token_account_name || "").trim();
@@ -1351,11 +1611,11 @@ document.addEventListener("DOMContentLoaded", async () => {
     const tokenCell = `<div class="log-account-cell">${accountParts.join("<br>")}</div>`;
     const previewCell = previewUrl
       ? `<button class="small preview-btn" data-url="${encodeURIComponent(previewUrl)}" data-kind="${previewKind || ""}">查看</button>`
-      : `<span style="color:#7f96ad;">-</span>`;
+      : `<span class="account-meta">-</span>`;
     tr.innerHTML = `
       <td class="log-time-cell"><span class="date">${dateText}</span><span class="time">${timeText}</span></td>
       <td>${statusCell}</td>
-      <td style="color:#a8bfd8;">${t}</td>
+      <td>${t}</td>
       <td>${progressCell}</td>
       <td title="${tokenTitle}">${tokenCell}</td>
       <td class="log-model-cell" title="${escapeHtml(modelText)}">${escapeHtml(modelText)}</td>
@@ -1612,7 +1872,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       el._msgTimer = null;
     }
     el.textContent = text;
-    el.style.color = isError ? "#ffb4bc" : "#4de2c4";
+    el.style.color = isError ? "var(--critical)" : "var(--good)";
     if (duration > 0) {
       el._msgTimer = setTimeout(() => {
         el.textContent = "";

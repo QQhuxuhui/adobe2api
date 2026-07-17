@@ -3,7 +3,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, List
+from urllib.parse import urlparse
 
+import requests
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from starlette.responses import RedirectResponse
@@ -12,6 +14,7 @@ from api.schemas import (
     AdminLoginRequest,
     ConfigUpdateRequest,
     ExportSelectionRequest,
+    ProxyTestRequest,
     RefreshCookieBatchImportRequest,
     RefreshCookieImportRequest,
     RefreshProfileEnabledRequest,
@@ -43,6 +46,28 @@ def build_admin_router(
         except Exception:
             value = 5
         return max(1, min(100, value))
+
+    def validate_proxy_url(raw_proxy: str) -> str:
+        proxy = str(raw_proxy or "").strip()
+        if not proxy:
+            return ""
+        try:
+            parsed = urlparse(proxy)
+            port = parsed.port
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid proxy URL")
+
+        hostname = str(parsed.hostname or "").strip()
+        if parsed.scheme.lower() not in {"http", "https"}:
+            raise HTTPException(status_code=400, detail="invalid proxy URL")
+        if not hostname or any(char.isspace() for char in hostname):
+            raise HTTPException(status_code=400, detail="invalid proxy URL")
+        if port is not None and not 1 <= port <= 65535:
+            raise HTTPException(status_code=400, detail="invalid proxy URL")
+        return proxy
+
+    def proxy_latency_ms(started_at: float) -> int:
+        return max(0, round((time.perf_counter() - started_at) * 1000))
 
     def delete_token_and_linked_profile(token_id: str) -> bool:
         token_info = token_manager.get_by_id(token_id)
@@ -186,9 +211,16 @@ def build_admin_router(
         for item in tokens:
             if not bool(item.get("auto_refresh")):
                 item["auto_refresh_enabled"] = None
+                item["refresh_profile_imported_at"] = None
+                item["refresh_profile_imported_at_text"] = ""
                 continue
             pid = str(item.get("refresh_profile_id") or "").strip()
             item["auto_refresh_enabled"] = refresh_manager.is_profile_enabled(pid)
+            import_info = refresh_manager.get_profile_import_info(pid)
+            item["refresh_profile_imported_at"] = import_info.get("imported_at")
+            item["refresh_profile_imported_at_text"] = str(
+                import_info.get("imported_at_text") or ""
+            )
         total_count = len(tokens)
         active_count = 0
         credits_available_total = 0.0
@@ -351,7 +383,10 @@ def build_admin_router(
         if not token_info:
             raise HTTPException(status_code=404, detail="token not found")
         try:
-            result = refresh_manager.refresh_credits_for_token_id(tid)
+            result = refresh_manager.refresh_credits_for_token_id(
+                tid,
+                handle_auth=True,
+            )
             return {"status": "ok", **result}
         except KeyError:
             raise HTTPException(status_code=404, detail="token not found")
@@ -380,7 +415,11 @@ def build_admin_router(
 
         def refresh_one(index: int, tid: str):
             try:
-                return index, "ok", refresh_manager.refresh_credits_for_token_id(tid)
+                result = refresh_manager.refresh_credits_for_token_id(
+                    tid,
+                    handle_auth=True,
+                )
+                return index, "ok", result
             except Exception as exc:
                 token_manager.set_credits_error(tid, str(exc))
                 return index, "failed", {"token_id": tid, "detail": str(exc)}
@@ -406,6 +445,46 @@ def build_admin_router(
             "failed_count": len(failed),
             "refreshed": refreshed,
             "failed": failed,
+        }
+
+    @router.post("/api/v1/config/test-proxy")
+    def test_proxy(req: ProxyTestRequest, request: Request):
+        require_admin_auth(request)
+        proxy = validate_proxy_url(req.proxy)
+        via = "proxy" if proxy else "direct"
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        started_at = time.perf_counter()
+        session = requests.Session()
+        session.trust_env = False
+        try:
+            response = session.get(
+                "https://firefly.adobe.io/",
+                timeout=10,
+                allow_redirects=False,
+                proxies=proxies,
+            )
+            return {
+                "ok": True,
+                "status_code": int(response.status_code),
+                "latency_ms": proxy_latency_ms(started_at),
+                "via": via,
+            }
+        except requests.exceptions.Timeout:
+            error = "timeout"
+        except requests.exceptions.ProxyError:
+            error = "proxy_error"
+        except requests.exceptions.ConnectionError:
+            error = "connection_error"
+        except requests.exceptions.RequestException:
+            error = "request_error"
+        finally:
+            session.close()
+
+        return {
+            "ok": False,
+            "error": error,
+            "latency_ms": proxy_latency_ms(started_at),
+            "via": via,
         }
 
     @router.get("/api/v1/config")
@@ -457,6 +536,20 @@ def build_admin_router(
             except Exception:
                 timeout_val = 300
             update_data["generate_timeout"] = timeout_val if timeout_val > 0 else 300
+        if "gemini_native_deadline_seconds" in incoming:
+            try:
+                gemini_deadline = int(incoming["gemini_native_deadline_seconds"])
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="gemini_native_deadline_seconds must be a positive integer",
+                )
+            if gemini_deadline <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="gemini_native_deadline_seconds must be a positive integer",
+                )
+            update_data["gemini_native_deadline_seconds"] = gemini_deadline
         if "refresh_interval_hours" in incoming:
             try:
                 interval_hours = int(incoming["refresh_interval_hours"])
@@ -764,6 +857,12 @@ def build_admin_router(
         if not imported:
             raise HTTPException(status_code=400, detail=result)
         return result
+
+    @router.post("/api/v1/refresh-profiles/dedupe-by-email")
+    def refresh_profiles_dedupe_by_email(request: Request):
+        require_admin_auth(request)
+        result = refresh_manager.dedupe_by_email()
+        return {"status": "ok", **result}
 
     @router.post("/api/v1/refresh-profiles/{profile_id}/refresh-now")
     def refresh_profiles_refresh_now(profile_id: str, request: Request):

@@ -295,10 +295,29 @@ class AdobeClient:
             return None
         return {"http": self.proxy, "https": self.proxy}
 
-    def _session(self):
+    @staticmethod
+    def _timeout_for_deadline(
+        timeout: float, deadline: Optional[float]
+    ) -> float:
+        fixed_timeout = max(0.001, float(timeout))
+        if deadline is None:
+            return fixed_timeout
+        remaining = float(deadline) - time.monotonic()
+        if remaining <= 0:
+            raise UpstreamTemporaryError(
+                "Gemini native request deadline exceeded",
+                status_code=503,
+                error_type="timeout",
+            )
+        return min(fixed_timeout, remaining)
+
+    def _session(
+        self, timeout: float = 60, deadline: Optional[float] = None
+    ):
         if CurlSession is None:
             return None
-        kwargs = {"impersonate": self.impersonate, "timeout": 60}
+        effective_timeout = self._timeout_for_deadline(timeout, deadline)
+        kwargs = {"impersonate": self.impersonate, "timeout": effective_timeout}
         if self.proxy:
             kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
         return CurlSession(**kwargs)
@@ -368,15 +387,22 @@ class AdobeClient:
             "accept": "application/json",
         }
 
-    def _post_json(self, url: str, headers: dict, payload: dict):
-        session = self._session()
+    def _post_json(
+        self,
+        url: str,
+        headers: dict,
+        payload: dict,
+        deadline: Optional[float] = None,
+    ):
+        session = self._session(timeout=60, deadline=deadline)
         if session is None:
+            effective_timeout = self._timeout_for_deadline(60, deadline)
             try:
                 return requests.post(
                     url,
                     headers=headers,
                     json=payload,
-                    timeout=60,
+                    timeout=effective_timeout,
                     proxies=self._requests_proxies(),
                 )
             except requests.Timeout as exc:
@@ -404,12 +430,13 @@ class AdobeClient:
                 error_type=self._classify_network_error_type(exc),
             )
         if resp.status_code == 451:
+            effective_timeout = self._timeout_for_deadline(60, deadline)
             try:
                 return requests.post(
                     url,
                     headers=headers,
                     json=payload,
-                    timeout=60,
+                    timeout=effective_timeout,
                     proxies=self._requests_proxies(),
                 )
             except requests.Timeout as exc:
@@ -434,15 +461,22 @@ class AdobeClient:
                 )
         return resp
 
-    def _post_bytes(self, url: str, headers: dict, payload: bytes):
-        session = self._session()
+    def _post_bytes(
+        self,
+        url: str,
+        headers: dict,
+        payload: bytes,
+        deadline: Optional[float] = None,
+    ):
+        session = self._session(timeout=60, deadline=deadline)
         if session is None:
+            effective_timeout = self._timeout_for_deadline(60, deadline)
             try:
                 return requests.post(
                     url,
                     headers=headers,
                     data=payload,
-                    timeout=60,
+                    timeout=effective_timeout,
                     proxies=self._requests_proxies(),
                 )
             except requests.Timeout as exc:
@@ -508,14 +542,21 @@ class AdobeClient:
             )
         return resp
 
-    def _get(self, url: str, headers: dict, timeout: int = 60):
-        session = self._session()
+    def _get(
+        self,
+        url: str,
+        headers: dict,
+        timeout: int = 60,
+        deadline: Optional[float] = None,
+    ):
+        session = self._session(timeout=timeout, deadline=deadline)
         if session is None:
+            effective_timeout = self._timeout_for_deadline(timeout, deadline)
             try:
                 return requests.get(
                     url,
                     headers=headers,
-                    timeout=timeout,
+                    timeout=effective_timeout,
                     proxies=self._requests_proxies(),
                 )
             except requests.Timeout as exc:
@@ -606,14 +647,16 @@ class AdobeClient:
         out_path: Path,
         timeout: int = 60,
         chunk_size: int = 1024 * 1024,
+        deadline: Optional[float] = None,
     ) -> int:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         total = 0
+        effective_timeout = self._timeout_for_deadline(timeout, deadline)
         try:
             with requests.get(
                 url,
                 headers=headers or {},
-                timeout=timeout,
+                timeout=effective_timeout,
                 proxies=self._requests_proxies(),
                 stream=True,
             ) as resp:
@@ -622,8 +665,11 @@ class AdobeClient:
                     for chunk in resp.iter_content(chunk_size=chunk_size):
                         if not chunk:
                             continue
+                        self._timeout_for_deadline(timeout, deadline)
                         f.write(chunk)
                         total += len(chunk)
+        except UpstreamTemporaryError:
+            raise
         except requests.Timeout as exc:
             raise UpstreamTemporaryError(f"upstream timeout: {exc}", error_type="timeout")
         except requests.ProxyError as exc:
@@ -639,7 +685,11 @@ class AdobeClient:
         return total
 
     def upload_image(
-        self, token: str, image_bytes: bytes, mime_type: str = "image/jpeg"
+        self,
+        token: str,
+        image_bytes: bytes,
+        mime_type: str = "image/jpeg",
+        deadline: Optional[float] = None,
     ) -> str:
         if not image_bytes:
             raise AdobeRequestError("image is empty")
@@ -650,7 +700,12 @@ class AdobeClient:
             "content-type": mime_type,
             "accept": "application/json",
         }
-        resp = self._post_bytes(self.upload_url, headers=headers, payload=image_bytes)
+        resp = self._post_bytes(
+            self.upload_url,
+            headers=headers,
+            payload=image_bytes,
+            deadline=deadline,
+        )
 
         if resp.status_code in (401, 403):
             raise AuthError("Token invalid or expired")
@@ -1481,6 +1536,7 @@ class AdobeClient:
         timeout: int = 180,
         out_path: Optional[Path] = None,
         progress_cb: Optional[Callable[[dict], None]] = None,
+        deadline: Optional[float] = None,
     ) -> tuple[Optional[bytes], dict]:
         submit_resp = None
         last_error = ""
@@ -1498,6 +1554,7 @@ class AdobeClient:
                 self.submit_url,
                 headers=self._submit_headers(token, prompt=prompt),
                 payload=payload,
+                deadline=deadline,
             )
             if submit_resp.status_code == 200:
                 break
@@ -1562,12 +1619,15 @@ class AdobeClient:
             except Exception:
                 pass
 
-        start = time.time()
+        start = time.monotonic()
         latest = {}
         sleep_time = 3.0
         while True:
             poll_resp = self._get(
-                poll_url, headers=self._poll_headers(token), timeout=60
+                poll_url,
+                headers=self._poll_headers(token),
+                timeout=60,
+                deadline=deadline,
             )
             if poll_resp.status_code != 200:
                 logger.error(
@@ -1619,10 +1679,16 @@ class AdobeClient:
                         headers={"accept": "*/*"},
                         out_path=out_path,
                         timeout=30,
+                        deadline=deadline,
                     )
                     image_bytes = None
                 else:
-                    img_resp = self._get(image_url, headers={"accept": "*/*"}, timeout=30)
+                    img_resp = self._get(
+                        image_url,
+                        headers={"accept": "*/*"},
+                        timeout=30,
+                        deadline=deadline,
+                    )
                     img_resp.raise_for_status()
                     image_bytes = img_resp.content
                 if progress_cb:
@@ -1657,7 +1723,14 @@ class AdobeClient:
                         pass
                 raise AdobeRequestError(f"image job failed: {latest}")
 
-            if time.time() - start > timeout:
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                raise UpstreamTemporaryError(
+                    "Gemini native request deadline exceeded",
+                    status_code=503,
+                    error_type="timeout",
+                )
+            if now - start > timeout:
                 if progress_cb:
                     try:
                         progress_cb(
@@ -1674,4 +1747,13 @@ class AdobeClient:
                     except Exception:
                         pass
                 raise AdobeRequestError("generation timed out")
-            time.sleep(sleep_time)
+            sleep_now = time.monotonic()
+            local_remaining = max(
+                0.0, float(timeout) - (sleep_now - start)
+            )
+            sleep_for = min(sleep_time, local_remaining)
+            if deadline is not None:
+                request_remaining = max(0.0, deadline - sleep_now)
+                sleep_for = min(sleep_for, request_remaining)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
