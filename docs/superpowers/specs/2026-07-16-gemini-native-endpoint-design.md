@@ -115,11 +115,11 @@ TEST_TEXT_MODELS = {
 
 ### 解析前请求体限流（复审 #1）
 
-Gemini POST 入口定义 `GEMINI_NATIVE_MAX_BODY_BYTES = 48 MiB`。该值可容纳本设计最多
-30 MiB 解码后图片（base64 约 40 MiB）及 JSON/prompt 开销，同时避免攻击者让服务先
+Gemini POST 入口定义 `GEMINI_NATIVE_MAX_BODY_BYTES = 64 MiB`。该值可容纳本设计最多
+40 MiB 解码后图片（base64 约 54 MiB）及 JSON/prompt 开销，同时避免攻击者让服务先
 分配数百 MiB 再拒绝：
 
-1. `Content-Length` 存在且大于 48 MiB 时立即返回 400 INVALID_ARGUMENT；
+1. `Content-Length` 存在且大于 64 MiB 时立即返回 400 INVALID_ARGUMENT；
 2. 不信任或缺失 `Content-Length`，继续通过 `request.stream()` 累计读取；一旦累计值
    超限立即停止并返回 400；
 3. 只在有限读取完成后执行 `json.loads(raw_body)`，不得先调用 `request.body()` 或
@@ -171,8 +171,9 @@ Adobe `client.generate` 只接受单 prompt 字符串 + 若干输入图，因此
   见 `app.py:955`）；校验通过后再调它做 jpg→jpeg 归一化。不改动这个公共函数，
   以免影响现有 OpenAI 路径。
 - 严格 base64 解码（`validate=True`），失败 400；解码前先按编码长度预检：单图
-  `data` 字符数不得超过 `4 * ceil(10 MiB / 3)`，超出直接 400，避免先解码超大字符串；
-- 单图 ≤ 10 MiB（沿用 `app.py` 的 `10 * 1024 * 1024`）；单请求输入图总量 ≤ 30 MiB，
+  `data` 字符数不得超过 `4 * ceil(20 MiB / 3)`，超出直接 400，避免先解码超大字符串；
+- 单图 ≤ 20 MiB（对齐 Gemini 原生 inline 上限，宽于 OpenAI 路径的 10 MiB）；
+  单请求输入图总量 ≤ 40 MiB，
   超出 400；
 - 最多 6 张（超出部分忽略，不报错，与 OpenAI 路径一致）。
 
@@ -181,14 +182,18 @@ Adobe `client.generate` 只接受单 prompt 字符串 + 若干输入图，因此
 
 ### 比例白名单（复审 #3，按上游族独立维护）
 
-初版统一列 10 个比例是错的：`payloads.py:size_from_ratio`（nano 路径）只认 9 个键、
-缺省回退 16:9，会造成「尺寸按 16:9、载荷仍发原比例」的自相矛盾请求。按 catalog 实际
-支持维护：
+白名单必须与 `payloads.py:size_from_ratio`（nano 路径）能给出精确尺寸的比例一致，
+否则未覆盖的比例会缺省回退 16:9，造成「尺寸按 16:9、载荷仍发原比例」的自相矛盾请求。
+`size_from_ratio` 已覆盖下表全部比例：
 
 | 族 | 允许 aspectRatio |
 |---|---|
-| nano-banana-2 / pro（gemini-3-pro-image） | `1:1, 16:9, 9:16, 4:3, 3:4`（= RATIO_SUFFIX_MAP） |
-| nano-banana-3（gemini-3.1-flash-image） | 上列 5 个 + `1:8, 1:4, 4:1, 8:1`（超长比例） |
+| nano-banana-2 / pro（gemini-3-pro-image） | Gemini 官方 10 比例：`1:1, 16:9, 9:16, 4:3, 3:4, 2:3, 3:2, 4:5, 5:4, 21:9` |
+| nano-banana-3（gemini-3.1-flash-image） | 上列 10 个 + `1:8, 1:4, 4:1, 8:1`（超长比例） |
+
+> 修订（2026-07-17）：初版 pro 只放 5 个比例，导致下游请求 `2:3/3:2/4:5/5:4/21:9`
+> 这些 Nano Banana Pro 官方支持的常见竖图比例时被 400 拒绝（偶发报错）。已给
+> `size_from_ratio` 补上这 5 个比例的 1K/2K/4K 尺寸并扩展白名单。
 
 实现约束：白名单里的每个比例都**必须**在 `size_from_ratio` 对应档位有精确条目
 （已核对：上述比例在 payloads.py 的 nano map 中均存在）。校验在请求解析阶段做，
@@ -383,7 +388,7 @@ Token 配额尽→429，上游临时错误/超预算→503，参数/JSON/结构/
 - model 从 URL 路径取得，prompt preview 从已完成限流与结构校验的 `contents` 扁平结果取得；
 - 日志中间件对 Gemini 路径**不得先调用 `request.body()`**。由路由的有限读取器设置
   `request._body` 以及 `request.state.log_model/log_prompt_preview`，middleware 在响应收尾
-  时从 state 读取；这样日志功能不会绕过 48 MiB 限制；
+  时从 state 读取；这样日志功能不会绕过 64 MiB 限制；
 - 罐头测活、countTokens、解析失败和上游重试都应有 operation/status 记录，但日志不得
   保存 inlineData/base64 原文。
 
@@ -403,7 +408,7 @@ Token 配额尽→429，上游临时错误/超预算→503，参数/JSON/结构/
 - JSON 结构/类型校验（#5）：顶层 `[]`/`null`/字符串 → 400；`contents` 缺失/空/非数组
   → 400；`content`/`parts` 类型错 → 400；`parts[]` 元素非 object、`text`/inlineData
   子字段类型错 → 400；非法 UTF-8 字节 → 400；
-- 请求体限流（#1）：伪造超大 `Content-Length` 与 chunked/无长度实际超 48 MiB 均在
+- 请求体限流（#1）：伪造超大 `Content-Length` 与 chunked/无长度实际超 64 MiB 均在
   JSON 解析前 → 400；单图 base64 编码长度超界时不调用 `b64decode`；
 - 比例白名单（#3）：pro 允许 5 个、flash 允许 9 个；给 pro 传 `1:8` → 400；
   给某族传其白名单外比例 → 400（不回退 16:9）；默认 1:1；
@@ -422,7 +427,7 @@ Token 配额尽→429，上游临时错误/超预算→503，参数/JSON/结构/
 - 总超时（#1/#5）：桩慢上传/慢 submit/慢生成（不止桩 generate），断言 deadline
   透传后各调用 timeout=min(固定,remaining)、curl session 同样受限、重试 sleep 不越界、
   预算耗尽停止重试并 503、总耗时不超过预算（允许极小调度误差）；
-- 输入图限额（#4/#7）：>10 MiB 单图→400、总量>30 MiB→400、非白名单 MIME→400
+- 输入图限额（#4/#7）：>20 MiB 单图→400、总量>40 MiB→400、非白名单 MIME→400
   （且未污染公共 `_normalize_image_mime`）、坏 base64→400；
 - 共享路径回归：`reraise_domain=False` 与 `deadline=None` 时，现有 OpenAI 401/503、
   固定网络超时、重试/Token 标记/落盘行为不变；

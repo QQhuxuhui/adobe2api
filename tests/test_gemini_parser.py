@@ -183,8 +183,8 @@ def test_resolve_model_action_rejects_unknown_model_or_action(model_action):
     assert exc_info.value.status == "NOT_FOUND"
 
 
-def test_read_limited_body_uses_exact_48_mib_limit_and_caches_body():
-    assert GEMINI_NATIVE_MAX_BODY_BYTES == 48 * 1024 * 1024
+def test_read_limited_body_uses_exact_64_mib_limit_and_caches_body():
+    assert GEMINI_NATIVE_MAX_BODY_BYTES == 64 * 1024 * 1024
     request, calls = _request_for_chunks([b'{"contents":', b"[]}"])
     body = asyncio.run(read_limited_body(request))
     assert body == b'{"contents":[]}'
@@ -433,12 +433,12 @@ def test_decode_inline_image_rejects_encoded_data_before_decoding(monkeypatch):
     oversized = "A" * (GEMINI_MAX_ENCODED_IMAGE_CHARS + 1)
     _assert_invalid(
         lambda: decode_inline_image(oversized, "image/png"),
-        "Inline image exceeds 10 MiB",
+        "Inline image exceeds 20 MiB",
     )
     assert decode_calls == []
 
 
-def test_decode_inline_image_rejects_decoded_data_above_ten_mib(monkeypatch):
+def test_decode_inline_image_rejects_decoded_data_above_limit(monkeypatch):
     monkeypatch.setattr(
         gemini_native.base64,
         "b64decode",
@@ -446,12 +446,12 @@ def test_decode_inline_image_rejects_decoded_data_above_ten_mib(monkeypatch):
     )
     _assert_invalid(
         lambda: decode_inline_image("AAAA", "image/png"),
-        "Inline image exceeds 10 MiB",
+        "Inline image exceeds 20 MiB",
     )
 
 
-def test_parse_rejects_total_decoded_images_above_thirty_mib(monkeypatch):
-    image = b"x" * (8 * 1024 * 1024)
+def test_parse_rejects_total_decoded_images_above_limit(monkeypatch):
+    image = b"x" * (11 * 1024 * 1024)
     monkeypatch.setattr(
         gemini_native, "decode_inline_image", lambda data, mime_type: (image, mime_type)
     )
@@ -491,7 +491,7 @@ def test_pro_rejects_flash_only_ratios(ratio):
     )
 
 
-@pytest.mark.parametrize("ratio", ["2:3", "3:2", "16:10", 1, None])
+@pytest.mark.parametrize("ratio", ["16:10", "5:3", "7:1", 1, None])
 def test_parse_rejects_unknown_or_non_string_ratios(ratio):
     _assert_invalid(
         lambda: parse_gemini_request(

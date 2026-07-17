@@ -17,6 +17,11 @@ def size_from_ratio(ratio: str, output_resolution: str = "2K") -> dict:
             "4:3": {"width": 1152, "height": 864},
             "3:4": {"width": 864, "height": 1152},
             "8:1": {"width": 3072, "height": 384},
+            "3:2": {"width": 1248, "height": 832},
+            "2:3": {"width": 832, "height": 1248},
+            "5:4": {"width": 1120, "height": 896},
+            "4:5": {"width": 896, "height": 1120},
+            "21:9": {"width": 1456, "height": 624},
         }
     elif level == "4K":
         ratio_map = {
@@ -29,6 +34,11 @@ def size_from_ratio(ratio: str, output_resolution: str = "2K") -> dict:
             "4:3": {"width": 4096, "height": 3072},
             "3:4": {"width": 3072, "height": 4096},
             "8:1": {"width": 12288, "height": 1536},
+            "3:2": {"width": 4992, "height": 3328},
+            "2:3": {"width": 3328, "height": 4992},
+            "5:4": {"width": 4480, "height": 3584},
+            "4:5": {"width": 3584, "height": 4480},
+            "21:9": {"width": 5824, "height": 2496},
         }
     else:
         ratio_map = {
@@ -41,6 +51,11 @@ def size_from_ratio(ratio: str, output_resolution: str = "2K") -> dict:
             "4:3": {"width": 2048, "height": 1536},
             "3:4": {"width": 1536, "height": 2048},
             "8:1": {"width": 6144, "height": 768},
+            "3:2": {"width": 2496, "height": 1664},
+            "2:3": {"width": 1664, "height": 2496},
+            "5:4": {"width": 2240, "height": 1792},
+            "4:5": {"width": 1792, "height": 2240},
+            "21:9": {"width": 2912, "height": 1248},
         }
     return ratio_map.get(ratio, ratio_map["16:9"])
 

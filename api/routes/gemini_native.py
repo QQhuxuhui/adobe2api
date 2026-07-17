@@ -21,13 +21,18 @@ from core.models.gemini_usage import (
     build_image_usage_metadata,
 )
 
-GEMINI_NATIVE_MAX_BODY_BYTES = 48 * 1024 * 1024
-GEMINI_MAX_IMAGE_BYTES = 10 * 1024 * 1024
-GEMINI_MAX_TOTAL_IMAGE_BYTES = 30 * 1024 * 1024
+GEMINI_NATIVE_MAX_BODY_BYTES = 64 * 1024 * 1024
+GEMINI_MAX_IMAGE_BYTES = 20 * 1024 * 1024
+GEMINI_MAX_TOTAL_IMAGE_BYTES = 40 * 1024 * 1024
 GEMINI_MAX_IMAGES = 6
 GEMINI_MAX_ENCODED_IMAGE_CHARS = 4 * math.ceil(GEMINI_MAX_IMAGE_BYTES / 3)
+GEMINI_MAX_IMAGE_MIB = GEMINI_MAX_IMAGE_BYTES // (1024 * 1024)
 
-PRO_RATIOS = frozenset({"1:1", "16:9", "9:16", "4:3", "3:4"})
+# Gemini 3 Pro Image(Nano Banana Pro)官方支持的 10 个比例。
+PRO_RATIOS = frozenset(
+    {"1:1", "16:9", "9:16", "4:3", "3:4", "2:3", "3:2", "4:5", "5:4", "21:9"}
+)
+# flash(Nano Banana 2)额外支持超长比例。
 FLASH_RATIOS = frozenset({*PRO_RATIOS, "1:8", "1:4", "4:1", "8:1"})
 TEST_TEXT_MODELS = frozenset(
     {
@@ -171,13 +176,13 @@ def decode_inline_image(data: str, mime_type: str) -> tuple[bytes, str]:
     }:
         raise _invalid("Unsupported inline image MIME type")
     if len(data) > GEMINI_MAX_ENCODED_IMAGE_CHARS:
-        raise _invalid("Inline image exceeds 10 MiB")
+        raise _invalid(f"Inline image exceeds {GEMINI_MAX_IMAGE_MIB} MiB")
     try:
         decoded = base64.b64decode(data, validate=True)
     except (binascii.Error, ValueError):
         raise _invalid("Invalid inline image base64")
     if len(decoded) > GEMINI_MAX_IMAGE_BYTES:
-        raise _invalid("Inline image exceeds 10 MiB")
+        raise _invalid(f"Inline image exceeds {GEMINI_MAX_IMAGE_MIB} MiB")
     if normalized_mime == "image/jpg":
         normalized_mime = "image/jpeg"
     return decoded, normalized_mime
