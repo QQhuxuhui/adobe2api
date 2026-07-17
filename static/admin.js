@@ -96,6 +96,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     matchesTokenFilter,
     resolveTokenFilter,
   } = window.AdminTokenFilters;
+  const {
+    parseCookieFilesToItems,
+    toCookieBatchItems,
+  } = window.AdminCookieImport;
   const tokenSelectedIds = new Set();
   let logsAutoTimer = null;
   let latestTokens = [];
@@ -1241,68 +1245,6 @@ document.addEventListener("DOMContentLoaded", async () => {
     return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
   }
 
-  function cookieToHeaderString(value) {
-    if (typeof value === "string") {
-      const txt = value.trim();
-      if (!txt) return "";
-      if (txt.toLowerCase().startsWith("cookie:")) {
-        return txt.slice(7).trim();
-      }
-      return txt;
-    }
-    if (Array.isArray(value)) {
-      const pairs = [];
-      value.forEach((item) => {
-        if (typeof item === "string") {
-          const txt = item.trim();
-          if (txt) pairs.push(txt);
-          return;
-        }
-        if (!item || typeof item !== "object") return;
-        const name = String(item.name || "").trim();
-        if (!name) return;
-        pairs.push(`${name}=${String(item.value || "").trim()}`);
-      });
-      return pairs.join("; ");
-    }
-    if (value && typeof value === "object") {
-      if (Array.isArray(value.cookies)) return cookieToHeaderString(value.cookies);
-      if (value.cookie != null) return cookieToHeaderString(value.cookie);
-    }
-    return "";
-  }
-
-  function toCookieBatchItems(value) {
-    if (Array.isArray(value)) {
-      if (value.length > 0 && value.every((item) => item && typeof item === "object" && "name" in item && "value" in item)) {
-        const cookie = cookieToHeaderString(value);
-        return cookie ? [{ name: null, cookie }] : [];
-      }
-      return value.map((item, idx) => {
-        if (!item || typeof item !== "object") {
-          throw new Error(`第 ${idx + 1} 项不是对象`);
-        }
-        const cookie = cookieToHeaderString(item.cookie != null ? item.cookie : item.cookies != null ? item.cookies : item);
-        if (!cookie) {
-          throw new Error(`第 ${idx + 1} 项缺少 cookie`);
-        }
-        return {
-          name: String(item.name || item.email || "").trim() || null,
-          cookie,
-        };
-      });
-    }
-    if (value && typeof value === "object") {
-      if (Array.isArray(value.items)) return toCookieBatchItems(value.items);
-      const cookie = cookieToHeaderString(value.cookie != null ? value.cookie : value.cookies != null ? value.cookies : value);
-      if (!cookie) throw new Error("cookie 内容为空");
-      return [{ name: String(value.name || value.email || "").trim() || null, cookie }];
-    }
-    const cookie = cookieToHeaderString(value);
-    if (!cookie) throw new Error("cookie 内容为空");
-    return [{ name: null, cookie }];
-  }
-
   async function importCookies() {
     const text = String(cookieInput?.value || "").trim();
     if (!text) {
@@ -1434,41 +1376,61 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   }
 
-  if (cookieFile) {
-    cookieFile.addEventListener("change", async () => {
-      const files = cookieFile.files ? Array.from(cookieFile.files) : [];
-      if (!files.length) return;
-      try {
-        if (files.length === 1) {
-          const text = await files[0].text();
-          if (cookieInput) cookieInput.value = text;
-          showMsg(refreshMsg, `已读取 1 个文件：${files[0].name}`, false, { duration: 5000 });
-          return;
-        }
+  async function handleCookieFiles(fileList) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    try {
+      if (files.length === 1) {
+        const text = await files[0].text();
+        if (cookieInput) cookieInput.value = text;
+        showMsg(refreshMsg, `已读取 1 个文件：${files[0].name}`, false, { duration: 5000 });
+        return;
+      }
 
-        const items = [];
-        for (const file of files) {
-          const raw = await file.text();
-          const baseName = String(file.name || "").replace(/\.(json|txt)$/i, "").trim();
-          let parsed = raw;
-          try {
-            parsed = JSON.parse(raw);
-          } catch (_) {
-            // plain text cookie string
-          }
-          const cookie = cookieToHeaderString(parsed);
-          if (!cookie) continue;
-          items.push({
-            name: baseName || null,
-            cookie,
-          });
-        }
-        if (cookieInput) {
-          cookieInput.value = JSON.stringify(items, null, 2);
-        }
-        showMsg(refreshMsg, `已读取 ${files.length} 个文件，解析出 ${items.length} 个 Cookie`, false, { duration: 6000 });
-      } catch (err) {
-        showMsg(refreshMsg, "读取 Cookie 文件失败", true);
+      const entries = [];
+      for (const file of files) {
+        entries.push({ name: file.name, text: await file.text() });
+      }
+      const { items, errors } = parseCookieFilesToItems(entries);
+      if (cookieInput) {
+        cookieInput.value = items.length ? JSON.stringify(items, null, 2) : "";
+      }
+      const errorNote = errors.length
+        ? `，${errors.length} 个文件解析失败：${errors.map((e) => `${e.file}（${e.error}）`).join("、")}`
+        : "";
+      showMsg(
+        refreshMsg,
+        `已读取 ${files.length} 个文件，解析出 ${items.length} 个账号${errorNote}`,
+        errors.length > 0,
+        { duration: 8000 }
+      );
+    } catch (err) {
+      showMsg(refreshMsg, "读取 Cookie 文件失败", true);
+    }
+  }
+
+  if (cookieFile) {
+    cookieFile.addEventListener("change", () => handleCookieFiles(cookieFile.files));
+  }
+
+  const refreshModalOverlay = document.getElementById("refreshModal");
+  const refreshModalCard = refreshModalOverlay ? refreshModalOverlay.querySelector(".dialog-card") : null;
+  if (refreshModalOverlay && refreshModalCard) {
+    refreshModalOverlay.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      refreshModalCard.classList.add("drag-over");
+    });
+    refreshModalOverlay.addEventListener("dragleave", (e) => {
+      if (e.relatedTarget && refreshModalOverlay.contains(e.relatedTarget)) return;
+      refreshModalCard.classList.remove("drag-over");
+    });
+    refreshModalOverlay.addEventListener("drop", (e) => {
+      e.preventDefault();
+      refreshModalCard.classList.remove("drag-over");
+      const files = e.dataTransfer ? e.dataTransfer.files : null;
+      if (files && files.length) {
+        if (cookieFile) cookieFile.value = "";
+        handleCookieFiles(files);
       }
     });
   }

@@ -1072,6 +1072,12 @@ td input[type="checkbox"] {
   box-shadow: var(--shadow-pop);
 }
 
+.dialog-card.drag-over {
+  border-color: var(--brand);
+  border-style: dashed;
+  box-shadow: 0 0 0 3px var(--brand-soft);
+}
+
 .preview-modal-dialog {
   width: min(1100px, 100%);
   display: flex;
