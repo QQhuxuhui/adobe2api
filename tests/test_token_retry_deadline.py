@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 import sys
@@ -8,6 +9,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
+from starlette.responses import Response
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -87,6 +89,188 @@ def make_request() -> Request:
             "headers": [],
         }
     )
+
+
+class FakeCreditsTracker:
+    def __init__(self):
+        self.begins: list[tuple[str, str]] = []
+        self.finishes: list[tuple[str, str, bool]] = []
+        self.completions: list[dict] = []
+
+    def begin(
+        self, token_id: str, request_id: str, *, account_id: str | None = None
+    ) -> None:
+        del account_id
+        self.begins.append((token_id, request_id))
+
+    def finish(
+        self,
+        token_id: str,
+        request_id: str,
+        *,
+        account_id: str | None = None,
+        completed: bool = False,
+    ) -> None:
+        del account_id
+        self.finishes.append((token_id, request_id, completed))
+
+    def complete(self, **kwargs) -> None:
+        self.completions.append(kwargs)
+
+
+class TokenMetadata:
+    def get_meta_by_value(self, token: str) -> dict:
+        return {
+            "token_id": token,
+            "token_account_id": f"account-{token}",
+            "token_account_name": token,
+            "token_account_email": f"{token}@example.com",
+            "token_source": "manual",
+        }
+
+
+class MiddlewareLogStore:
+    def __init__(self):
+        self.records: list[dict] = []
+
+    def add_payload(self, payload: dict) -> None:
+        self.records.append(dict(payload))
+
+    def upsert(self, log_id: str, payload: dict) -> None:
+        self.records.append({**payload, "id": log_id})
+
+
+class MiddlewareLiveStore:
+    def __init__(self):
+        self.items: dict[str, dict] = {}
+
+    def upsert(self, log_id: str, payload: dict) -> None:
+        self.items[log_id] = {**self.items.get(log_id, {}), **payload}
+
+    def remove(self, log_id: str) -> None:
+        self.items.pop(log_id, None)
+
+
+def test_token_context_tracks_first_binding_and_finishes_before_retry_switch(
+    monkeypatch,
+):
+    tracker = FakeCreditsTracker()
+    request = make_request()
+    request.state.log_id = "root-log"
+    monkeypatch.setattr(app_module, "token_manager", TokenMetadata())
+    monkeypatch.setattr(app_module, "credits_tracker", tracker, raising=False)
+
+    app_module._set_request_token_context(request, "token-1", 1)
+    app_module._set_request_token_context(request, "token-2", 2)
+
+    assert tracker.begins == [("token-1", "root-log"), ("token-2", "root-log")]
+    assert tracker.finishes == [("token-1", "root-log", False)]
+
+
+def test_middleware_submits_final_successful_attempt_for_credit_measurement(
+    monkeypatch,
+):
+    tracker = FakeCreditsTracker()
+    logs = MiddlewareLogStore()
+    live = MiddlewareLiveStore()
+    monkeypatch.setattr(app_module, "credits_tracker", tracker, raising=False)
+    monkeypatch.setattr(app_module, "log_store", logs)
+    monkeypatch.setattr(app_module, "live_log_store", live)
+    request = make_request()
+    success_payload = {
+        "id": "root-a2",
+        "ts": 10,
+        "status_code": 200,
+        "task_status": "COMPLETED",
+        "model": "firefly-gpt-image",
+        "token_id": "token-2",
+    }
+
+    async def call_next(req: Request):
+        root_id = req.state.log_id
+        req.state.log_credit_token_id = "token-2"
+        req.state.log_credit_request_id = root_id
+        req.state.log_output_resolution = "4K"
+        req.state.log_has_attempt_logs = True
+        req.state.log_attempt_records = [
+            {**success_payload, "id": f"{root_id}-a2"}
+        ]
+        return Response(status_code=200)
+
+    asyncio.run(app_module.request_logger(request, call_next))
+
+    assert len(tracker.completions) == 1
+    completion = tracker.completions[0]
+    assert completion["log_id"].endswith("-a2")
+    assert completion["token_id"] == "token-2"
+    assert completion["model_id"] == "firefly-gpt-image"
+    assert completion["output_resolution"] == "4K"
+    assert completion["payload"]["status_code"] == 200
+
+
+def test_middleware_failure_releases_tracking_without_measurement(monkeypatch):
+    tracker = FakeCreditsTracker()
+    monkeypatch.setattr(app_module, "credits_tracker", tracker, raising=False)
+    monkeypatch.setattr(app_module, "log_store", MiddlewareLogStore())
+    monkeypatch.setattr(app_module, "live_log_store", MiddlewareLiveStore())
+    request = make_request()
+
+    async def call_next(req: Request):
+        root_id = req.state.log_id
+        req.state.log_credit_token_id = "token-1"
+        req.state.log_credit_request_id = root_id
+        req.state.log_has_attempt_logs = True
+        req.state.log_attempt_records = [
+            {
+                "id": f"{root_id}-a1",
+                "ts": 10,
+                "status_code": 500,
+                "task_status": "FAILED",
+                "model": "firefly-gpt-image",
+                "token_id": "token-1",
+            }
+        ]
+        return Response(status_code=500)
+
+    asyncio.run(app_module.request_logger(request, call_next))
+
+    assert tracker.completions == []
+    assert len(tracker.finishes) == 1
+    assert tracker.finishes[0][0] == "token-1"
+    assert tracker.finishes[0][2] is False
+
+
+def test_middleware_final_http_failure_does_not_measure_successful_attempt(
+    monkeypatch,
+):
+    tracker = FakeCreditsTracker()
+    monkeypatch.setattr(app_module, "credits_tracker", tracker, raising=False)
+    monkeypatch.setattr(app_module, "log_store", MiddlewareLogStore())
+    monkeypatch.setattr(app_module, "live_log_store", MiddlewareLiveStore())
+    request = make_request()
+
+    async def call_next(req: Request):
+        root_id = req.state.log_id
+        req.state.log_credit_token_id = "token-1"
+        req.state.log_credit_account_id = "account-1"
+        req.state.log_credit_request_id = root_id
+        req.state.log_has_attempt_logs = True
+        req.state.log_attempt_records = [
+            {
+                "id": f"{root_id}-a1",
+                "ts": 10,
+                "status_code": 200,
+                "task_status": "COMPLETED",
+                "model": "firefly-gpt-image",
+                "token_id": "token-1",
+            }
+        ]
+        return Response(status_code=500)
+
+    asyncio.run(app_module.request_logger(request, call_next))
+
+    assert tracker.completions == []
+    assert len(tracker.finishes) == 1
 
 
 @pytest.fixture

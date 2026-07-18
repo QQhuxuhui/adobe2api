@@ -905,9 +905,14 @@ td input[type="checkbox"] {
 }
 
 /* Logs table sizing */
+#logsTable {
+  min-width: 1000px;
+  table-layout: fixed;
+}
+
 #logsTable th:nth-child(1),
 #logsTable td:nth-child(1) {
-  width: 80px;
+  width: 92px;
 }
 
 #logsTable th:nth-child(3),
@@ -918,8 +923,20 @@ td input[type="checkbox"] {
 
 #logsTable th:nth-child(7),
 #logsTable td:nth-child(7) {
-  min-width: 220px;
-  width: 32%;
+  width: 64px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+#logsTable th:nth-child(8),
+#logsTable td:nth-child(8) {
+  width: 220px;
+}
+
+#logsTable th:nth-child(9),
+#logsTable td:nth-child(9) {
+  width: 64px;
+  white-space: nowrap;
 }
 
 #logsTable td {
@@ -959,11 +976,24 @@ td input[type="checkbox"] {
   word-break: break-word;
 }
 
+.log-credits-cell {
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-credits-cell.estimated {
+  color: var(--muted);
+}
+
 .log-prompt-cell {
   color: var(--text-secondary);
   line-height: 1.4;
-  word-break: break-word;
-  overflow-wrap: anywhere;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .log-state {

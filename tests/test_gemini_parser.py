@@ -23,6 +23,7 @@ from api.routes.gemini_native import (
     GeminiNativeError,
     decode_inline_image,
     parse_gemini_request,
+    parse_veo_request,
     read_limited_body,
     resolve_model_action,
 )
@@ -111,6 +112,10 @@ def _flash_spec():
     return GEMINI_MODELS["gemini-3.1-flash-image"]
 
 
+def _veo_spec():
+    return GEMINI_MODELS["veo-3.1-generate-preview"]
+
+
 def test_model_registry_contains_exact_supported_aliases():
     expected_image_models = {
         "gemini-3-pro-image",
@@ -118,7 +123,13 @@ def test_model_registry_contains_exact_supported_aliases():
         "gemini-3.1-flash-image",
         "gemini-3.1-flash-image-preview",
     }
-    assert set(GEMINI_MODELS) == expected_image_models | set(TEST_TEXT_MODELS)
+    expected_video_models = {
+        "veo-3.1-generate-preview",
+        "veo-3.1-fast-generate-preview",
+    }
+    assert set(GEMINI_MODELS) == (
+        expected_image_models | expected_video_models | set(TEST_TEXT_MODELS)
+    )
     for model_id in ("gemini-3-pro-image", "gemini-3-pro-image-preview"):
         spec = GEMINI_MODELS[model_id]
         assert spec.model_id == model_id
@@ -142,6 +153,10 @@ def test_model_registry_contains_exact_supported_aliases():
         assert spec.upstream_model_id is None
         assert spec.upstream_model_version is None
         assert spec.aspect_ratios == frozenset()
+    for model_id in expected_video_models:
+        spec = GEMINI_MODELS[model_id]
+        assert spec.family == "video"
+        assert spec.supported_actions == frozenset({"predictLongRunning"})
 
 
 @pytest.mark.parametrize(
@@ -181,6 +196,87 @@ def test_resolve_model_action_rejects_unknown_model_or_action(model_action):
         resolve_model_action(model_action)
     assert exc_info.value.code == 404
     assert exc_info.value.status == "NOT_FOUND"
+
+
+def test_video_models_only_support_predict_long_running():
+    spec, action = resolve_model_action(
+        "veo-3.1-generate-preview:predictLongRunning"
+    )
+    assert spec is _veo_spec()
+    assert action == "predictLongRunning"
+
+    with pytest.raises(GeminiNativeError) as exc_info:
+        resolve_model_action("veo-3.1-generate-preview:generateContent")
+    assert exc_info.value.code == 404
+
+
+@pytest.mark.parametrize(
+    ("parameters", "expected"),
+    [
+        ({}, ("16:9", 8, "720p", "")),
+        (
+            {
+                "aspectRatio": "9:16",
+                "durationSeconds": 8,
+                "resolution": "1080p",
+                "negativePrompt": "no captions",
+            },
+            ("9:16", 8, "1080p", "no captions"),
+        ),
+        (
+            {
+                "aspect_ratio": "9:16",
+                "duration_seconds": 6,
+                "resolution": "720p",
+                "negative_prompt": "no captions",
+            },
+            ("9:16", 6, "720p", "no captions"),
+        ),
+    ],
+)
+def test_parse_veo_request_accepts_supported_parameters(parameters, expected):
+    raw = json.dumps(
+        {
+            "instances": [{"prompt": "make a video"}],
+            "parameters": parameters,
+        }
+    ).encode("utf-8")
+
+    parsed = parse_veo_request(raw, _veo_spec())
+
+    assert parsed.prompt == "make a video"
+    assert (
+        parsed.aspect_ratio,
+        parsed.duration,
+        parsed.resolution,
+        parsed.negative_prompt,
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"instances": []},
+        {"instances": [{"prompt": "p"}, {"prompt": "second"}]},
+        {"instances": [{"prompt": ""}]},
+        {"instances": [{"prompt": "p", "image": {"bytes": "x"}}]},
+        {"instances": [{"prompt": "p"}], "parameters": {"durationSeconds": 12}},
+        {"instances": [{"prompt": "p"}], "parameters": {"resolution": "4k"}},
+        {
+            "instances": [{"prompt": "p"}],
+            "parameters": {"durationSeconds": 6, "resolution": "1080p"},
+        },
+        {
+            "instances": [{"prompt": "p"}],
+            "parameters": {"personGeneration": "allow_all"},
+        },
+    ],
+)
+def test_parse_veo_request_rejects_unsupported_shapes_and_combinations(payload):
+    _assert_invalid(
+        lambda: parse_veo_request(json.dumps(payload).encode("utf-8"), _veo_spec())
+    )
 
 
 def test_read_limited_body_uses_exact_64_mib_limit_and_caches_body():
@@ -525,6 +621,70 @@ def test_parse_rejects_unsupported_image_sizes(image_size):
         lambda: parse_gemini_request(
             _body(generation_config={"imageConfig": {"imageSize": image_size}}),
             _pro_spec(),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "generation_config",
+    [
+        {"imageConfig": {"aspect_ratio": "16:9", "image_size": "2K"}},
+        {"image_config": {"aspect_ratio": "16:9", "image_size": "2K"}},
+        {"image_config": {"aspectRatio": "16:9", "imageSize": "2K"}},
+    ],
+)
+def test_parse_accepts_snake_case_image_config_aliases(generation_config):
+    parsed = parse_gemini_request(
+        _body(generation_config=generation_config),
+        _pro_spec(),
+    )
+    assert parsed.aspect_ratio == "16:9"
+    assert parsed.image_size == "2K"
+
+
+def test_parse_accepts_snake_case_generation_config_alias():
+    payload = {
+        "contents": [{"parts": [{"text": "draw"}]}],
+        "generation_config": {"imageConfig": {"aspectRatio": "9:16"}},
+    }
+    parsed = parse_gemini_request(
+        json.dumps(payload).encode("utf-8"),
+        _pro_spec(),
+    )
+    assert parsed.aspect_ratio == "9:16"
+
+
+def test_parse_prefers_camel_case_over_snake_case():
+    parsed = parse_gemini_request(
+        _body(
+            generation_config={
+                "imageConfig": {
+                    "aspectRatio": "16:9",
+                    "aspect_ratio": "4:3",
+                    "imageSize": "4K",
+                    "image_size": "2K",
+                }
+            }
+        ),
+        _pro_spec(),
+    )
+    assert parsed.aspect_ratio == "16:9"
+    assert parsed.image_size == "4K"
+
+
+@pytest.mark.parametrize(
+    "image_config",
+    [
+        {"aspect_ratio": "16:10"},
+        {"aspect_ratio": 1},
+        {"image_size": "8K"},
+    ],
+)
+def test_parse_validates_snake_case_values_like_camel_case(image_config):
+    _assert_invalid(
+        lambda: parse_gemini_request(
+            _body(generation_config={"imageConfig": image_config}),
+            _flash_spec(),
         )
     )
 

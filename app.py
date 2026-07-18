@@ -1,5 +1,4 @@
 import os
-import json
 import logging
 import time
 import uuid
@@ -24,6 +23,7 @@ from api.routes.admin import build_admin_router
 from api.routes.entity import build_entity_router
 from api.routes.gemini_native import build_gemini_native_router
 from api.routes.generation import build_generation_router
+from api.routes.openai_videos import build_openai_videos_router
 from api.streaming import sse_chat_stream
 
 try:
@@ -40,6 +40,7 @@ from core.adobe_client import (
 )
 from core.token_mgr import token_manager
 from core.config_mgr import config_manager
+from core.credits_tracker import CreditsTracker
 from core.refresh_mgr import refresh_manager
 from core.stores import (
     ErrorDetailRecord,
@@ -48,6 +49,12 @@ from core.stores import (
     LiveRequestStore,
     RequestLogRecord,
     RequestLogStore,
+)
+from core.video_generation import generate_video_file
+from core.video_tasks import (
+    VideoTaskManager,
+    VideoTaskStore,
+    build_video_task_runner,
 )
 from core.models import (
     MODEL_CATALOG,
@@ -126,8 +133,40 @@ store = JobStore()
 log_store = RequestLogStore(DATA_DIR / "request_logs.jsonl", max_items=5000)
 error_store = ErrorDetailStore(DATA_DIR / "request_errors.jsonl", max_items=5000)
 live_log_store = LiveRequestStore(max_items=2000)
+video_task_store = VideoTaskStore(DATA_DIR / "video_tasks.jsonl", max_items=500)
 client = AdobeClient()
+credits_tracker = CreditsTracker(
+    refresh_manager=refresh_manager,
+    token_manager=token_manager,
+    log_store=log_store,
+    learned_costs_path=DATA_DIR / "credit_costs_learned.json",
+    model_catalog=MODEL_CATALOG,
+    video_model_catalog=VIDEO_MODEL_CATALOG,
+)
 refresh_manager.start()
+
+
+def _extract_responses_prompt(input_value: Any) -> str:
+    if isinstance(input_value, str):
+        return input_value.strip()
+    if not isinstance(input_value, list):
+        return ""
+    for item in reversed(input_value):
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if not isinstance(content, list):
+            return ""
+        texts: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in {"input_text", "text"}:
+                text = str(part.get("text") or "").strip()
+                if text:
+                    texts.append(text)
+        return "\n".join(texts).strip()
+    return ""
 
 
 def _extract_logging_fields(raw_body: bytes) -> dict[str, Optional[str]]:
@@ -152,6 +191,8 @@ def _extract_logging_fields(raw_body: bytes) -> dict[str, Optional[str]]:
             model = f"entity:{entity_type or 'object'}"
         if not prompt:
             prompt = _extract_prompt_from_messages(data.get("messages") or [])
+        if not prompt:
+            prompt = _extract_responses_prompt(data.get("input"))
         if prompt:
             prompt = prompt.replace("\r", " ").replace("\n", " ").strip()
             prompt = prompt[:180]
@@ -162,10 +203,18 @@ def _extract_logging_fields(raw_body: bytes) -> dict[str, Optional[str]]:
 
 def _resolve_request_operation(method: str, path: str) -> str:
     normalized_method = str(method or "").upper()
+    if path == "/v1/videos" and normalized_method == "POST":
+        return "videos.create"
+    if path.startswith("/v1/videos/") and normalized_method == "GET":
+        return "videos.content" if path.endswith("/content") else "videos.get"
     if path == "/v1/chat/completions":
         return "chat.completions"
+    if path == "/v1/responses":
+        return "responses.create"
     if path == "/v1/images/generations":
         return "images.generations"
+    if path == "/v1/images/edits":
+        return "images.edits"
     if path == "/api/v1/generate":
         return "api.generate"
     if path == "/v1/entities" and normalized_method == "POST":
@@ -177,6 +226,12 @@ def _resolve_request_operation(method: str, path: str) -> str:
     if not path.startswith(prefix):
         return ""
     tail = path[len(prefix):]
+    if (
+        normalized_method == "GET"
+        and "/operations/" in tail
+        and ":" not in tail
+    ):
+        return "gemini.operations.get"
     if normalized_method == "GET" and tail and ":" not in tail:
         return "gemini.models.get"
     if normalized_method != "POST":
@@ -188,6 +243,7 @@ def _resolve_request_operation(method: str, path: str) -> str:
         "generateContent": "gemini.generateContent",
         "streamGenerateContent": "gemini.streamGenerateContent",
         "countTokens": "gemini.countTokens",
+        "predictLongRunning": "gemini.predictLongRunning",
     }.get(action, "")
 
 
@@ -196,6 +252,8 @@ def _gemini_model_from_path(path: str) -> Optional[str]:
     if not path.startswith(prefix):
         return None
     tail = path[len(prefix):]
+    if "/operations/" in tail:
+        tail = tail.split("/operations/", 1)[0]
     model = tail.rpartition(":")[0] if ":" in tail else tail
     return model or None
 
@@ -225,6 +283,24 @@ def _set_request_logging_fields(
         {
             "model": request.state.log_model,
             "prompt_preview": request.state.log_prompt_preview,
+            "ts": time.time(),
+        },
+    )
+
+
+def _set_request_credit_context(
+    request: Request,
+    model: Optional[str],
+    output_resolution: Optional[str],
+) -> None:
+    normalized_model = str(model or "").strip() or None
+    normalized_resolution = str(output_resolution or "").strip().upper() or None
+    request.state.log_model = normalized_model
+    request.state.log_output_resolution = normalized_resolution
+    _upsert_live_request(
+        request,
+        {
+            "model": normalized_model,
             "ts": time.time(),
         },
     )
@@ -384,7 +460,35 @@ def _set_request_task_progress(
 def _set_request_token_context(request: Request, token: str, attempt: int) -> dict:
     meta = token_manager.get_meta_by_value(token)
     try:
-        request.state.log_token_id = meta.get("token_id")
+        token_id = str(meta.get("token_id") or "").strip()
+        account_id = str(meta.get("token_account_id") or "").strip()
+        request_id = str(getattr(request.state, "log_id", "") or "").strip()
+        previous_token_id = str(
+            getattr(request.state, "log_credit_token_id", "") or ""
+        ).strip()
+        previous_request_id = str(
+            getattr(request.state, "log_credit_request_id", "") or request_id
+        ).strip()
+        previous_account_id = str(
+            getattr(request.state, "log_credit_account_id", "") or ""
+        ).strip()
+        if previous_token_id and previous_token_id != token_id:
+            credits_tracker.finish(
+                previous_token_id,
+                previous_request_id,
+                account_id=previous_account_id or None,
+                completed=False,
+            )
+        if token_id and request_id and previous_token_id != token_id:
+            credits_tracker.begin(
+                token_id,
+                request_id,
+                account_id=account_id or None,
+            )
+        request.state.log_credit_token_id = token_id or None
+        request.state.log_credit_account_id = account_id or None
+        request.state.log_credit_request_id = request_id or None
+        request.state.log_token_id = token_id or None
         request.state.log_token_account_id = meta.get("token_account_id")
         request.state.log_token_account_name = meta.get("token_account_name")
         request.state.log_token_account_email = meta.get("token_account_email")
@@ -405,6 +509,66 @@ def _set_request_token_context(request: Request, token: str, attempt: int) -> di
     except Exception:
         pass
     return meta
+
+
+def _finalize_request_credits(
+    request: Request,
+    successful_payload: Optional[dict],
+    log_generation: Optional[int] = None,
+) -> None:
+    try:
+        token_id = str(
+            getattr(request.state, "log_credit_token_id", "") or ""
+        ).strip()
+        request_id = str(
+            getattr(request.state, "log_credit_request_id", "")
+            or getattr(request.state, "log_id", "")
+            or ""
+        ).strip()
+        account_id = str(
+            getattr(request.state, "log_credit_account_id", "") or ""
+        ).strip()
+        if not token_id or not request_id:
+            return
+        request.state.log_credit_token_id = None
+        request.state.log_credit_account_id = None
+        request.state.log_credit_request_id = None
+        if not isinstance(successful_payload, dict):
+            credits_tracker.finish(
+                token_id,
+                request_id,
+                account_id=account_id or None,
+                completed=False,
+            )
+            return
+        log_id = str(successful_payload.get("id") or "").strip()
+        if not log_id:
+            credits_tracker.finish(
+                token_id,
+                request_id,
+                account_id=account_id or None,
+                completed=False,
+            )
+            return
+        credits_tracker.complete(
+            token_id=token_id,
+            account_id=account_id or None,
+            request_id=request_id,
+            log_id=log_id,
+            log_generation=log_generation,
+            payload=successful_payload,
+            model_id=str(
+                successful_payload.get("model")
+                or getattr(request.state, "log_model", "")
+                or ""
+            ),
+            output_resolution=(
+                str(getattr(request.state, "log_output_resolution", "") or "")
+                or None
+            ),
+        )
+    except Exception:
+        logger.warning("failed to finalize request credit tracking", exc_info=True)
 
 
 def _append_attempt_log(
@@ -490,13 +654,22 @@ async def request_logger(request: Request, call_next):
     operation = _resolve_request_operation(method, path)
     should_log = bool(operation)
     is_gemini = path == "/v1beta/models" or path.startswith("/v1beta/models/")
+    is_sora_submit = method == "POST" and path == "/v1/videos"
+    # multipart 请求(图片编辑): body 无法按 JSON 提取字段,也不该整个缓冲进内存;
+    # model/prompt 由路由内部通过 set_request_logging_fields 上报
+    is_images_edit = method == "POST" and path == "/v1/images/edits"
 
     if should_log:
         request.state.log_id = uuid.uuid4().hex[:12]
         if is_gemini:
             request.state.log_model = _gemini_model_from_path(path)
         try:
-            if method in {"POST", "PUT", "PATCH"} and not is_gemini:
+            if (
+                method in {"POST", "PUT", "PATCH"}
+                and not is_gemini
+                and not is_sora_submit
+                and not is_images_edit
+            ):
                 raw_body = await request.body()
                 request._body = raw_body
                 body_meta = _extract_logging_fields(raw_body)
@@ -551,7 +724,15 @@ async def request_logger(request: Request, call_next):
         )
         raise
     finally:
-        if should_log:
+        if should_log and bool(
+            getattr(request.state, "log_managed_externally", False)
+        ):
+            log_id = str(getattr(request.state, "log_id", "") or "")
+            if log_id:
+                live_log_store.remove(log_id)
+        elif should_log:
+            successful_credit_payload = None
+            successful_credit_generation = None
             has_attempt_logs = bool(
                 getattr(request.state, "log_has_attempt_logs", False)
             )
@@ -563,7 +744,22 @@ async def request_logger(request: Request, call_next):
             attempt_records = getattr(request.state, "log_attempt_records", None)
             if isinstance(attempt_records, list) and attempt_records:
                 for payload in attempt_records:
-                    log_store.add_payload(payload)
+                    written_generation = log_store.add_payload(payload)
+                    try:
+                        attempt_status = int(payload.get("status_code") or 0)
+                    except Exception:
+                        attempt_status = 0
+                    attempt_task_status = str(
+                        payload.get("task_status") or ""
+                    ).upper()
+                    if (
+                        200 <= int(status_code or 0) < 300
+                        and 200 <= attempt_status < 300
+                        and attempt_task_status == "COMPLETED"
+                        and str(payload.get("token_id") or "").strip()
+                    ):
+                        successful_credit_payload = payload
+                        successful_credit_generation = written_generation
 
             if not has_attempt_logs:
                 duration_sec = int(time.time() - started)
@@ -636,6 +832,11 @@ async def request_logger(request: Request, call_next):
                         )
                     ),
                 )
+            _finalize_request_credits(
+                request,
+                successful_credit_payload,
+                successful_credit_generation,
+            )
             live_log_store.remove(log_id)
     return response
 
@@ -1366,6 +1567,64 @@ def _video_ext_from_meta(meta: dict) -> str:
 _reconcile_generated_storage(force=True)
 
 
+def _write_submitted_video_log(spec, record) -> None:
+    payload = asdict(
+        RequestLogRecord(
+            id=spec.log_id,
+            ts=time.time(),
+            method="POST",
+            path=(
+                "/v1/videos"
+                if spec.protocol == "openai"
+                else f"/v1beta/models/{spec.model}:predictLongRunning"
+            ),
+            status_code=200,
+            duration_sec=0,
+            operation=(
+                "videos.create"
+                if spec.protocol == "openai"
+                else "gemini.predictLongRunning"
+            ),
+            model=spec.model,
+            prompt_preview=spec.prompt_preview,
+            task_status="QUEUED",
+            task_progress=0.0,
+        )
+    )
+    log_store.upsert(spec.log_id, payload)
+
+
+video_task_runner = build_video_task_runner(
+    token_manager=token_manager,
+    client=client,
+    credits_tracker=credits_tracker,
+    request_log_store=log_store,
+    generated_dir=GENERATED_DIR,
+    generate_video=generate_video_file,
+    on_generated_file_written=_on_generated_file_written,
+    quota_error_cls=QuotaExhaustedError,
+    auth_error_cls=AuthError,
+    upstream_temp_error_cls=UpstreamTemporaryError,
+    adobe_error_cls=AdobeRequestError,
+    logger=logger,
+)
+video_task_manager = VideoTaskManager(
+    video_task_store,
+    video_task_runner,
+    max_workers=2,
+    max_pending=20,
+    on_submitted=_write_submitted_video_log,
+)
+
+
+def _shutdown_video_services() -> None:
+    video_task_manager.close()
+    credits_tracker.close()
+
+
+app.add_event_handler("shutdown", _shutdown_video_services)
+
+
 app.include_router(
     build_admin_router(
         static_dir=STATIC_DIR,
@@ -1383,10 +1642,21 @@ app.include_router(
 )
 
 app.include_router(
+    build_openai_videos_router(
+        task_manager=video_task_manager,
+        task_store=video_task_store,
+        require_service_api_key=_require_service_api_key,
+        public_generated_url=_public_generated_url,
+    )
+)
+
+app.include_router(
     build_generation_router(
         store=store,
         token_manager=token_manager,
         client=client,
+        credits_tracker=credits_tracker,
+        request_log_store=log_store,
         generated_dir=GENERATED_DIR,
         model_catalog=MODEL_CATALOG,
         video_model_catalog=VIDEO_MODEL_CATALOG,
@@ -1395,6 +1665,7 @@ app.include_router(
         resolve_ratio_and_resolution=resolve_ratio_and_resolution,
         require_service_api_key=_require_service_api_key,
         set_request_task_progress=_set_request_task_progress,
+        set_request_credit_context=_set_request_credit_context,
         run_with_token_retries=_run_with_token_retries,
         set_request_error_detail=_set_request_error_detail,
         set_request_preview=_set_request_preview,
@@ -1402,6 +1673,8 @@ app.include_router(
         public_generated_url=_public_generated_url,
         resolve_video_options=_resolve_video_options,
         load_input_images=_load_input_images,
+        normalize_image_mime=_normalize_image_mime,
+        set_request_logging_fields=_set_request_logging_fields,
         prepare_video_source_image=_prepare_video_source_image,
         video_ext_from_meta=_video_ext_from_meta,
         extract_prompt_from_messages=_extract_prompt_from_messages,
@@ -1423,6 +1696,7 @@ app.include_router(
         set_request_error_detail=_set_request_error_detail,
         set_request_task_progress=_set_request_task_progress,
         set_request_logging_fields=_set_request_logging_fields,
+        set_request_credit_context=_set_request_credit_context,
         set_request_preview=_set_request_preview,
         public_image_url=_public_image_url,
         on_generated_file_written=_on_generated_file_written,
@@ -1431,6 +1705,9 @@ app.include_router(
         upstream_temp_error_cls=UpstreamTemporaryError,
         adobe_error_cls=AdobeRequestError,
         logger=logger,
+        video_task_manager=video_task_manager,
+        video_task_store=video_task_store,
+        public_generated_url=_public_generated_url,
     )
 )
 

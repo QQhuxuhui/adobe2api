@@ -9,6 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Sequence
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -20,8 +21,14 @@ from core.models.gemini_usage import (
     build_count_tokens_response,
     build_image_usage_metadata,
 )
+from core.video_tasks import (
+    VideoTaskCapacityError,
+    VideoTaskSpec,
+    VideoTaskStorageError,
+)
 
 GEMINI_NATIVE_MAX_BODY_BYTES = 64 * 1024 * 1024
+GEMINI_VIDEO_MAX_BODY_BYTES = 1024 * 1024
 GEMINI_MAX_IMAGE_BYTES = 20 * 1024 * 1024
 GEMINI_MAX_TOTAL_IMAGE_BYTES = 40 * 1024 * 1024
 GEMINI_MAX_IMAGES = 6
@@ -42,8 +49,14 @@ TEST_TEXT_MODELS = frozenset(
         "gemini-3.1-pro-preview",
     }
 )
-GEMINI_NATIVE_ACTIONS = frozenset(
+GEMINI_CONTENT_ACTIONS = frozenset(
     {"generateContent", "streamGenerateContent", "countTokens"}
+)
+GEMINI_ACTION_ORDER = (
+    "generateContent",
+    "streamGenerateContent",
+    "countTokens",
+    "predictLongRunning",
 )
 
 
@@ -55,6 +68,9 @@ class GeminiModelSpec:
     upstream_model_id: str | None
     upstream_model_version: str | None
     aspect_ratios: frozenset[str]
+    supported_actions: frozenset[str] = GEMINI_CONTENT_ACTIONS
+    video_engine: str | None = None
+    video_upstream_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +80,15 @@ class ParsedGeminiRequest:
     aspect_ratio: str
     image_size: str
     candidate_count: int
+
+
+@dataclass(frozen=True)
+class ParsedVeoRequest:
+    prompt: str
+    aspect_ratio: str
+    duration: int
+    resolution: str
+    negative_prompt: str
 
 
 class GeminiNativeError(Exception):
@@ -88,6 +113,25 @@ def _image_model(
         upstream_model_id="gemini-flash",
         upstream_model_version=upstream_model_version,
         aspect_ratios=aspect_ratios,
+    )
+
+
+def _video_model(
+    model_id: str,
+    *,
+    engine: str,
+    upstream_model: str,
+) -> GeminiModelSpec:
+    return GeminiModelSpec(
+        model_id=model_id,
+        display_name=model_id,
+        family="video",
+        upstream_model_id=None,
+        upstream_model_version=None,
+        aspect_ratios=frozenset({"16:9", "9:16"}),
+        supported_actions=frozenset({"predictLongRunning"}),
+        video_engine=engine,
+        video_upstream_model=upstream_model,
     )
 
 
@@ -116,6 +160,16 @@ GEMINI_MODELS: dict[str, GeminiModelSpec] = {
         upstream_model_version="nano-banana-3",
         aspect_ratios=FLASH_RATIOS,
     ),
+    "veo-3.1-generate-preview": _video_model(
+        "veo-3.1-generate-preview",
+        engine="veo31-standard",
+        upstream_model="google:firefly:colligo:veo31",
+    ),
+    "veo-3.1-fast-generate-preview": _video_model(
+        "veo-3.1-fast-generate-preview",
+        engine="veo31-fast",
+        upstream_model="google:firefly:colligo:veo31-fast",
+    ),
     **{
         model_id: GeminiModelSpec(
             model_id=model_id,
@@ -139,26 +193,31 @@ def resolve_model_action(model_action: str) -> tuple[GeminiModelSpec, str]:
         raise GeminiNativeError(404, "Model or action not found", "NOT_FOUND")
     model_id, separator, action = model_action.rpartition(":")
     model_spec = GEMINI_MODELS.get(model_id) if separator else None
-    if model_spec is None or action not in GEMINI_NATIVE_ACTIONS:
+    if model_spec is None or action not in model_spec.supported_actions:
         raise GeminiNativeError(404, "Model or action not found", "NOT_FOUND")
     return model_spec, action
 
 
-async def read_limited_body(request: Request) -> bytes:
+async def read_limited_body(request: Request, max_bytes: int | None = None) -> bytes:
+    limit = (
+        GEMINI_NATIVE_MAX_BODY_BYTES
+        if max_bytes is None
+        else max(1, int(max_bytes))
+    )
     content_length = request.headers.get("content-length")
     if content_length:
         try:
             declared = int(content_length)
         except ValueError:
             declared = -1
-        if declared > GEMINI_NATIVE_MAX_BODY_BYTES:
+        if declared > limit:
             raise _invalid("Request body is too large")
 
     chunks: list[bytes] = []
     total = 0
     async for chunk in request.stream():
         total += len(chunk)
-        if total > GEMINI_NATIVE_MAX_BODY_BYTES:
+        if total > limit:
             raise _invalid("Request body is too large")
         chunks.append(chunk)
     raw_body = b"".join(chunks)
@@ -213,6 +272,14 @@ def _validate_parts(parts: Any, *, container_name: str) -> list[dict[str, Any]]:
     return validated
 
 
+def _config_field(config: dict[str, Any], camel: str, snake: str, default: Any) -> Any:
+    if camel in config:
+        return config[camel]
+    if snake in config:
+        return config[snake]
+    return default
+
+
 def _decode_request_json(raw_body: bytes) -> dict[str, Any]:
     try:
         payload = json.loads(raw_body.decode("utf-8"))
@@ -232,10 +299,11 @@ def parse_gemini_request(
     if not isinstance(contents, list) or not contents:
         raise _invalid("contents must be a non-empty array")
 
-    generation_config = payload.get("generationConfig", {})
+    # 与 Google proto3 JSON 一致:camelCase 与 snake_case 字段名都接受,camelCase 优先。
+    generation_config = _config_field(payload, "generationConfig", "generation_config", {})
     if not isinstance(generation_config, dict):
         raise _invalid("generationConfig must be an object")
-    image_config = generation_config.get("imageConfig", {})
+    image_config = _config_field(generation_config, "imageConfig", "image_config", {})
     if not isinstance(image_config, dict):
         raise _invalid("generationConfig.imageConfig must be an object")
 
@@ -260,13 +328,13 @@ def parse_gemini_request(
     if type(candidate_count) is not int or candidate_count != 1:
         raise _invalid("candidateCount must be 1")
 
-    aspect_ratio = image_config.get("aspectRatio", "1:1")
+    aspect_ratio = _config_field(image_config, "aspectRatio", "aspect_ratio", "1:1")
     if not isinstance(aspect_ratio, str):
         raise _invalid("aspectRatio must be a supported string")
     if model_spec.family != "text" and aspect_ratio not in model_spec.aspect_ratios:
         raise _invalid("Unsupported aspectRatio")
 
-    image_size_value = image_config.get("imageSize", "1K")
+    image_size_value = _config_field(image_config, "imageSize", "image_size", "1K")
     if not isinstance(image_size_value, str):
         raise _invalid("imageSize must be a supported string")
     image_size = image_size_value.upper()
@@ -316,6 +384,97 @@ def parse_gemini_request(
     )
 
 
+def parse_veo_request(
+    raw_body: bytes,
+    model_spec: GeminiModelSpec,
+) -> ParsedVeoRequest:
+    if model_spec.family != "video":
+        raise _invalid("Model does not support video generation")
+    payload = _decode_request_json(raw_body)
+    instances = payload.get("instances")
+    if not isinstance(instances, list) or len(instances) != 1:
+        raise _invalid("instances must contain exactly one item")
+    instance = instances[0]
+    if not isinstance(instance, dict):
+        raise _invalid("instances entries must be objects")
+    prompt = instance.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise _invalid("instances[0].prompt must be a non-empty string")
+    for field in (
+        "image",
+        "video",
+        "referenceImages",
+        "reference_images",
+        "lastFrame",
+        "last_frame",
+    ):
+        if field in instance:
+            raise _invalid(f"Unsupported parameter: {field}")
+
+    parameters = payload.get("parameters", {})
+    if not isinstance(parameters, dict):
+        raise _invalid("parameters must be an object")
+    for field in ("image", "video", "referenceImages", "reference_images"):
+        if field in parameters:
+            raise _invalid(f"Unsupported parameter: {field}")
+
+    aspect_ratio = _config_field(
+        parameters,
+        "aspectRatio",
+        "aspect_ratio",
+        "16:9",
+    )
+    if not isinstance(aspect_ratio, str) or aspect_ratio not in model_spec.aspect_ratios:
+        raise _invalid("Unsupported aspectRatio")
+
+    raw_duration = _config_field(
+        parameters,
+        "durationSeconds",
+        "duration_seconds",
+        8,
+    )
+    if isinstance(raw_duration, bool) or not isinstance(raw_duration, (int, float)):
+        raise _invalid("durationSeconds must be 4, 6, or 8")
+    duration = int(raw_duration)
+    if float(raw_duration) != float(duration) or duration not in {4, 6, 8}:
+        raise _invalid("durationSeconds must be 4, 6, or 8")
+
+    raw_resolution = parameters.get("resolution", "720p")
+    if not isinstance(raw_resolution, str):
+        raise _invalid("resolution must be 720p or 1080p")
+    resolution = raw_resolution.strip().lower()
+    if resolution not in {"720p", "1080p"}:
+        raise _invalid("resolution must be 720p or 1080p")
+    if resolution == "1080p" and duration != 8:
+        raise _invalid("1080p resolution requires durationSeconds=8")
+
+    negative_prompt = _config_field(
+        parameters,
+        "negativePrompt",
+        "negative_prompt",
+        "",
+    )
+    if not isinstance(negative_prompt, str):
+        raise _invalid("negativePrompt must be a string")
+
+    person_generation = _config_field(
+        parameters,
+        "personGeneration",
+        "person_generation",
+        None,
+    )
+    if person_generation not in (None, ""):
+        raise _invalid("Unsupported parameter: personGeneration")
+
+    return ParsedVeoRequest(
+        prompt=prompt.strip(),
+        aspect_ratio=aspect_ratio,
+        duration=duration,
+        resolution=resolution,
+        negative_prompt=negative_prompt.strip(),
+    )
+
+
 def google_error(error: GeminiNativeError) -> JSONResponse:
     return JSONResponse(
         status_code=error.code,
@@ -334,11 +493,18 @@ def model_resource(spec: GeminiModelSpec) -> dict:
         "name": f"models/{spec.model_id}",
         "displayName": spec.display_name,
         "supportedGenerationMethods": [
-            "generateContent",
-            "streamGenerateContent",
-            "countTokens",
+            action for action in GEMINI_ACTION_ORDER if action in spec.supported_actions
         ],
     }
+
+
+def video_proxy_uri(uri: str) -> str:
+    parsed = urlsplit(str(uri or ""))
+    query = [(key, value) for key, value in parse_qsl(parsed.query) if key != "key"]
+    query.append(("key", "proxy"))
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
+    )
 
 
 def build_image_response(
@@ -406,6 +572,7 @@ def build_gemini_native_router(
     set_request_error_detail,
     set_request_task_progress,
     set_request_logging_fields,
+    set_request_credit_context,
     set_request_preview,
     public_image_url,
     on_generated_file_written,
@@ -414,6 +581,9 @@ def build_gemini_native_router(
     upstream_temp_error_cls,
     adobe_error_cls,
     logger,
+    video_task_manager=None,
+    video_task_store=None,
+    public_generated_url=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -440,6 +610,14 @@ def build_gemini_native_router(
     def error_response(request: Request, exc: Exception) -> JSONResponse:
         if isinstance(exc, GeminiNativeError):
             error = exc
+        elif isinstance(exc, VideoTaskCapacityError):
+            error = GeminiNativeError(
+                429, "Video task queue is full", "RESOURCE_EXHAUSTED"
+            )
+        elif isinstance(exc, VideoTaskStorageError):
+            error = GeminiNativeError(
+                500, "Unable to persist video task", "INTERNAL"
+            )
         elif isinstance(exc, quota_error_cls):
             error = GeminiNativeError(
                 429, "Resource exhausted", "RESOURCE_EXHAUSTED"
@@ -501,14 +679,129 @@ def build_gemini_native_router(
         except Exception as exc:
             return error_response(request, exc)
 
+    @router.get("/v1beta/models/{model}/operations/{operation_id}")
+    def get_video_operation(model: str, operation_id: str, request: Request):
+        try:
+            require_api_key(request)
+            spec = get_model(model)
+            if spec.family != "video" or video_task_store is None:
+                raise GeminiNativeError(404, "Operation not found", "NOT_FOUND")
+            record = video_task_store.get(operation_id)
+            if (
+                record is None
+                or record.protocol != "veo"
+                or record.model != spec.model_id
+            ):
+                raise GeminiNativeError(404, "Operation not found", "NOT_FOUND")
+            set_request_logging_fields(request, spec.model_id, None)
+            name = f"models/{spec.model_id}/operations/{record.id}"
+            if record.status == "completed":
+                if not record.result_url:
+                    raise GeminiNativeError(
+                        500, "Video task has no result URL", "INTERNAL"
+                    )
+                return {
+                    "name": name,
+                    "done": True,
+                    "response": {
+                        "@type": (
+                            "type.googleapis.com/google.ai.generativelanguage."
+                            "v1beta.GenerateVideoResponse"
+                        ),
+                        "generateVideoResponse": {
+                            "generatedSamples": [
+                                {
+                                    "video": {
+                                        "uri": video_proxy_uri(record.result_url)
+                                    }
+                                }
+                            ]
+                        },
+                    },
+                }
+            if record.status == "failed":
+                return {
+                    "name": name,
+                    "done": True,
+                    "error": {
+                        "code": 13,
+                        "message": record.error_message
+                        or "Video generation failed",
+                    },
+                }
+            return {
+                "name": name,
+                "done": False,
+                "metadata": {
+                    "progressPercent": int(
+                        max(0, min(float(record.progress or 0), 100))
+                    )
+                },
+            }
+        except Exception as exc:
+            return error_response(request, exc)
+
     @router.post("/v1beta/models/{model_action}")
     async def invoke_model(model_action: str, request: Request):
         try:
             require_api_key(request)
             spec, action = resolve_model_action(model_action)
-            raw_body = await read_limited_body(request)
+            raw_body = await read_limited_body(
+                request,
+                max_bytes=(
+                    GEMINI_VIDEO_MAX_BODY_BYTES if spec.family == "video" else None
+                ),
+            )
+            if spec.family == "video":
+                if video_task_manager is None or public_generated_url is None:
+                    raise GeminiNativeError(
+                        503, "Video task service is unavailable", "UNAVAILABLE"
+                    )
+                parsed_video = parse_veo_request(raw_body, spec)
+                set_request_logging_fields(
+                    request, spec.model_id, parsed_video.prompt
+                )
+                operation_id = f"operation_{uuid.uuid4().hex}"
+                log_id = str(
+                    getattr(request.state, "log_id", "") or uuid.uuid4().hex[:12]
+                )
+                ratio_suffix = parsed_video.aspect_ratio.replace(":", "x")
+                catalog_prefix = (
+                    "firefly-veo31-fast"
+                    if spec.video_engine == "veo31-fast"
+                    else "firefly-veo31"
+                )
+                task_spec = VideoTaskSpec(
+                    id=operation_id,
+                    protocol="veo",
+                    model=spec.model_id,
+                    prompt=parsed_video.prompt,
+                    prompt_preview=parsed_video.prompt.replace("\r", " ")
+                    .replace("\n", " ")[:180],
+                    engine=str(spec.video_engine or ""),
+                    upstream_model=str(spec.video_upstream_model or ""),
+                    duration=parsed_video.duration,
+                    aspect_ratio=parsed_video.aspect_ratio,
+                    resolution=parsed_video.resolution,
+                    requested_size=parsed_video.resolution,
+                    negative_prompt=parsed_video.negative_prompt,
+                    credit_model_id=(
+                        f"{catalog_prefix}-{parsed_video.duration}s-"
+                        f"{ratio_suffix}-{parsed_video.resolution}"
+                    ),
+                    result_url_prefix=str(public_generated_url(request, "")),
+                    log_id=log_id,
+                )
+                video_task_manager.submit(task_spec)
+                request.state.log_managed_externally = True
+                return {
+                    "name": f"models/{spec.model_id}/operations/{operation_id}"
+                }
             parsed = parse_gemini_request(raw_body, spec)
             set_request_logging_fields(request, spec.model_id, parsed.prompt)
+
+            if action != "countTokens" and spec.family != "text":
+                set_request_credit_context(request, spec.model_id, parsed.image_size)
 
             if action == "countTokens":
                 return build_count_tokens_response(

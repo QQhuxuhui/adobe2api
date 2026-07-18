@@ -1,18 +1,30 @@
+import base64
 import re
 import secrets
-import threading
 import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
+from api.openai_responses import (
+    ResponsesRequestError,
+    build_responses_image_response,
+    encode_image_result,
+    iter_responses_image_sse,
+    parse_responses_image_request,
+)
 from api.schemas import GenerateRequest
 from core.entity_store import entity_store
+from core.image_generation import generate_image_artifact
 from core.models.resolver import build_image_usage
+from core.stores import RequestLogRecord
+from core.video_generation import generate_video_file
 
 
 def build_generation_router(
@@ -20,6 +32,8 @@ def build_generation_router(
     store,
     token_manager,
     client,
+    credits_tracker,
+    request_log_store,
     generated_dir: Path,
     model_catalog: dict,
     video_model_catalog: dict,
@@ -28,6 +42,7 @@ def build_generation_router(
     resolve_ratio_and_resolution: Callable[[dict, str | None], tuple[str, str, str]],
     require_service_api_key: Callable[[Request], None],
     set_request_task_progress: Callable[..., None],
+    set_request_credit_context: Callable[[Request, str, str], None],
     run_with_token_retries: Callable[..., Any],
     set_request_error_detail: Callable[..., str],
     set_request_preview: Callable[[Request, str, str], None],
@@ -35,6 +50,8 @@ def build_generation_router(
     public_generated_url: Callable[[Request, str], str],
     resolve_video_options: Callable[[dict], tuple[bool, str, str]],
     load_input_images: Callable[[Any], list[tuple[bytes, str]]],
+    normalize_image_mime: Callable[[str], str],
+    set_request_logging_fields: Callable[[Request, Any, Any], None],
     prepare_video_source_image: Callable[[bytes, str, str], tuple[bytes, str]],
     video_ext_from_meta: Callable[[dict], str],
     extract_prompt_from_messages: Callable[[Any], str],
@@ -242,6 +259,7 @@ def build_generation_router(
             data, model_id
         )
         model_conf = resolve_model(resolved_model_id)
+        set_request_credit_context(request, resolved_model_id, output_resolution)
 
         try:
             set_request_task_progress(
@@ -259,41 +277,19 @@ def build_generation_router(
                         error=update.get("error"),
                     )
 
-                job_id = uuid.uuid4().hex
-                out_path = generated_dir / f"{job_id}.png"
-                old_size = 0
-                try:
-                    if out_path.exists():
-                        old_size = int(out_path.stat().st_size)
-                except Exception:
-                    old_size = 0
-
-                image_bytes, _meta = client.generate(
+                artifact = generate_image_artifact(
+                    client=client,
                     token=token,
                     prompt=prompt,
                     aspect_ratio=ratio,
                     output_resolution=output_resolution,
-                    upstream_model_id=str(
-                        model_conf.get("upstream_model_id") or "gemini-flash"
-                    ),
-                    upstream_model_version=str(
-                        model_conf.get("upstream_model_version") or "nano-banana-2"
-                    ),
-                    quality_level=(
-                        client.gpt_image_quality
-                        if str(model_conf.get("upstream_model_id") or "") == "gpt-image"
-                        else None
-                    ),
-                    detail_level=model_conf.get("detail_level"),
-                    timeout=client.generate_timeout,
-                    out_path=out_path,
+                    model_config=model_conf,
+                    generated_dir=generated_dir,
+                    source_image_ids=[],
                     progress_cb=_image_progress_cb,
+                    on_generated_file_written=on_generated_file_written,
                 )
-                if image_bytes is not None:
-                    out_path.write_bytes(image_bytes)
-                new_size = int(out_path.stat().st_size) if out_path.exists() else 0
-                on_generated_file_written(out_path, old_size, new_size)
-                image_url = public_image_url(request, job_id)
+                image_url = public_image_url(request, artifact.job_id)
                 set_request_preview(request, image_url, kind="image")
                 return {
                     "created": int(time.time()),
@@ -438,6 +434,330 @@ def build_generation_router(
                 },
             )
 
+    def _openai_image_error_response(
+        request: Request, exc: Exception, *, endpoint: str, model_label: str
+    ) -> JSONResponse:
+        if isinstance(exc, quota_error_cls):
+            message, status_code, err_type = (
+                "Token quota exhausted",
+                429,
+                "rate_limit_error",
+            )
+        elif isinstance(exc, auth_error_cls):
+            message, status_code, err_type = (
+                "Token invalid or expired",
+                401,
+                "authentication_error",
+            )
+        elif isinstance(exc, upstream_temp_error_cls):
+            message, status_code, err_type = str(exc), 503, "server_error"
+        elif isinstance(exc, HTTPException):
+            message = str(exc.detail)
+            status_code = int(exc.status_code)
+            err_type = (
+                "invalid_request_error" if 400 <= status_code < 500 else "server_error"
+            )
+        else:
+            message, status_code, err_type = str(exc), 500, "server_error"
+            logger.exception(
+                "Unhandled error in %s log_id=%s model=%s",
+                endpoint,
+                getattr(request.state, "log_id", ""),
+                model_label,
+            )
+
+        include_traceback = status_code == 500 and not isinstance(exc, HTTPException)
+        error_code = ""
+        if not isinstance(exc, HTTPException) and not include_traceback:
+            error_code = str(getattr(request.state, "log_error_code", "") or "")
+        if not error_code:
+            error_code = set_request_error_detail(
+                request,
+                error=exc if include_traceback else message,
+                status_code=status_code,
+                error_type=err_type,
+                include_traceback=include_traceback,
+            )
+        set_request_task_progress(
+            request, task_status="FAILED", task_progress=0.0, error=message
+        )
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "error": {"message": message, "type": err_type, "code": error_code}
+            },
+        )
+
+    @router.post("/v1/responses")
+    def openai_responses(request: Request, data: Any = Body(None)):
+        require_service_api_key(request)
+
+        image_model_ids = {
+            model_id
+            for model_id, config in model_catalog.items()
+            if str(config.get("upstream_model_id") or "") == "gpt-image"
+        }
+        try:
+            parsed = parse_responses_image_request(data, image_model_ids)
+            ratio, output_resolution, resolved_model_id = resolve_ratio_and_resolution(
+                {"size": parsed.size, "quality": parsed.quality}, parsed.image_model
+            )
+            model_conf = resolve_model(resolved_model_id)
+            input_images = load_input_images(parsed.image_loader_messages())
+        except ResponsesRequestError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": str(exc),
+                        "type": "invalid_request_error",
+                        "param": exc.param,
+                    }
+                },
+            )
+        except Exception as exc:
+            return _openai_image_error_response(
+                request,
+                exc,
+                endpoint="/v1/responses",
+                model_label=(
+                    str(data.get("model") or "")
+                    if isinstance(data, dict)
+                    else ""
+                ),
+            )
+
+        set_request_logging_fields(request, resolved_model_id, parsed.prompt)
+        set_request_credit_context(request, resolved_model_id, output_resolution)
+        set_request_task_progress(request, task_status="IN_PROGRESS", task_progress=0.0)
+
+        def _run_once(token: str):
+            source_image_ids = [
+                client.upload_image(token, image_bytes, image_mime)
+                for image_bytes, image_mime in input_images
+            ]
+
+            def _image_progress_cb(update: dict):
+                set_request_task_progress(
+                    request,
+                    task_status=str(update.get("task_status") or "IN_PROGRESS"),
+                    task_progress=update.get("task_progress"),
+                    upstream_job_id=update.get("upstream_job_id"),
+                    retry_after=update.get("retry_after"),
+                    error=update.get("error"),
+                )
+
+            artifact = generate_image_artifact(
+                client=client,
+                token=token,
+                prompt=parsed.prompt,
+                aspect_ratio=ratio,
+                output_resolution=output_resolution,
+                model_config=model_conf,
+                generated_dir=generated_dir,
+                source_image_ids=source_image_ids,
+                progress_cb=_image_progress_cb,
+                on_generated_file_written=on_generated_file_written,
+            )
+            image_url = public_image_url(request, artifact.job_id)
+            set_request_preview(request, image_url, kind="image")
+            result_b64 = encode_image_result(
+                artifact.image_bytes,
+                parsed.output_format,
+                parsed.output_compression,
+            )
+            usage = build_image_usage(
+                parsed.prompt,
+                output_resolution,
+                ratio,
+                len(source_image_ids),
+            )
+            return build_responses_image_response(
+                response_id=f"resp_{uuid.uuid4().hex}",
+                item_id=f"ig_{uuid.uuid4().hex}",
+                created_at=int(time.time()),
+                model=parsed.inbound_model,
+                result_b64=result_b64,
+                usage=usage,
+            )
+
+        try:
+            response_payload = run_with_token_retries(
+                request=request,
+                operation_name="responses.create",
+                run_once=_run_once,
+            )
+            set_request_task_progress(request, task_status="COMPLETED", task_progress=100.0)
+            if parsed.stream:
+                return StreamingResponse(
+                    iter_responses_image_sse(response_payload),
+                    media_type="text/event-stream",
+                )
+            return response_payload
+        except Exception as exc:
+            return _openai_image_error_response(
+                request,
+                exc,
+                endpoint="/v1/responses",
+                model_label=resolved_model_id,
+            )
+
+    @router.post("/v1/images/edits")
+    async def openai_edit(request: Request):
+        require_service_api_key(request)
+
+        try:
+            form = await request.form()
+        except Exception:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "invalid multipart/form-data body",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+
+        def _bad_request(message: str) -> JSONResponse:
+            set_request_error_detail(
+                request,
+                error=message,
+                status_code=400,
+                error_type="invalid_request_error",
+                include_traceback=False,
+            )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": message,
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+
+        prompt = str(form.get("prompt") or "").strip()
+        if not prompt:
+            return _bad_request("prompt is required")
+
+        # OpenAI 各版 SDK 的图片字段名不统一: image / image[] / image[N]
+        image_key_re = re.compile(r"^image(\[\d*\])?$")
+        uploads = [
+            value
+            for key, value in form.multi_items()
+            if image_key_re.match(key) and hasattr(value, "read")
+        ]
+        if not uploads:
+            return _bad_request("image is required")
+        if len(uploads) > 6:
+            return _bad_request("at most 6 input images are supported")
+
+        input_images: list[tuple[bytes, str]] = []
+        for upload in uploads:
+            image_bytes = await upload.read()
+            if not image_bytes:
+                return _bad_request("image file is empty")
+            if len(image_bytes) > 10 * 1024 * 1024:
+                return _bad_request("image too large, max 10MB")
+            input_images.append(
+                (image_bytes, normalize_image_mime(upload.content_type))
+            )
+
+        if form.get("mask") is not None:
+            # Firefly 上游没有 mask 局部重绘能力: 接受该字段但整图编辑
+            logger.info(
+                "images.edits: mask ignored (unsupported upstream) log_id=%s",
+                getattr(request.state, "log_id", ""),
+            )
+
+        response_format = str(form.get("response_format") or "url").strip().lower()
+        if response_format not in {"url", "b64_json"}:
+            return _bad_request("response_format must be url or b64_json")
+
+        model_id = str(form.get("model") or "").strip() or None
+        if model_id in video_model_catalog:
+            return _bad_request("Use /v1/chat/completions for video generation")
+
+        try:
+            ratio, output_resolution, resolved_model_id = resolve_ratio_and_resolution(
+                {"size": form.get("size"), "quality": form.get("quality")}, model_id
+            )
+            model_conf = resolve_model(resolved_model_id)
+        except HTTPException as exc:
+            return _openai_image_error_response(
+                request, exc, endpoint="/v1/images/edits", model_label=str(model_id)
+            )
+        # multipart body 不经过全局中间件的 JSON 字段提取,这里主动上报
+        set_request_logging_fields(request, resolved_model_id, prompt)
+        set_request_credit_context(request, resolved_model_id, output_resolution)
+
+        def _execute():
+            set_request_task_progress(
+                request, task_status="IN_PROGRESS", task_progress=0.0
+            )
+
+            def _run_once(token: str):
+                source_image_ids = [
+                    client.upload_image(token, image_bytes, image_mime)
+                    for image_bytes, image_mime in input_images
+                ]
+
+                def _image_progress_cb(update: dict):
+                    set_request_task_progress(
+                        request,
+                        task_status=str(update.get("task_status") or "IN_PROGRESS"),
+                        task_progress=update.get("task_progress"),
+                        upstream_job_id=update.get("upstream_job_id"),
+                        retry_after=update.get("retry_after"),
+                        error=update.get("error"),
+                    )
+
+                artifact = generate_image_artifact(
+                    client=client,
+                    token=token,
+                    prompt=prompt,
+                    aspect_ratio=ratio,
+                    output_resolution=output_resolution,
+                    model_config=model_conf,
+                    generated_dir=generated_dir,
+                    source_image_ids=source_image_ids,
+                    progress_cb=_image_progress_cb,
+                    on_generated_file_written=on_generated_file_written,
+                )
+                image_url = public_image_url(request, artifact.job_id)
+                set_request_preview(request, image_url, kind="image")
+                if response_format == "b64_json":
+                    item = {
+                        "b64_json": base64.b64encode(artifact.image_bytes).decode()
+                    }
+                else:
+                    item = {"url": image_url}
+                return {
+                    "created": int(time.time()),
+                    "model": resolved_model_id,
+                    "data": [item],
+                    "usage": build_image_usage(
+                        prompt, output_resolution, ratio, len(source_image_ids)
+                    ),
+                }
+
+            return run_with_token_retries(
+                request=request,
+                operation_name="images.edits",
+                run_once=_run_once,
+            )
+
+        try:
+            return await run_in_threadpool(_execute)
+        except Exception as exc:
+            return _openai_image_error_response(
+                request,
+                exc,
+                endpoint="/v1/images/edits",
+                model_label=str(resolved_model_id),
+            )
+
     @router.post("/api/v1/generate")
     def create_job(data: GenerateRequest, request: Request):
         require_service_api_key(request)
@@ -458,13 +778,71 @@ def build_generation_router(
         if data.model:
             output_resolution = model_conf["output_resolution"]
 
+        resolved_model_id = str(data.model or "").strip()
+        if not resolved_model_id:
+            resolved_model_id = next(
+                (
+                    candidate_id
+                    for candidate_id, candidate_conf in model_catalog.items()
+                    if candidate_conf is model_conf
+                ),
+                "unknown",
+            )
+        set_request_credit_context(request, resolved_model_id, output_resolution)
+
         job = store.create(prompt=prompt, aspect_ratio=ratio)
+        request_started = time.time()
+        request_log_id = str(
+            getattr(request.state, "log_id", "") or f"job-{job.id}"
+        ).strip()
+        tracking_request_id = f"{request_log_id}:background"
+
+        def job_log_payload(
+            *,
+            status_code: int,
+            task_status: str,
+            token_meta: dict | None = None,
+            token_attempt: int | None = None,
+            preview_url: str | None = None,
+            error: str | None = None,
+        ) -> dict:
+            meta = token_meta if isinstance(token_meta, dict) else {}
+            return asdict(
+                RequestLogRecord(
+                    id=request_log_id,
+                    ts=request_started,
+                    method="POST",
+                    path="/api/v1/generate",
+                    status_code=int(status_code),
+                    duration_sec=int(max(0.0, time.time() - request_started)),
+                    operation="api.generate",
+                    preview_url=preview_url,
+                    preview_kind="image" if preview_url else None,
+                    model=resolved_model_id,
+                    prompt_preview=prompt[:180],
+                    error=(str(error)[:240] if error else None),
+                    task_status=str(task_status or "").upper() or None,
+                    task_progress=100.0 if task_status == "COMPLETED" else None,
+                    token_id=str(meta.get("token_id") or "") or None,
+                    token_account_name=(
+                        str(meta.get("token_account_name") or "") or None
+                    ),
+                    token_account_email=(
+                        str(meta.get("token_account_email") or "") or None
+                    ),
+                    token_source=str(meta.get("token_source") or "") or None,
+                    token_attempt=token_attempt,
+                )
+            )
 
         def runner(job_id: str):
             store.update(job_id, status="running", progress=5.0)
             max_attempts = client.retry_max_attempts if client.retry_enabled else 1
             max_attempts = max(1, int(max_attempts))
             last_error = "No active tokens available in the pool"
+            last_status_code = 503
+            last_token_meta: dict = {}
+            last_attempt: int | None = None
 
             for attempt in range(1, max_attempts + 1):
                 token = token_manager.get_available(
@@ -472,6 +850,20 @@ def build_generation_router(
                 )
                 if not token:
                     break
+
+                token_meta = token_manager.get_meta_by_value(token)
+                token_id = str(token_meta.get("token_id") or "").strip()
+                account_id = str(
+                    token_meta.get("token_account_id") or ""
+                ).strip()
+                last_token_meta = token_meta
+                last_attempt = attempt
+                if token_id:
+                    credits_tracker.begin(
+                        token_id,
+                        tracking_request_id,
+                        account_id=account_id or None,
+                    )
 
                 try:
                     out_path = generated_dir / f"{job_id}.png"
@@ -513,24 +905,71 @@ def build_generation_router(
                         progress=max(progress, 100.0),
                         image_url=image_url,
                     )
+                    payload = job_log_payload(
+                        status_code=200,
+                        task_status="COMPLETED",
+                        token_meta=token_meta,
+                        token_attempt=attempt,
+                        preview_url=image_url,
+                    )
+                    write_generation = request_log_store.upsert(request_log_id, payload)
+                    if token_id:
+                        credits_tracker.complete(
+                            token_id=token_id,
+                            account_id=account_id or None,
+                            request_id=tracking_request_id,
+                            log_id=request_log_id,
+                            log_generation=write_generation,
+                            payload=payload,
+                            model_id=resolved_model_id,
+                            output_resolution=output_resolution,
+                        )
                     return
                 except quota_error_cls:
                     token_manager.report_exhausted(token)
                     last_error = "Token quota exhausted."
+                    last_status_code = 429
                     retryable = attempt < max_attempts
                 except auth_error_cls:
                     token_manager.report_invalid(token)
                     last_error = "Token invalid or expired."
+                    last_status_code = 401
                     retryable = attempt < max_attempts
                 except upstream_temp_error_cls as exc:
                     last_error = str(exc)
+                    last_status_code = 503
                     retryable = (
                         attempt < max_attempts
                         and client.should_retry_temporary_error(exc)
                     )
                 except Exception as exc:
+                    if token_id:
+                        credits_tracker.finish(
+                            token_id,
+                            tracking_request_id,
+                            account_id=account_id or None,
+                            completed=False,
+                        )
                     store.update(job_id, status="failed", error=str(exc))
+                    request_log_store.upsert(
+                        request_log_id,
+                        job_log_payload(
+                            status_code=500,
+                            task_status="FAILED",
+                            token_meta=token_meta,
+                            token_attempt=attempt,
+                            error=str(exc),
+                        ),
+                    )
                     return
+
+                if token_id:
+                    credits_tracker.finish(
+                        token_id,
+                        tracking_request_id,
+                        account_id=account_id or None,
+                        completed=False,
+                    )
 
                 if retryable:
                     delay = client._retry_delay_for_attempt(attempt)
@@ -540,10 +979,21 @@ def build_generation_router(
                 break
 
             store.update(job_id, status="failed", error=last_error)
+            request_log_store.upsert(
+                request_log_id,
+                job_log_payload(
+                    status_code=last_status_code,
+                    task_status="FAILED",
+                    token_meta=last_token_meta,
+                    token_attempt=last_attempt,
+                    error=last_error,
+                ),
+            )
 
-        threading.Thread(target=runner, args=(job.id,), daemon=True).start()
-
-        return {"task_id": job.id, "status": job.status}
+        return JSONResponse(
+            content={"task_id": job.id, "status": job.status},
+            background=BackgroundTask(runner, job.id),
+        )
 
     @router.get("/api/v1/generate/{task_id}")
     def get_job(task_id: str, request: Request):
@@ -627,6 +1077,11 @@ def build_generation_router(
         image_model_conf = (
             resolve_model(resolved_model_id) if not is_video_model else {}
         )
+        set_request_credit_context(
+            request,
+            str(resolved_model_id or model_id),
+            video_resolution if is_video_model else output_resolution,
+        )
 
         try:
             entity_account_id = ""
@@ -681,15 +1136,6 @@ def build_generation_router(
                             error=update.get("error"),
                         )
 
-                    job_id = uuid.uuid4().hex
-                    tmp_path = generated_dir / f"{job_id}.video.tmp"
-                    old_size = 0
-                    try:
-                        if tmp_path.exists():
-                            old_size = int(tmp_path.stat().st_size)
-                    except Exception:
-                        old_size = 0
-
                     video_prompt = prompt
                     entity_refs = None
                     if video_engine == "kling-o3":
@@ -697,30 +1143,27 @@ def build_generation_router(
                             token, prompt, kling_bound_refs
                         )
 
-                    video_bytes, video_meta = client.generate_video(
+                    job_id = uuid.uuid4().hex
+                    generated_video = generate_video_file(
+                        client=client,
                         token=token,
                         video_conf=video_conf or {},
                         prompt=video_prompt,
                         aspect_ratio=ratio,
                         duration=duration,
+                        generated_dir=generated_dir,
+                        task_id=job_id,
+                        resolution=video_resolution,
                         source_image_ids=source_image_ids,
                         entity_refs=entity_refs,
                         timeout=max(int(client.generate_timeout), 600),
                         negative_prompt=negative_prompt,
                         generate_audio=generate_audio,
                         reference_mode=video_reference_mode,
-                        out_path=tmp_path,
                         progress_cb=_video_progress_cb,
+                        on_generated_file_written=on_generated_file_written,
                     )
-                    video_ext = video_ext_from_meta(video_meta)
-                    filename = f"{job_id}.{video_ext}"
-                    out_path = generated_dir / filename
-                    if video_bytes is not None:
-                        out_path.write_bytes(video_bytes)
-                    elif tmp_path.exists():
-                        tmp_path.replace(out_path)
-                    new_size = int(out_path.stat().st_size) if out_path.exists() else 0
-                    on_generated_file_written(out_path, old_size, new_size)
+                    filename = generated_video.path.name
                     image_url = public_generated_url(request, filename)
                     set_request_preview(request, image_url, kind="video")
                     response_content = (
@@ -744,44 +1187,19 @@ def build_generation_router(
                             error=update.get("error"),
                         )
 
-                    job_id = uuid.uuid4().hex
-                    out_path = generated_dir / f"{job_id}.png"
-                    old_size = 0
-                    try:
-                        if out_path.exists():
-                            old_size = int(out_path.stat().st_size)
-                    except Exception:
-                        old_size = 0
-
-                    image_bytes, _meta = client.generate(
+                    artifact = generate_image_artifact(
+                        client=client,
                         token=token,
                         prompt=prompt,
                         aspect_ratio=ratio,
                         output_resolution=output_resolution,
-                        upstream_model_id=str(
-                            image_model_conf.get("upstream_model_id") or "gemini-flash"
-                        ),
-                        upstream_model_version=str(
-                            image_model_conf.get("upstream_model_version")
-                            or "nano-banana-2"
-                        ),
-                        quality_level=(
-                            client.gpt_image_quality
-                            if str(image_model_conf.get("upstream_model_id") or "")
-                            == "gpt-image"
-                            else None
-                        ),
-                        detail_level=image_model_conf.get("detail_level"),
+                        model_config=image_model_conf,
+                        generated_dir=generated_dir,
                         source_image_ids=source_image_ids,
-                        timeout=client.generate_timeout,
-                        out_path=out_path,
                         progress_cb=_image_progress_cb,
+                        on_generated_file_written=on_generated_file_written,
                     )
-                    if image_bytes is not None:
-                        out_path.write_bytes(image_bytes)
-                    new_size = int(out_path.stat().st_size) if out_path.exists() else 0
-                    on_generated_file_written(out_path, old_size, new_size)
-                    image_url = public_image_url(request, job_id)
+                    image_url = public_image_url(request, artifact.job_id)
                     set_request_preview(request, image_url, kind="image")
                     response_content = f"![Generated Image]({image_url})"
 

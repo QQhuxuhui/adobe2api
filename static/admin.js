@@ -107,6 +107,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     parseCookieFilesToItems,
     toCookieBatchItems,
   } = window.AdminCookieImport;
+  const { formatLogCredits } = window.AdminLogCredits;
   const tokenSelectedIds = new Set();
   let logsAutoTimer = null;
   let latestTokens = [];
@@ -1497,7 +1498,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         renderLogStats(null);
       }
     } catch (err) {
-      logsTbody.innerHTML = `<tr><td colspan="8" class="empty-state" style="color: var(--critical);">${err.message || "日志加载失败"}</td></tr>`;
+      logsTbody.innerHTML = `<tr><td colspan="9" class="empty-state" style="color: var(--critical);">${err.message || "日志加载失败"}</td></tr>`;
       logsRunningTotal = 0;
       logsTotalPages = Math.max(1, logsCurrentPage || 1);
       renderLogsPagination();
@@ -1596,6 +1597,11 @@ document.addEventListener("DOMContentLoaded", async () => {
         : `<span class="log-account-email">-</span>`
     );
     const modelText = String(item.model || "-");
+    const promptText = String(item.prompt_preview || "-");
+    const credits = formatLogCredits(item.credits_used, item.credits_source);
+    const creditsTitle = credits.title
+      ? ` title="${escapeHtml(credits.title)}"`
+      : "";
     const tokenCell = `<div class="log-account-cell">${accountParts.join("<br>")}</div>`;
     const previewCell = previewUrl
       ? `<button class="small preview-btn" data-url="${encodeURIComponent(previewUrl)}" data-kind="${previewKind || ""}">查看</button>`
@@ -1607,7 +1613,8 @@ document.addEventListener("DOMContentLoaded", async () => {
       <td>${progressCell}</td>
       <td title="${tokenTitle}">${tokenCell}</td>
       <td class="log-model-cell" title="${escapeHtml(modelText)}">${escapeHtml(modelText)}</td>
-      <td class="log-prompt-cell" title="${(item.prompt_preview || "").replace(/"/g, "&quot;")}">${item.prompt_preview || "-"}</td>
+      <td class="log-credits-cell${credits.estimated ? " estimated" : ""}"${creditsTitle}>${escapeHtml(credits.text)}</td>
+      <td class="log-prompt-cell" title="${escapeHtml(promptText)}">${escapeHtml(promptText)}</td>
       <td>${previewCell}</td>
     `;
     if (isRunning) tr.classList.add("log-row-running");
@@ -1627,7 +1634,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     ];
 
     if (!allRows.length) {
-      logsTbody.innerHTML = `<tr><td colspan="8" class="empty-state">暂无请求日志</td></tr>`;
+      logsTbody.innerHTML = `<tr><td colspan="9" class="empty-state">暂无请求日志</td></tr>`;
       return;
     }
 

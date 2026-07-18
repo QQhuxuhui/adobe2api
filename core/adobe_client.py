@@ -1229,6 +1229,10 @@ class AdobeClient:
                                 "promptReference": idx,
                             }
                         )
+            if negative_prompt:
+                payload["modelSpecificPayload"]["parameters"][
+                    "negativePrompt"
+                ] = str(negative_prompt)
             return payload
 
         if engine == "kling-o3":

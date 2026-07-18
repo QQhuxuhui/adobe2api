@@ -21,6 +21,11 @@ from core.adobe_client import (  # noqa: E402
     QuotaExhaustedError,
     UpstreamTemporaryError,
 )
+from core.video_tasks import (  # noqa: E402
+    VideoTaskRecord,
+    VideoTaskSpec,
+    VideoTaskStore,
+)
 
 
 class FakeConfig:
@@ -72,6 +77,30 @@ class FakeAdobeClient:
         return None, {"status": "SUCCEEDED", "outputs": [{"image": {}}]}
 
 
+class FakeVideoTaskManager:
+    def __init__(self, store: VideoTaskStore) -> None:
+        self.store = store
+        self.specs: list[VideoTaskSpec] = []
+
+    def submit(self, spec: VideoTaskSpec) -> VideoTaskRecord:
+        self.specs.append(spec)
+        return self.store.create(
+            VideoTaskRecord(
+                id=spec.id,
+                protocol=spec.protocol,
+                model=spec.model,
+                prompt_preview=spec.prompt_preview,
+                engine=spec.engine,
+                duration=spec.duration,
+                aspect_ratio=spec.aspect_ratio,
+                resolution=spec.resolution,
+                requested_size=spec.requested_size,
+                log_id=spec.log_id,
+                created_at=1_700_000_000,
+            )
+        )
+
+
 class Harness:
     def __init__(
         self,
@@ -80,37 +109,55 @@ class Harness:
         client: FakeAdobeClient | None = None,
         config: FakeConfig | None = None,
         retry_runner: Callable | None = None,
+        enable_video_tasks: bool = False,
     ):
         self.client_impl = client or FakeAdobeClient()
         self.config = config or FakeConfig()
         self.accounted: list[tuple[Path, int, int]] = []
         self.previews: list[tuple[str, str]] = []
         self.logging_fields: list[tuple[str | None, str | None]] = []
+        self.credit_contexts: list[tuple[str | None, str | None]] = []
         self.progress: list[dict] = []
         self.error_details: list[dict] = []
+        self.video_store = VideoTaskStore(tmp_path / "video_tasks.jsonl")
+        self.video_manager = FakeVideoTaskManager(self.video_store)
 
         def default_retry_runner(*, run_once, **kwargs):
             del kwargs
             return run_once("token-1")
 
         api = FastAPI()
+        router_kwargs = {
+            "config_manager": self.config,
+            "client": self.client_impl,
+            "generated_dir": tmp_path,
+            "run_with_token_retries": retry_runner or default_retry_runner,
+            "set_request_error_detail": self._set_error_detail,
+            "set_request_task_progress": self._set_progress,
+            "set_request_logging_fields": self._set_logging_fields,
+            "set_request_credit_context": self._set_credit_context,
+            "set_request_preview": self._set_preview,
+            "public_image_url": lambda request, job_id: f"/generated/{job_id}.png",
+            "on_generated_file_written": self._account_file,
+            "quota_error_cls": QuotaExhaustedError,
+            "auth_error_cls": AuthError,
+            "upstream_temp_error_cls": UpstreamTemporaryError,
+            "adobe_error_cls": AdobeRequestError,
+            "logger": FakeLogger(),
+        }
+        if enable_video_tasks:
+            router_kwargs.update(
+                {
+                    "video_task_manager": self.video_manager,
+                    "video_task_store": self.video_store,
+                    "public_generated_url": lambda request, filename: (
+                        f"https://videos.example/generated/{filename}"
+                    ),
+                }
+            )
         api.include_router(
             build_gemini_native_router(
-                config_manager=self.config,
-                client=self.client_impl,
-                generated_dir=tmp_path,
-                run_with_token_retries=retry_runner or default_retry_runner,
-                set_request_error_detail=self._set_error_detail,
-                set_request_task_progress=self._set_progress,
-                set_request_logging_fields=self._set_logging_fields,
-                set_request_preview=self._set_preview,
-                public_image_url=lambda request, job_id: f"/generated/{job_id}.png",
-                on_generated_file_written=self._account_file,
-                quota_error_cls=QuotaExhaustedError,
-                auth_error_cls=AuthError,
-                upstream_temp_error_cls=UpstreamTemporaryError,
-                adobe_error_cls=AdobeRequestError,
-                logger=FakeLogger(),
+                **router_kwargs,
             )
         )
         self.http = TestClient(api)
@@ -128,6 +175,10 @@ class Harness:
         request.state.log_model = model
         request.state.log_prompt_preview = prompt
         self.logging_fields.append((model, prompt))
+
+    def _set_credit_context(self, request, model, output_resolution):
+        request.state.log_output_resolution = output_resolution
+        self.credit_contexts.append((model, output_resolution))
 
     def _set_preview(self, request, url, kind="image"):
         del request
@@ -175,6 +226,27 @@ def image_request(
     }
 
 
+def veo_request(
+    *,
+    prompt: str = "make a cinematic video",
+    ratio: str = "16:9",
+    duration: int = 8,
+    resolution: str = "720p",
+    negative_prompt: str = "",
+) -> dict:
+    parameters = {
+        "aspectRatio": ratio,
+        "durationSeconds": duration,
+        "resolution": resolution,
+    }
+    if negative_prompt:
+        parameters["negativePrompt"] = negative_prompt
+    return {
+        "instances": [{"prompt": prompt}],
+        "parameters": parameters,
+    }
+
+
 def post(
     harness: Harness,
     model: str,
@@ -198,6 +270,20 @@ def assert_google_error(response, code: int, status: str):
     assert response.json()["error"]["code"] == code
     assert response.json()["error"]["status"] == status
     assert isinstance(response.json()["error"]["message"], str)
+
+
+def test_image_request_captures_resolved_credit_dimensions(tmp_path: Path):
+    harness = Harness(tmp_path)
+
+    response = post(
+        harness,
+        "gemini-3-pro-image",
+        "generateContent",
+        image_request(size="4K"),
+    )
+
+    assert response.status_code == 200
+    assert harness.credit_contexts == [("gemini-3-pro-image", "4K")]
 
 
 def test_auth_accepts_header_and_query_key_and_rejects_missing(tmp_path: Path):
@@ -249,13 +335,17 @@ def test_model_list_and_single_model_use_the_same_registry(tmp_path: Path):
 
     assert listing.status_code == 200
     models = listing.json()["models"]
-    assert len(models) == 8
+    assert len(models) == 10
     assert all(item["name"].startswith("models/") for item in models)
-    assert all(
-        item["supportedGenerationMethods"]
-        == ["generateContent", "streamGenerateContent", "countTokens"]
-        for item in models
-    )
+    for item in models:
+        if item["name"].startswith("models/veo-"):
+            assert item["supportedGenerationMethods"] == ["predictLongRunning"]
+        else:
+            assert item["supportedGenerationMethods"] == [
+                "generateContent",
+                "streamGenerateContent",
+                "countTokens",
+            ]
 
     model_id = "gemini-3-pro-image"
     single = harness.http.get(
@@ -287,6 +377,104 @@ def test_model_routes_return_google_not_found(tmp_path: Path):
         "NOT_FOUND",
     )
     assert harness.client_impl.generate_calls == []
+
+
+def test_veo_submit_creates_task_and_returns_operation_name(tmp_path: Path):
+    harness = Harness(tmp_path, enable_video_tasks=True)
+
+    response = post(
+        harness,
+        "veo-3.1-fast-generate-preview",
+        "predictLongRunning",
+        veo_request(
+            ratio="9:16",
+            duration=8,
+            resolution="1080p",
+            negative_prompt="no captions",
+        ),
+    )
+
+    assert response.status_code == 200
+    name = response.json()["name"]
+    assert name.startswith(
+        "models/veo-3.1-fast-generate-preview/operations/operation_"
+    )
+    spec = harness.video_manager.specs[-1]
+    assert spec.protocol == "veo"
+    assert spec.engine == "veo31-fast"
+    assert spec.upstream_model == "google:firefly:colligo:veo31-fast"
+    assert spec.negative_prompt == "no captions"
+    assert spec.credit_model_id == "firefly-veo31-fast-8s-9x16-1080p"
+
+
+def test_veo_operation_maps_running_completed_and_failed_states(tmp_path: Path):
+    harness = Harness(tmp_path, enable_video_tasks=True)
+    submitted = post(
+        harness,
+        "veo-3.1-generate-preview",
+        "predictLongRunning",
+        veo_request(),
+    ).json()["name"]
+    operation_id = submitted.rsplit("/", 1)[-1]
+    path = f"/v1beta/models/veo-3.1-generate-preview/operations/{operation_id}"
+    headers = {"x-goog-api-key": "test-key"}
+
+    running = harness.http.get(path, headers=headers)
+    assert running.status_code == 200
+    assert running.json()["name"] == submitted
+    assert running.json()["done"] is False
+    assert running.json()["metadata"]["progressPercent"] == 0
+
+    harness.video_store.update(
+        operation_id,
+        status="completed",
+        progress=100,
+        result_path=str(tmp_path / "result.mp4"),
+        result_mime="video/mp4",
+        result_url="https://videos.example/generated/result.mp4",
+        completed_at=1_700_000_100,
+    )
+    completed = harness.http.get(path, headers=headers)
+    assert completed.status_code == 200
+    assert completed.json()["done"] is True
+    uri = completed.json()["response"]["generateVideoResponse"][
+        "generatedSamples"
+    ][0]["video"]["uri"]
+    assert uri == "https://videos.example/generated/result.mp4?key=proxy"
+    assert "test-key" not in uri
+
+    harness.video_store.update(
+        operation_id,
+        status="failed",
+        error_message="generation failed",
+        error_code="generation_failed",
+    )
+    failed = harness.http.get(path, headers=headers)
+    assert failed.status_code == 200
+    assert failed.json()["done"] is True
+    assert failed.json()["error"] == {"code": 13, "message": "generation failed"}
+
+
+def test_veo_operation_hides_model_mismatch_and_requires_key(tmp_path: Path):
+    harness = Harness(tmp_path, enable_video_tasks=True)
+    submitted = post(
+        harness,
+        "veo-3.1-generate-preview",
+        "predictLongRunning",
+        veo_request(),
+    ).json()["name"]
+    operation_id = submitted.rsplit("/", 1)[-1]
+
+    missing_key = harness.http.get(
+        f"/v1beta/models/veo-3.1-generate-preview/operations/{operation_id}"
+    )
+    assert_google_error(missing_key, 401, "UNAUTHENTICATED")
+
+    mismatch = harness.http.get(
+        f"/v1beta/models/veo-3.1-fast-generate-preview/operations/{operation_id}",
+        headers={"x-goog-api-key": "test-key"},
+    )
+    assert_google_error(mismatch, 404, "NOT_FOUND")
 
 
 def test_count_tokens_flattens_all_text_and_prices_images_without_adobe(
@@ -642,6 +830,167 @@ def test_full_app_resolves_every_gemini_operation():
     assert app_module._resolve_request_operation(
         "POST", "/v1beta/models/gemini-3-pro-image:countTokens"
     ) == "gemini.countTokens"
+    assert app_module._resolve_request_operation("POST", "/v1/videos") == (
+        "videos.create"
+    )
+    assert app_module._resolve_request_operation(
+        "GET", "/v1/videos/video_123"
+    ) == "videos.get"
+    assert app_module._resolve_request_operation(
+        "GET", "/v1/videos/video_123/content"
+    ) == "videos.content"
+    assert app_module._resolve_request_operation(
+        "POST", "/v1beta/models/veo-3.1-generate-preview:predictLongRunning"
+    ) == "gemini.predictLongRunning"
+    assert app_module._resolve_request_operation(
+        "GET",
+        "/v1beta/models/veo-3.1-generate-preview/operations/operation_123",
+    ) == "gemini.operations.get"
+    assert app_module._gemini_model_from_path(
+        "/v1beta/models/veo-3.1-generate-preview/operations/operation_123"
+    ) == "veo-3.1-generate-preview"
+
+
+def test_full_app_shutdown_closes_video_tasks_before_credit_tracker(monkeypatch):
+    app_module = import_full_app()
+    closed: list[str] = []
+
+    monkeypatch.setattr(
+        app_module.video_task_manager,
+        "close",
+        lambda: closed.append("video"),
+    )
+    monkeypatch.setattr(
+        app_module.credits_tracker,
+        "close",
+        lambda: closed.append("credits"),
+    )
+
+    app_module._shutdown_video_services()
+
+    assert closed == ["video", "credits"]
+
+
+def test_full_app_wires_sora_and_veo_submissions_to_shared_manager(monkeypatch):
+    app_module = import_full_app()
+    submitted: list[VideoTaskSpec] = []
+
+    def fake_submit(spec: VideoTaskSpec) -> VideoTaskRecord:
+        submitted.append(spec)
+        return VideoTaskRecord(
+            id=spec.id,
+            protocol=spec.protocol,
+            model=spec.model,
+            prompt_preview=spec.prompt_preview,
+            engine=spec.engine,
+            duration=spec.duration,
+            aspect_ratio=spec.aspect_ratio,
+            resolution=spec.resolution,
+            requested_size=spec.requested_size,
+            log_id=spec.log_id,
+            status="queued",
+            created_at=1_700_000_000,
+        )
+
+    monkeypatch.setattr(app_module.video_task_manager, "submit", fake_submit)
+    original_get = app_module.config_manager.get
+
+    def config_get(key: str, default=None):
+        if key == "api_key":
+            return "test-key"
+        return original_get(key, default)
+
+    monkeypatch.setattr(app_module.config_manager, "get", config_get)
+    http = TestClient(app_module.app)
+
+    sora = http.post(
+        "/v1/videos",
+        headers={"Authorization": "Bearer test-key"},
+        json={"model": "sora-2", "prompt": "sora prompt"},
+    )
+    veo = http.post(
+        "/v1beta/models/veo-3.1-generate-preview:predictLongRunning",
+        headers={"x-goog-api-key": "test-key"},
+        json=veo_request(prompt="veo prompt"),
+    )
+
+    assert sora.status_code == 200
+    assert veo.status_code == 200
+    assert [spec.protocol for spec in submitted] == ["openai", "veo"]
+    assert submitted[0].model == "sora-2"
+    assert submitted[1].model == "veo-3.1-generate-preview"
+
+
+def test_full_app_video_submit_log_is_managed_once(monkeypatch):
+    app_module, http, logs, live, _errors = patch_full_app_state(monkeypatch)
+
+    def fake_submit(spec: VideoTaskSpec) -> VideoTaskRecord:
+        record = VideoTaskRecord(
+            id=spec.id,
+            protocol=spec.protocol,
+            model=spec.model,
+            prompt_preview=spec.prompt_preview,
+            engine=spec.engine,
+            duration=spec.duration,
+            aspect_ratio=spec.aspect_ratio,
+            resolution=spec.resolution,
+            requested_size=spec.requested_size,
+            log_id=spec.log_id,
+            status="queued",
+            created_at=1_700_000_000,
+        )
+        app_module._write_submitted_video_log(spec, record)
+        return record
+
+    monkeypatch.setattr(app_module.video_task_manager, "submit", fake_submit)
+
+    response = http.post(
+        "/v1/videos",
+        headers={"Authorization": "Bearer test-key"},
+        json={"model": "sora-2", "prompt": "queued prompt"},
+    )
+
+    assert response.status_code == 200
+    matching = [row for row in logs.records if row["operation"] == "videos.create"]
+    assert len(matching) == 1
+    assert matching[0]["task_status"] == "QUEUED"
+    assert matching[0]["prompt_preview"] == "queued prompt"
+    assert live.items == {}
+
+
+def test_full_app_does_not_preload_unauthorized_sora_body(monkeypatch):
+    _app, http, _logs, _live, _errors = patch_full_app_state(monkeypatch)
+    consumed: list[bytes] = []
+
+    def request_chunks():
+        chunk = b"x" * 1024
+        consumed.append(chunk)
+        yield chunk
+
+    response = http.post(
+        "/v1/videos",
+        headers={"content-type": "application/json"},
+        content=request_chunks(),
+    )
+
+    assert response.status_code == 401
+    assert consumed == []
+
+
+def test_veo_submit_rejects_body_over_one_mib_before_task_creation(tmp_path: Path):
+    harness = Harness(tmp_path, enable_video_tasks=True)
+    oversized_prompt = "x" * (1024 * 1024)
+
+    response = post(
+        harness,
+        "veo-3.1-generate-preview",
+        "predictLongRunning",
+        veo_request(prompt=oversized_prompt),
+    )
+
+    assert_google_error(response, 400, "INVALID_ARGUMENT")
+    assert response.json()["error"]["message"] == "Request body is too large"
+    assert harness.video_manager.specs == []
 
 
 def test_full_app_logs_gemini_paths_without_base64(monkeypatch):

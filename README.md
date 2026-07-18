@@ -300,6 +300,43 @@ curl -X POST "http://127.0.0.1:6001/v1/chat/completions" \
   }'
 ```
 
+### 3.2.1 OpenAI Responses 图像接口
+
+`POST /v1/responses` 支持 Adobe-backed GPT 图像模型的 Responses 协议。
+成功结果使用 `image_generation_call.result` 返回 base64 图片数据，
+`stream=true` 返回 Responses SSE 事件。
+
+顶层图像模型：
+
+```bash
+curl -X POST "http://127.0.0.1:6001/v1/responses" \
+  -H "Authorization: Bearer <service_api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-image-2",
+    "input": "draw a blue square",
+    "size": "1024x1024",
+    "quality": "low"
+  }'
+```
+
+官方 Responses 图片工具形态：
+
+```bash
+curl -X POST "http://127.0.0.1:6001/v1/responses" \
+  -H "Authorization: Bearer <service_api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.4-mini",
+    "input": "draw a blue square",
+    "tools": [{"type": "image_generation"}]
+  }'
+```
+
+当前不支持 `/v1/responses/compact`、Responses WebSocket、Files API、
+`file_id`/mask 输入、透明背景和中间预览图。图生图请在 `input` 的最后一条
+user 内容中传 `input_image.image_url`，支持 `data:`、`http://` 和 `https://`。
+
 ### 3.3 实体创建与可灵引用
 
 实体用于 Kling O3 中保持角色或物体一致。实体绑定到创建它的 Adobe 账号，服务会自动获取该账号的 Creative Cloud 仓库，不需要也不支持手动配置 `repo_urn`。
@@ -461,6 +498,63 @@ gateway:
 - `upstream_response_read_max_bytes` 必须至少为 128 MiB；默认 8 MiB 会截断较大的 2K / 4K 非流式响应
 - 修改 deadline 后要同步提高 response header timeout，并在真实 sub2api 链路执行一次 base64 至少 8 MiB 的 4K 非流式 smoke test
 
+### 3.6 new-api 视频任务协议
+
+服务同时提供 new-api 当前任务适配器可直接调用的 Sora 和 Gemini Veo 异步协议。视频生成最多同时执行 2 个任务、排队 20 个任务；第 23 个未结束任务会在提交时返回 429。服务重启后，未完成任务会变为 failed，不会永久停留在 queued。
+
+Sora 端点：
+
+- `POST /v1/videos`
+- `GET /v1/videos/{video_id}`
+- `GET /v1/videos/{video_id}/content`
+
+| 模型 | seconds | size |
+|---|---|---|
+| `sora-2` | `4` / `8` / `12` | `1280x720` / `720x1280` |
+| `sora-2-pro` | `4` / `8` / `12` | `1280x720` / `720x1280` / `1792x1024` / `1024x1792` |
+
+`sora-2-pro` 的两个高尺寸值是当前 new-api fork 使用的旧枚举，服务会分别生成 Adobe 实际支持的 1920x1080 或 1080x1920 视频。当前实现不支持 `input_reference`、`characters` 等媒体输入。
+
+```bash
+curl -X POST "http://127.0.0.1:6001/v1/videos" \
+  -H "Authorization: Bearer <service_api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"sora-2","prompt":"waves hitting a lighthouse","seconds":"4","size":"1280x720"}'
+
+# 使用创建响应中的 id 轮询，completed 后下载
+curl "http://127.0.0.1:6001/v1/videos/<video_id>" \
+  -H "Authorization: Bearer <service_api_key>"
+curl -L "http://127.0.0.1:6001/v1/videos/<video_id>/content" \
+  -H "Authorization: Bearer <service_api_key>" -o result.mp4
+```
+
+Gemini Veo 端点：
+
+- `POST /v1beta/models/{model}:predictLongRunning`
+- `GET /v1beta/models/{model}/operations/{operation_id}`
+
+支持 `veo-3.1-generate-preview` 和 `veo-3.1-fast-generate-preview`。`durationSeconds` 支持 `4` / `6` / `8`，`resolution` 支持 `720p` / `1080p`，其中 1080p 只能生成 8 秒；`aspectRatio` 支持 `16:9` / `9:16`。`negativePrompt` 会透传，媒体输入、4K 和非空 `personGeneration` 会明确返回 400。
+
+```bash
+curl -X POST "http://127.0.0.1:6001/v1beta/models/veo-3.1-generate-preview:predictLongRunning" \
+  -H "X-Goog-Api-Key: <service_api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "instances":[{"prompt":"waves hitting a lighthouse"}],
+    "parameters":{"durationSeconds":8,"resolution":"1080p","aspectRatio":"16:9"}
+  }'
+
+# 使用创建响应中的 name 轮询
+curl "http://127.0.0.1:6001/v1beta/models/veo-3.1-generate-preview/operations/<operation_id>" \
+  -H "X-Goog-Api-Key: <service_api_key>"
+```
+
+部署 new-api 时，Sora 和 Gemini 视频应配置为两个渠道，Gemini version 使用 `v1beta`。base URL 应使用 HTTPS 或仅在受信私网中可达的服务名，避免 API key 和生成文件暴露在明文链路上。
+
+计费需要按本机 new-api 的实现配置：Sora 默认按 `model_price * seconds * size 倍率` 计费，高尺寸倍率为 `1.666667`，因此 `model_price` 应配置为每秒基础价且不要设置 `TASK_PRICE_PATCH`；只有要固定按次收费时才加入该变量。Gemini 任务适配器当前不把时长写入计价数据，Veo 只能按 `model_price` 固定单次计费。
+
+任务完成后，Sora content 端点和 Veo operation 响应会指向 `data/generated/` 中的真实视频。容量清理可能删除旧文件；此时任务记录仍为 completed，但下载会返回 404。
+
 ## 4）Cookie 导入
 
 ### 第一步：使用浏览器插件导出（推荐）
@@ -504,6 +598,7 @@ gateway:
 ## 5）存储路径
 
 - 生成媒体文件：`data/generated/`
+- 视频任务：`data/video_tasks.jsonl`
 - 请求日志：`data/request_logs.jsonl`
 - Token 池：`config/tokens.json`
 - 服务配置：`config/config.json`

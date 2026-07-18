@@ -2,7 +2,6 @@ import json
 import threading
 import time
 import uuid
-from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
@@ -85,30 +84,27 @@ class RequestLogRecord:
     token_account_email: Optional[str] = None
     token_source: Optional[str] = None
     token_attempt: Optional[int] = None
+    credits_used: Optional[float] = None
+    credits_source: Optional[str] = None
 
 
 class RequestLogStore:
     def __init__(self, file_path: Path, max_items: int = 500) -> None:
         self._file_path = file_path
         self._lock = threading.Lock()
-        self._max_items = max_items
+        self._max_items = max(1, int(max_items or 500))
         self._append_since_truncate = 0
         self._truncate_check_interval = 200
+        self._generation = 0
         self._file_path.parent.mkdir(parents=True, exist_ok=True)
         if not self._file_path.exists():
             self._file_path.touch()
 
     def _truncate_to_max_locked(self) -> None:
-        tail: deque[str] = deque(maxlen=self._max_items)
-        total = 0
-        with self._file_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                total += 1
-                tail.append(line)
-        if total <= self._max_items:
-            return
+        latest_rows = self._read_latest_locked()[: self._max_items]
         with self._file_path.open("w", encoding="utf-8") as f:
-            f.writelines(tail)
+            for payload in reversed(latest_rows):
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def _append_payload_locked(self, payload: dict) -> None:
         with self._file_path.open("a", encoding="utf-8") as f:
@@ -118,61 +114,90 @@ class RequestLogStore:
             self._truncate_to_max_locked()
             self._append_since_truncate = 0
 
-    def add(self, item: RequestLogRecord) -> None:
+    def add(self, item: RequestLogRecord) -> Optional[int]:
         payload = asdict(item)
-        self.add_payload(payload)
+        return self.add_payload(payload)
 
-    def add_payload(self, payload: dict) -> None:
+    def add_payload(self, payload: dict) -> Optional[int]:
         if not isinstance(payload, dict):
-            return
+            return None
         with self._lock:
             self._append_payload_locked(payload)
+            return self._generation
 
-    def upsert(self, item_id: str, payload: dict) -> None:
+    def upsert(self, item_id: str, payload: dict) -> Optional[int]:
         if not item_id:
-            return
+            return None
         if not isinstance(payload, dict):
-            return
+            return None
         item = {"id": item_id}
         item.update(payload)
         with self._lock:
             self._append_payload_locked(item)
+            return self._generation
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def upsert_if_generation(
+        self,
+        item_id: str,
+        payload: dict,
+        expected_generation: int,
+    ) -> bool:
+        if not item_id or not isinstance(payload, dict):
+            return False
+        item = {"id": item_id}
+        item.update(payload)
+        with self._lock:
+            if self._generation != int(expected_generation):
+                return False
+            self._append_payload_locked(item)
+            return True
+
+    def _read_latest_locked(self) -> list[dict]:
+        latest: dict[str, tuple[int, dict]] = {}
+        with self._file_path.open("r", encoding="utf-8") as f:
+            for line_number, line in enumerate(f):
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    item = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                item_id = str(item.get("id") or "").strip()
+                key = f"id:{item_id}" if item_id else f"line:{line_number}"
+                latest[key] = (line_number, item)
+
+        def sort_key(entry: tuple[int, dict]) -> tuple[float, int]:
+            line_number, item = entry
+            try:
+                ts_value = float(item.get("ts") or 0)
+            except Exception:
+                ts_value = 0.0
+            return ts_value, line_number
+
+        ordered = sorted(latest.values(), key=sort_key, reverse=True)
+        return [item for _, item in ordered]
 
     def list(self, limit: int = 20, page: int = 1) -> tuple[list[dict], int]:
         safe_limit = min(max(int(limit or 20), 1), 100)
         safe_page = max(int(page or 1), 1)
-        window_size = safe_limit * safe_page
-        tail: deque[str] = deque(maxlen=window_size)
-        total = 0
         with self._lock:
-            with self._file_path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    total += 1
-                    tail.append(line)
+            rows = self._read_latest_locked()
+        total = len(rows)
         if total <= 0:
             return [], 0
 
-        tail_lines = list(tail)
-        available = len(tail_lines)
-        start_from_end = (safe_page - 1) * safe_limit
-        if start_from_end >= available:
+        start = (safe_page - 1) * safe_limit
+        if start >= total:
             return [], total
-
-        end_idx = available - start_from_end
-        start_idx = max(0, end_idx - safe_limit)
-        selected = tail_lines[start_idx:end_idx]
-        data: list[dict] = []
-        for line in reversed(selected):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                item = json.loads(line)
-                if isinstance(item, dict):
-                    data.append(item)
-            except Exception:
-                continue
-        return data, total
+        return rows[start : start + safe_limit], total
 
     def stats(
         self,
@@ -186,46 +211,37 @@ class RequestLogStore:
         in_progress_requests = 0
 
         with self._lock:
-            with self._file_path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    raw = line.strip()
-                    if not raw:
-                        continue
-                    try:
-                        item = json.loads(raw)
-                    except Exception:
-                        continue
-                    if not isinstance(item, dict):
-                        continue
+            rows = self._read_latest_locked()
 
-                    try:
-                        ts_val = float(item.get("ts") or 0)
-                    except Exception:
-                        ts_val = 0.0
-                    if start_ts is not None and ts_val < float(start_ts):
-                        continue
-                    if end_ts is not None and ts_val > float(end_ts):
-                        continue
+        for item in rows:
+            try:
+                ts_val = float(item.get("ts") or 0)
+            except Exception:
+                ts_val = 0.0
+            if start_ts is not None and ts_val < float(start_ts):
+                continue
+            if end_ts is not None and ts_val > float(end_ts):
+                continue
 
-                    total_requests += 1
+            total_requests += 1
 
-                    try:
-                        status_code = int(item.get("status_code") or 0)
-                    except Exception:
-                        status_code = 0
-                    if status_code >= 400:
-                        failed_requests += 1
+            try:
+                status_code = int(item.get("status_code") or 0)
+            except Exception:
+                status_code = 0
+            if status_code >= 400:
+                failed_requests += 1
 
-                    task_status = str(item.get("task_status") or "").upper()
-                    if task_status == "IN_PROGRESS":
-                        in_progress_requests += 1
+            task_status = str(item.get("task_status") or "").upper()
+            if task_status == "IN_PROGRESS":
+                in_progress_requests += 1
 
-                    preview_kind = str(item.get("preview_kind") or "").strip().lower()
-                    if 200 <= status_code < 300:
-                        if preview_kind == "image":
-                            generated_images += 1
-                        elif preview_kind == "video":
-                            generated_videos += 1
+            preview_kind = str(item.get("preview_kind") or "").strip().lower()
+            if 200 <= status_code < 300:
+                if preview_kind == "image":
+                    generated_images += 1
+                elif preview_kind == "video":
+                    generated_videos += 1
 
         return {
             "total_requests": total_requests,
@@ -241,6 +257,7 @@ class RequestLogStore:
             with self._file_path.open("w", encoding="utf-8") as f:
                 f.write("")
             self._append_since_truncate = 0
+            self._generation += 1
 
 
 @dataclass
