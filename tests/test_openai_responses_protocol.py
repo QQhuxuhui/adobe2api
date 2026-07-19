@@ -49,11 +49,13 @@ def test_parse_official_image_tool_defaults_backend_model_and_tool_fields_win():
                 }
             ],
             "size": "1024x1024",
+            "aspect_ratio": "16:9",
             "quality": "low",
             "tools": [
                 {
                     "type": "image_generation",
                     "size": "1536x1024",
+                    "aspect_ratio": "free",
                     "quality": "high",
                     "output_format": "webp",
                     "output_compression": 73,
@@ -70,6 +72,7 @@ def test_parse_official_image_tool_defaults_backend_model_and_tool_fields_win():
     assert parsed.prompt == "edit this"
     assert parsed.input_image_urls == ("data:image/png;base64,YQ==",)
     assert parsed.size == "1536x1024"
+    assert parsed.aspect_ratio == "free"
     assert parsed.quality == "high"
     assert parsed.output_format == "webp"
     assert parsed.output_compression == 73

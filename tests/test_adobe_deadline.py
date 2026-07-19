@@ -320,6 +320,28 @@ def configure_generate_stubs(
     )
 
 
+def test_generate_forwards_fallback_ratio_to_payload_builder(monkeypatch):
+    client = make_client()
+    captured: dict[str, Any] = {}
+
+    def capture_payload_options(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(client, "_build_payload_candidates", capture_payload_options)
+
+    with pytest.raises(AdobeRequestError, match="no response"):
+        client.generate(
+            "token",
+            "prompt",
+            aspect_ratio="auto",
+            output_size={"width": 1744, "height": 2400},
+            fallback_aspect_ratio="3:4",
+        )
+
+    assert captured["fallback_aspect_ratio"] == "3:4"
+
+
 def test_generate_forwards_deadline_to_submit_poll_and_file_download(
     monkeypatch, tmp_path: Path
 ):

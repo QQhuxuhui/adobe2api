@@ -42,6 +42,7 @@ def test_executor_writes_returned_bytes_and_passes_adobe_options(tmp_path: Path)
         model_config=_model_config(),
         generated_dir=tmp_path,
         source_image_ids=["source-1"],
+        fallback_aspect_ratio="3:4",
         progress_cb=lambda update: None,
         on_generated_file_written=lambda path, old, new: writes.append((path, old, new)),
         job_id="fixed",
@@ -50,6 +51,7 @@ def test_executor_writes_returned_bytes_and_passes_adobe_options(tmp_path: Path)
     assert artifact.path.read_bytes() == b"returned-image"
     assert client.kwargs["quality_level"] == "low"
     assert client.kwargs["source_image_ids"] == ["source-1"]
+    assert client.kwargs["fallback_aspect_ratio"] == "3:4"
     assert writes == [(tmp_path / "fixed.png", 0, len(b"returned-image"))]
 
 

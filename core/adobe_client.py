@@ -994,6 +994,8 @@ class AdobeClient:
         quality_level: Optional[str] = None,
         detail_level: Optional[int] = None,
         source_image_ids: Optional[list[str]] = None,
+        output_size: Optional[dict[str, int]] = None,
+        fallback_aspect_ratio: Optional[str] = None,
     ) -> list[dict]:
         return build_image_payload_candidates(
             prompt=prompt,
@@ -1004,6 +1006,8 @@ class AdobeClient:
             quality_level=quality_level,
             detail_level=detail_level,
             source_image_ids=source_image_ids,
+            output_size=output_size,
+            fallback_aspect_ratio=fallback_aspect_ratio,
         )
 
     @staticmethod
@@ -1537,6 +1541,8 @@ class AdobeClient:
         quality_level: Optional[str] = None,
         detail_level: Optional[int] = None,
         source_image_ids: Optional[list[str]] = None,
+        output_size: Optional[dict[str, int]] = None,
+        fallback_aspect_ratio: Optional[str] = None,
         timeout: int = 180,
         out_path: Optional[Path] = None,
         progress_cb: Optional[Callable[[dict], None]] = None,
@@ -1553,6 +1559,8 @@ class AdobeClient:
             quality_level=quality_level,
             detail_level=detail_level,
             source_image_ids=source_image_ids,
+            output_size=output_size,
+            fallback_aspect_ratio=fallback_aspect_ratio,
         ):
             submit_resp = self._post_json(
                 self.submit_url,

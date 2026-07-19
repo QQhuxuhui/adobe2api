@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -21,6 +21,11 @@ from core.models.gemini_usage import (
     build_count_tokens_response,
     build_image_usage_metadata,
 )
+from core.models.catalog import (
+    GEMINI_FLASH_FIXED_RATIOS,
+    GEMINI_PRO_FIXED_RATIOS,
+)
+from core.models.resolver import resolve_requested_aspect_ratio
 from core.video_tasks import (
     VideoTaskCapacityError,
     VideoTaskSpec,
@@ -97,6 +102,16 @@ class GeminiNativeError(Exception):
         self.code = int(code)
         self.message = str(message)
         self.status = str(status)
+
+
+def _nonempty_parameter(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, dict, set)):
+        return bool(value)
+    return True
 
 
 def _image_model(
@@ -331,7 +346,11 @@ def parse_gemini_request(
     aspect_ratio = _config_field(image_config, "aspectRatio", "aspect_ratio", "1:1")
     if not isinstance(aspect_ratio, str):
         raise _invalid("aspectRatio must be a supported string")
-    if model_spec.family != "text" and aspect_ratio not in model_spec.aspect_ratios:
+    if (
+        model_spec.family != "text"
+        and aspect_ratio not in model_spec.aspect_ratios
+        and aspect_ratio not in {"free", "auto"}
+    ):
         raise _invalid("Unsupported aspectRatio")
 
     image_size_value = _config_field(image_config, "imageSize", "image_size", "1K")
@@ -391,6 +410,9 @@ def parse_veo_request(
     if model_spec.family != "video":
         raise _invalid("Model does not support video generation")
     payload = _decode_request_json(raw_body)
+    for field, value in payload.items():
+        if field not in {"instances", "parameters"} and _nonempty_parameter(value):
+            raise _invalid(f"Unsupported parameter: {field}")
     instances = payload.get("instances")
     if not isinstance(instances, list) or len(instances) != 1:
         raise _invalid("instances must contain exactly one item")
@@ -400,6 +422,9 @@ def parse_veo_request(
     prompt = instance.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise _invalid("instances[0].prompt must be a non-empty string")
+    for field, value in instance.items():
+        if field != "prompt" and _nonempty_parameter(value):
+            raise _invalid(f"Unsupported parameter: {field}")
     for field in (
         "image",
         "video",
@@ -414,6 +439,20 @@ def parse_veo_request(
     parameters = payload.get("parameters", {})
     if not isinstance(parameters, dict):
         raise _invalid("parameters must be an object")
+    allowed_parameter_fields = frozenset(
+        {
+            "aspectRatio",
+            "aspect_ratio",
+            "durationSeconds",
+            "duration_seconds",
+            "resolution",
+            "negativePrompt",
+            "negative_prompt",
+        }
+    )
+    for field, value in parameters.items():
+        if field not in allowed_parameter_fields and _nonempty_parameter(value):
+            raise _invalid(f"Unsupported parameter: {field}")
     for field in ("image", "video", "referenceImages", "reference_images"):
         if field in parameters:
             raise _invalid(f"Unsupported parameter: {field}")
@@ -435,8 +474,14 @@ def parse_veo_request(
     )
     if isinstance(raw_duration, bool) or not isinstance(raw_duration, (int, float)):
         raise _invalid("durationSeconds must be 4, 6, or 8")
-    duration = int(raw_duration)
-    if float(raw_duration) != float(duration) or duration not in {4, 6, 8}:
+    try:
+        numeric_duration = float(raw_duration)
+    except (TypeError, ValueError, OverflowError):
+        raise _invalid("durationSeconds must be 4, 6, or 8")
+    if not math.isfinite(numeric_duration):
+        raise _invalid("durationSeconds must be 4, 6, or 8")
+    duration = int(numeric_duration)
+    if numeric_duration != float(duration) or duration not in {4, 6, 8}:
         raise _invalid("durationSeconds must be 4, 6, or 8")
 
     raw_resolution = parameters.get("resolution", "720p")
@@ -811,6 +856,21 @@ def build_gemini_native_router(
             if spec.family == "text":
                 payload = build_canned_response(spec, parsed.prompt)
             else:
+                ordered_ratios = (
+                    GEMINI_FLASH_FIXED_RATIOS
+                    if spec.family == "flash"
+                    else GEMINI_PRO_FIXED_RATIOS
+                )
+                try:
+                    geometry = resolve_requested_aspect_ratio(
+                        parsed.aspect_ratio,
+                        input_images=parsed.images,
+                        supported_ratios=ordered_ratios,
+                        supports_auto=True,
+                        output_resolution=parsed.image_size,
+                    )
+                except HTTPException as exc:
+                    raise _invalid(str(exc.detail)) from exc
                 deadline = get_deadline()
 
                 def run_once(token: str) -> dict:
@@ -844,11 +904,13 @@ def build_gemini_native_router(
                         client.generate(
                             token=token,
                             prompt=parsed.prompt,
-                            aspect_ratio=parsed.aspect_ratio,
+                            aspect_ratio=geometry.aspect_ratio,
                             output_resolution=parsed.image_size,
                             upstream_model_id=str(spec.upstream_model_id),
                             upstream_model_version=str(spec.upstream_model_version),
                             source_image_ids=source_ids,
+                            output_size=geometry.output_size,
+                            fallback_aspect_ratio=geometry.fallback_aspect_ratio,
                             timeout=client.generate_timeout,
                             out_path=out_path,
                             progress_cb=progress,

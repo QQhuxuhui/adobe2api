@@ -63,6 +63,7 @@ class Harness:
                 public_generated_url=lambda request, filename: (
                     f"https://videos.example/generated/{filename}"
                 ),
+                generated_dir=tmp_path,
             )
         )
         self.client = TestClient(api)
@@ -118,6 +119,7 @@ def test_create_sora_video_maps_request_to_task(content_type: str, harness: Harn
         {"model": "sora-2", "prompt": ""},
         {"model": "sora-2", "prompt": "p", "input_reference": "file"},
         {"model": "sora-2", "prompt": "p", "characters": [{"id": "c"}]},
+        {"model": "sora-2", "prompt": "p", "seed": 1},
     ],
 )
 def test_create_rejects_invalid_or_unsupported_fields(harness: Harness, fields):
@@ -226,6 +228,29 @@ def test_content_returns_real_mime_and_rejects_nonterminal_states(
         f"/v1/videos/{task_id}/content", headers=harness.headers
     )
     assert pruned.status_code == 404
+
+
+def test_content_rejects_result_path_outside_generated_root(
+    harness: Harness,
+    tmp_path: Path,
+):
+    created = harness.post_video("json", model="sora-2", prompt="p").json()
+    outside = tmp_path.parent / "outside.mp4"
+    outside.write_bytes(b"must not be served")
+    harness.store.update(
+        created["id"],
+        status="completed",
+        progress=100,
+        result_path=str(outside),
+        result_mime="video/mp4",
+    )
+
+    response = harness.client.get(
+        f"/v1/videos/{created['id']}/content", headers=harness.headers
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "video_file_not_found"
 
 
 def test_get_and_content_hide_cross_protocol_tasks(harness: Harness):

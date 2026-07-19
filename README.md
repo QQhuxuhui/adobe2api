@@ -133,11 +133,14 @@ GPT Image 图像模型（实验接入）：
   - `firefly-gpt-image-4k-1x1`
   - `firefly-gpt-image-2k-21x9`
 
-关于 `auto`：
+关于 `free` / `auto`：
 
-- 当前实现 **不支持** `aspect_ratio=auto`
-- 如果请求里传入 `auto`，服务端会回退为 `1:1`
-- 请显式传具体比例，或直接使用带比例后缀的模型 ID
+- 两者是兼容别名；有输入图时，第一张图决定输出比例
+- Adobe/Gemini 模型先尝试按第一张图生成等比例输出尺寸；上游不接受时回退到该模型最接近的标准比例
+- `gpt-image-2` 会映射到该模型最接近的标准比例
+- 没有输入图时优先读取 `size`；也没有 `size` 时 Adobe/Gemini 尝试 `auto`，GPT Image 使用 `1:1`
+- 没有显式传模型但传了 `free` / `auto` 时，使用动态模型 `firefly-nano-banana-pro`
+- 用户显式选择带比例后缀的模型 ID 时，模型 ID 中的固定比例优先
 
 Sora2 视频模型：
 
@@ -513,6 +516,8 @@ Sora 端点：
 | `sora-2` | `4` / `8` / `12` | `1280x720` / `720x1280` |
 | `sora-2-pro` | `4` / `8` / `12` | `1280x720` / `720x1280` / `1792x1024` / `1024x1792` |
 
+未传 `seconds` 时默认 4 秒，未传 `size` 时默认 `720x1280`。这两个公共模型名也会出现在 `GET /v1/models`；旧的 `firefly-sora2-*` 和 `firefly-sora2-pro-*` 后缀模型仍然可以在聊天入口使用。请求日志保留公共模型名，积分计量使用实际匹配出的 `firefly-*` 后缀模型。
+
 `sora-2-pro` 的两个高尺寸值是当前 new-api fork 使用的旧枚举，服务会分别生成 Adobe 实际支持的 1920x1080 或 1080x1920 视频。当前实现不支持 `input_reference`、`characters` 等媒体输入。
 
 ```bash
@@ -535,6 +540,8 @@ Gemini Veo 端点：
 
 支持 `veo-3.1-generate-preview` 和 `veo-3.1-fast-generate-preview`。`durationSeconds` 支持 `4` / `6` / `8`，`resolution` 支持 `720p` / `1080p`，其中 1080p 只能生成 8 秒；`aspectRatio` 支持 `16:9` / `9:16`。`negativePrompt` 会透传，媒体输入、4K 和非空 `personGeneration` 会明确返回 400。
 
+Veo 未传参数时默认 8 秒、`16:9`、`720p`。服务会按请求参数匹配 Adobe 的 `firefly-veo31-{duration}s-{ratio}-{resolution}` 或 `firefly-veo31-fast-{duration}s-{ratio}-{resolution}` 后缀，公共别名和所有旧后缀都会出现在对应模型列表中。
+
 ```bash
 curl -X POST "http://127.0.0.1:6001/v1beta/models/veo-3.1-generate-preview:predictLongRunning" \
   -H "X-Goog-Api-Key: <service_api_key>" \
@@ -550,6 +557,8 @@ curl "http://127.0.0.1:6001/v1beta/models/veo-3.1-generate-preview/operations/<o
 ```
 
 部署 new-api 时，Sora 和 Gemini 视频应配置为两个渠道，Gemini version 使用 `v1beta`。base URL 应使用 HTTPS 或仅在受信私网中可达的服务名，避免 API key 和生成文件暴露在明文链路上。
+
+Veo operation 返回的下载地址使用 `public_base_url`（或 `ADOBE_PUBLIC_BASE_URL`）；当 new-api 与本服务不在同一网络命名空间时，必须把它配置成 new-api 可访问的完整 URL，不能使用默认的回环地址。
 
 计费需要按本机 new-api 的实现配置：Sora 默认按 `model_price * seconds * size 倍率` 计费，高尺寸倍率为 `1.666667`，因此 `model_price` 应配置为每秒基础价且不要设置 `TASK_PRICE_PATCH`；只有要固定按次收费时才加入该变量。Gemini 任务适配器当前不把时长写入计价数据，Veo 只能按 `model_price` 固定单次计费。
 

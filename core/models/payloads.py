@@ -1,7 +1,30 @@
 from __future__ import annotations
 
+import copy
+import math
 import time
 from typing import Optional
+
+
+def size_from_dimensions(
+    width: int, height: int, output_resolution: str = "2K"
+) -> dict[str, int]:
+    if width <= 0 or height <= 0:
+        raise ValueError("image dimensions must be positive")
+    level = str(output_resolution or "2K").upper()
+    side = {"1K": 1024, "2K": 2048, "4K": 4096}.get(level, 2048)
+    max_edge = {"1K": 3072, "2K": 6144, "4K": 12288}.get(level, 6144)
+    pixel_budget_scale = math.sqrt((side * side) / (width * height))
+    edge_limit_scale = max_edge / max(width, height)
+    scale = min(pixel_budget_scale, edge_limit_scale)
+
+    def aligned(value: float) -> int:
+        return max(16, int(round(value / 16.0)) * 16)
+
+    return {
+        "width": aligned(width * scale),
+        "height": aligned(height * scale),
+    }
 
 
 def size_from_ratio(ratio: str, output_resolution: str = "2K") -> dict:
@@ -137,8 +160,11 @@ def build_image_payload_candidates(
     quality_level: Optional[str] = None,
     detail_level: Optional[int] = None,
     source_image_ids: Optional[list[str]] = None,
+    output_size: Optional[dict[str, int]] = None,
+    fallback_aspect_ratio: Optional[str] = None,
 ) -> list[dict]:
     normalized_ratio = str(aspect_ratio or "").strip().lower()
+    normalized_fallback_ratio = str(fallback_aspect_ratio or "").strip().lower()
     effective_ratio = normalized_ratio or "1:1"
     if str(upstream_model_id or "").strip().lower() == "gpt-image":
         effective_detail_level = detail_level
@@ -198,7 +224,6 @@ def build_image_payload_candidates(
         "modelVersion": upstream_model_version,
         "n": 1,
         "prompt": prompt,
-        "size": size_from_ratio(effective_ratio, output_resolution),
         "seeds": [int(time.time()) % 999999],
         "groundSearch": False,
         "skipCai": False,
@@ -211,11 +236,33 @@ def build_image_payload_candidates(
             "parameters": {"addWatermark": False},
         },
     }
+    if output_size is not None:
+        base_payload["size"] = {
+            "width": int(output_size["width"]),
+            "height": int(output_size["height"]),
+        }
+    elif effective_ratio != "auto":
+        base_payload["size"] = size_from_ratio(effective_ratio, output_resolution)
     if normalized_ratio and normalized_ratio != "auto":
         base_payload["modelSpecificPayload"]["aspectRatio"] = normalized_ratio
 
+    def fixed_ratio_fallback(payload: dict, ratio: str) -> dict:
+        fallback = copy.deepcopy(payload)
+        fallback["size"] = size_from_ratio(ratio, output_resolution)
+        fallback["modelSpecificPayload"]["aspectRatio"] = ratio
+        return fallback
+
+    auto_fallback_ratio = normalized_fallback_ratio
+    if effective_ratio == "auto" and output_size is None:
+        auto_fallback_ratio = auto_fallback_ratio or "1:1"
+
     if not source_image_ids:
         base_payload["referenceBlobs"] = []
+        if effective_ratio == "auto" and auto_fallback_ratio:
+            return [
+                base_payload,
+                fixed_ratio_fallback(base_payload, auto_fallback_ratio),
+            ]
         return [base_payload]
 
     edited = dict(base_payload)
@@ -226,4 +273,6 @@ def build_image_payload_candidates(
     edited["referenceBlobs"] = [
         {"id": img_id, "usage": "general"} for img_id in source_image_ids
     ]
+    if effective_ratio == "auto" and auto_fallback_ratio:
+        return [edited, fixed_ratio_fallback(edited, auto_fallback_ratio)]
     return [edited]

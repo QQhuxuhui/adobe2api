@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import importlib
 import json
 import sys
@@ -10,6 +11,7 @@ from typing import Callable
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -224,6 +226,12 @@ def image_request(
             "candidateCount": 1,
         },
     }
+
+
+def png_bytes(width: int, height: int) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", (width, height), (30, 60, 90)).save(output, format="PNG")
+    return output.getvalue()
 
 
 def veo_request(
@@ -571,6 +579,56 @@ def test_pro_generation_reads_disk_and_returns_inline_png(
     assert len(harness.accounted) == 1
     assert harness.accounted[0][2] == len(b"generated-png")
     assert harness.previews[0][1] == "image"
+
+
+def test_gemini_free_uses_primary_image_ratio_and_size_override(tmp_path: Path):
+    harness = Harness(tmp_path)
+    response = post(
+        harness,
+        "gemini-3-pro-image",
+        "generateContent",
+        image_request(
+            ratio="free", size="2K", inline_image=png_bytes(1000, 1379)
+        ),
+    )
+
+    assert response.status_code == 200, response.text
+    call = harness.client_impl.generate_calls[0]
+    assert call["aspect_ratio"] == "auto"
+    assert call["fallback_aspect_ratio"] == "3:4"
+    assert call["output_size"]["width"] < call["output_size"]["height"]
+    actual = call["output_size"]["width"] / call["output_size"]["height"]
+    assert abs(actual - 1000 / 1379) < 0.01
+
+
+def test_gemini_free_without_input_image_forwards_size_less_auto(tmp_path: Path):
+    harness = Harness(tmp_path)
+    response = post(
+        harness,
+        "gemini-3.1-flash-image",
+        "generateContent",
+        image_request(ratio="auto", size="2K"),
+    )
+
+    assert response.status_code == 200, response.text
+    call = harness.client_impl.generate_calls[0]
+    assert call["aspect_ratio"] == "auto"
+    assert call["output_size"] is None
+
+
+def test_gemini_free_rejects_unreadable_primary_image(tmp_path: Path):
+    harness = Harness(tmp_path)
+    response = post(
+        harness,
+        "gemini-3-pro-image",
+        "generateContent",
+        image_request(ratio="free", inline_image=b"not-an-image"),
+    )
+
+    assert_google_error(response, 400, "INVALID_ARGUMENT")
+    assert "first input image" in response.json()["error"]["message"]
+    assert harness.client_impl.upload_calls == []
+    assert harness.client_impl.generate_calls == []
 
 
 def test_flash_generation_omits_index_and_has_flash_identity(

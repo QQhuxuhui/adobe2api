@@ -23,8 +23,45 @@ from api.schemas import GenerateRequest
 from core.entity_store import entity_store
 from core.image_generation import generate_image_artifact
 from core.models.resolver import build_image_usage
+from core.models.video_resolver import VideoModelRequestError, resolve_video_model
 from core.stores import RequestLogRecord
 from core.video_generation import generate_video_file
+
+
+CHAT_VIDEO_ALLOWED_FIELDS = frozenset(
+    {
+        "model",
+        "messages",
+        "prompt",
+        "stream",
+        "duration",
+        "durationSeconds",
+        "duration_seconds",
+        "seconds",
+        "size",
+        "aspectRatio",
+        "aspect_ratio",
+        "resolution",
+        "generate_audio",
+        "generateAudio",
+        "negative_prompt",
+        "negativePrompt",
+        "video_reference_mode",
+        "videoReferenceMode",
+        "reference_mode",
+        "referenceMode",
+    }
+)
+
+
+def _nonempty_video_field(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, dict, set)):
+        return bool(value)
+    return True
 
 
 def build_generation_router(
@@ -39,7 +76,7 @@ def build_generation_router(
     video_model_catalog: dict,
     supported_ratios: set,
     resolve_model: Callable[[str | None], dict],
-    resolve_ratio_and_resolution: Callable[[dict, str | None], tuple[str, str, str]],
+    resolve_image_geometry: Callable[..., Any],
     require_service_api_key: Callable[[Request], None],
     set_request_task_progress: Callable[..., None],
     set_request_credit_context: Callable[[Request, str, str], None],
@@ -255,9 +292,11 @@ def build_generation_router(
                     }
                 },
             )
-        ratio, output_resolution, resolved_model_id = resolve_ratio_and_resolution(
-            data, model_id
-        )
+        geometry = resolve_image_geometry(data, model_id, [])
+        ratio = geometry.aspect_ratio
+        usage_ratio = geometry.usage_ratio
+        output_resolution = geometry.output_resolution
+        resolved_model_id = geometry.model_id
         model_conf = resolve_model(resolved_model_id)
         set_request_credit_context(request, resolved_model_id, output_resolution)
 
@@ -286,6 +325,8 @@ def build_generation_router(
                     model_config=model_conf,
                     generated_dir=generated_dir,
                     source_image_ids=[],
+                    output_size=geometry.output_size,
+                    fallback_aspect_ratio=geometry.fallback_aspect_ratio,
                     progress_cb=_image_progress_cb,
                     on_generated_file_written=on_generated_file_written,
                 )
@@ -297,7 +338,9 @@ def build_generation_router(
                     "data": [{"url": image_url}],
                     # 该接口不上传输入图(client.generate 无 source_image_ids),
                     # 输入图 token 恒为 0,不按请求里未使用的图片字段虚计费
-                    "usage": build_image_usage(prompt, output_resolution, ratio, 0),
+                    "usage": build_image_usage(
+                        prompt, output_resolution, usage_ratio, 0
+                    ),
                 }
 
             return run_with_token_retries(
@@ -499,11 +542,20 @@ def build_generation_router(
         }
         try:
             parsed = parse_responses_image_request(data, image_model_ids)
-            ratio, output_resolution, resolved_model_id = resolve_ratio_and_resolution(
-                {"size": parsed.size, "quality": parsed.quality}, parsed.image_model
-            )
-            model_conf = resolve_model(resolved_model_id)
             input_images = load_input_images(parsed.image_loader_messages())
+            geometry = resolve_image_geometry(
+                {
+                    "size": parsed.size,
+                    "quality": parsed.quality,
+                    "aspect_ratio": parsed.aspect_ratio,
+                },
+                parsed.image_model,
+                input_images,
+            )
+            ratio = geometry.aspect_ratio
+            output_resolution = geometry.output_resolution
+            resolved_model_id = geometry.model_id
+            model_conf = resolve_model(resolved_model_id)
         except ResponsesRequestError as exc:
             return JSONResponse(
                 status_code=400,
@@ -556,6 +608,8 @@ def build_generation_router(
                 model_config=model_conf,
                 generated_dir=generated_dir,
                 source_image_ids=source_image_ids,
+                output_size=geometry.output_size,
+                fallback_aspect_ratio=geometry.fallback_aspect_ratio,
                 progress_cb=_image_progress_cb,
                 on_generated_file_written=on_generated_file_written,
             )
@@ -569,7 +623,7 @@ def build_generation_router(
             usage = build_image_usage(
                 parsed.prompt,
                 output_resolution,
-                ratio,
+                geometry.usage_ratio,
                 len(source_image_ids),
             )
             return build_responses_image_response(
@@ -680,9 +734,18 @@ def build_generation_router(
             return _bad_request("Use /v1/chat/completions for video generation")
 
         try:
-            ratio, output_resolution, resolved_model_id = resolve_ratio_and_resolution(
-                {"size": form.get("size"), "quality": form.get("quality")}, model_id
+            geometry = resolve_image_geometry(
+                {
+                    "size": form.get("size"),
+                    "quality": form.get("quality"),
+                    "aspect_ratio": form.get("aspect_ratio"),
+                },
+                model_id,
+                input_images,
             )
+            ratio = geometry.aspect_ratio
+            output_resolution = geometry.output_resolution
+            resolved_model_id = geometry.model_id
             model_conf = resolve_model(resolved_model_id)
         except HTTPException as exc:
             return _openai_image_error_response(
@@ -722,6 +785,8 @@ def build_generation_router(
                     model_config=model_conf,
                     generated_dir=generated_dir,
                     source_image_ids=source_image_ids,
+                    output_size=geometry.output_size,
+                    fallback_aspect_ratio=geometry.fallback_aspect_ratio,
                     progress_cb=_image_progress_cb,
                     on_generated_file_written=on_generated_file_written,
                 )
@@ -738,7 +803,10 @@ def build_generation_router(
                     "model": resolved_model_id,
                     "data": [item],
                     "usage": build_image_usage(
-                        prompt, output_resolution, ratio, len(source_image_ids)
+                        prompt,
+                        output_resolution,
+                        geometry.usage_ratio,
+                        len(source_image_ids),
                     ),
                 }
 
@@ -1043,43 +1111,96 @@ def build_generation_router(
         resolved_model_id = model_id if is_video_model else None
         ratio = "9:16"
         output_resolution = "2K"
-        duration = int(video_conf["duration"]) if video_conf else 12
-        video_resolution = (
-            str(video_conf.get("resolution") or "720p") if video_conf else "720p"
-        )
-        if video_conf:
-            ratio = str(video_conf.get("aspect_ratio") or ratio)
-        video_engine = str(video_conf.get("engine") or "sora2") if video_conf else ""
+        resolved_video = None
+        image_geometry = None
+        if is_video_model:
+            for field, value in data.items():
+                if field not in CHAT_VIDEO_ALLOWED_FIELDS and _nonempty_video_field(
+                    value
+                ):
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": {
+                                "message": f"Unsupported parameter: {field}",
+                                "type": "invalid_request_error",
+                                "code": "unsupported_parameter",
+                            }
+                        },
+                    )
+            try:
+                resolved_video = resolve_video_model(model_id, data)
+            except VideoModelRequestError as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": str(exc),
+                            "type": "invalid_request_error",
+                            "code": str(exc.code),
+                        }
+                    },
+                )
+            ratio = resolved_video.aspect_ratio
+            duration = resolved_video.duration
+            video_resolution = resolved_video.resolution
+            video_engine = resolved_video.engine
+            resolved_video_conf = {
+                **video_conf,
+                "engine": resolved_video.engine,
+                "upstream_model": resolved_video.upstream_model,
+                "duration": resolved_video.duration,
+                "aspect_ratio": resolved_video.aspect_ratio,
+                "resolution": resolved_video.resolution,
+                "reference_mode": resolved_video.reference_mode,
+                "generate_audio": resolved_video.generate_audio,
+            }
+        else:
+            resolved_video_conf = {}
+            duration = 12
+            video_resolution = "720p"
+            video_engine = ""
+        try:
+            input_images = load_input_images(data.get("messages") or [])
+        except Exception as exc:
+            return _openai_image_error_response(
+                request,
+                exc,
+                endpoint="/v1/chat/completions",
+                model_label=str(model_id),
+            )
         generate_audio = True
         negative_prompt = ""
-        video_reference_mode = (
-            str(video_conf.get("reference_mode") or "frame") if video_conf else "frame"
-        )
+        video_reference_mode = "frame"
         if is_video_model:
-            resolved_video_options = resolve_video_options(data)
-            if (
-                isinstance(resolved_video_options, tuple)
-                and len(resolved_video_options) == 3
-            ):
-                generate_audio, negative_prompt, requested_reference_mode = (
-                    resolved_video_options
-                )
-                if "reference_mode" not in (video_conf or {}):
-                    video_reference_mode = requested_reference_mode
-            else:
-                generate_audio, negative_prompt = resolved_video_options
-            if not any(k in data for k in ("generate_audio", "generateAudio")):
-                generate_audio = bool(video_conf.get("generate_audio", generate_audio))
+            generate_audio = resolved_video.generate_audio
+            negative_prompt = resolved_video.negative_prompt
+            video_reference_mode = resolved_video.reference_mode
         else:
-            ratio, output_resolution, resolved_model_id = resolve_ratio_and_resolution(
-                data, model_id or None
-            )
+            try:
+                image_geometry = resolve_image_geometry(
+                    data, model_id or None, input_images
+                )
+            except Exception as exc:
+                return _openai_image_error_response(
+                    request,
+                    exc,
+                    endpoint="/v1/chat/completions",
+                    model_label=str(model_id),
+                )
+            ratio = image_geometry.aspect_ratio
+            output_resolution = image_geometry.output_resolution
+            resolved_model_id = image_geometry.model_id
         image_model_conf = (
             resolve_model(resolved_model_id) if not is_video_model else {}
         )
         set_request_credit_context(
             request,
-            str(resolved_model_id or model_id),
+            str(
+                resolved_video.credit_model_id
+                if resolved_video is not None
+                else (resolved_model_id or model_id)
+            ),
             video_resolution if is_video_model else output_resolution,
         )
 
@@ -1088,7 +1209,6 @@ def build_generation_router(
             kling_bound_refs: list[dict] | None = None
             if video_engine == "kling-o3":
                 entity_account_id, kling_bound_refs = _resolve_entity_bindings(prompt)
-            input_images = load_input_images(data.get("messages") or [])
             set_request_task_progress(
                 request, task_status="IN_PROGRESS", task_progress=0.0
             )
@@ -1147,7 +1267,7 @@ def build_generation_router(
                     generated_video = generate_video_file(
                         client=client,
                         token=token,
-                        video_conf=video_conf or {},
+                        video_conf=resolved_video_conf or video_conf or {},
                         prompt=video_prompt,
                         aspect_ratio=ratio,
                         duration=duration,
@@ -1196,6 +1316,10 @@ def build_generation_router(
                         model_config=image_model_conf,
                         generated_dir=generated_dir,
                         source_image_ids=source_image_ids,
+                        output_size=image_geometry.output_size,
+                        fallback_aspect_ratio=(
+                            image_geometry.fallback_aspect_ratio
+                        ),
                         progress_cb=_image_progress_cb,
                         on_generated_file_written=on_generated_file_written,
                     )
@@ -1221,7 +1345,14 @@ def build_generation_router(
                     # 输入图按实际上传给上游的张数计费(最后一条 user 消息、
                     # 最多 6 张),而非请求里出现的所有图片字段
                     "usage": build_image_usage(
-                        prompt, output_resolution, ratio, len(source_image_ids)
+                        prompt,
+                        output_resolution,
+                        (
+                            image_geometry.usage_ratio
+                            if image_geometry is not None
+                            else ratio
+                        ),
+                        len(source_image_ids),
                     ),
                 }
                 if bool(data.get("stream", False)):

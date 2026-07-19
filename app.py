@@ -60,8 +60,8 @@ from core.models import (
     MODEL_CATALOG,
     SUPPORTED_RATIOS,
     VIDEO_MODEL_CATALOG,
+    resolve_image_geometry,
     resolve_model,
-    resolve_ratio_and_resolution,
 )
 
 
@@ -123,7 +123,12 @@ def serve_generated_file(filename: str):
     safe_name = Path(raw).name
     if not safe_name or safe_name != raw:
         raise HTTPException(status_code=404, detail="file not found")
-    target = GENERATED_DIR / safe_name
+    try:
+        root = GENERATED_DIR.resolve()
+        target = (GENERATED_DIR / safe_name).resolve()
+        target.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        raise HTTPException(status_code=404, detail="file not found")
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="file not found")
     background = BackgroundTask(_drop_generated_file_cache, target)
@@ -295,12 +300,18 @@ def _set_request_credit_context(
 ) -> None:
     normalized_model = str(model or "").strip() or None
     normalized_resolution = str(output_resolution or "").strip().upper() or None
-    request.state.log_model = normalized_model
+    # Keep the public model in request logs while retaining the concrete
+    # Adobe suffix separately for credit attribution.
+    request.state.log_credit_model_id = normalized_model
+    if not str(getattr(request.state, "log_model", "") or "").strip():
+        request.state.log_model = normalized_model
     request.state.log_output_resolution = normalized_resolution
     _upsert_live_request(
         request,
         {
-            "model": normalized_model,
+            "model": (
+                getattr(request.state, "log_model", None) or normalized_model
+            ),
             "ts": time.time(),
         },
     )
@@ -558,7 +569,8 @@ def _finalize_request_credits(
             log_generation=log_generation,
             payload=successful_payload,
             model_id=str(
-                successful_payload.get("model")
+                getattr(request.state, "log_credit_model_id", "")
+                or successful_payload.get("model")
                 or getattr(request.state, "log_model", "")
                 or ""
             ),
@@ -1389,15 +1401,15 @@ def _public_generated_url(request: Request, filename: str) -> str:
     safe_name = str(filename or "").lstrip("/")
     path = f"/generated/{safe_name}"
 
-    config_base = str(config_manager.get("public_base_url", "") or "").strip()
-    if config_base:
-        return f"{config_base.rstrip('/')}{path}"
-
     override = str(
         os.getenv("ADOBE_PUBLIC_BASE_URL") or os.getenv("PUBLIC_BASE_URL") or ""
     ).strip()
     if override:
         return f"{override.rstrip('/')}{path}"
+
+    config_base = str(config_manager.get("public_base_url", "") or "").strip()
+    if config_base:
+        return f"{config_base.rstrip('/')}{path}"
 
     forwarded_host = str(request.headers.get("x-forwarded-host") or "").strip()
     if forwarded_host:
@@ -1594,6 +1606,63 @@ def _write_submitted_video_log(spec, record) -> None:
     log_store.upsert(spec.log_id, payload)
 
 
+def _write_terminal_video_log(record) -> None:
+    """Close a task log when no worker is available to emit its final record."""
+    try:
+        list_logs = getattr(log_store, "list", None)
+        if callable(list_logs):
+            rows, _total = list_logs(limit=500, page=1)
+            if any(
+                str(row.get("id") or "").strip() == str(record.log_id or "").strip()
+                and str(row.get("task_status") or "").upper() == "FAILED"
+                for row in rows
+                if isinstance(row, dict)
+            ):
+                return
+        log_store.upsert(
+            record.log_id,
+            asdict(
+                RequestLogRecord(
+                    id=record.log_id,
+                    ts=time.time(),
+                    method="POST",
+                    path=(
+                        "/v1/videos"
+                        if record.protocol == "openai"
+                        else f"/v1beta/models/{record.model}:predictLongRunning"
+                    ),
+                    status_code=503,
+                    duration_sec=0,
+                    operation=(
+                        "videos.create"
+                        if record.protocol == "openai"
+                        else "gemini.predictLongRunning"
+                    ),
+                    model=record.model,
+                    prompt_preview=record.prompt_preview,
+                    error=record.error_message,
+                    error_code=record.error_code,
+                    task_status="FAILED",
+                    task_progress=float(record.progress or 0),
+                )
+            ),
+        )
+    except Exception:
+        logger.warning("failed to finalize video task log id=%s", record.log_id, exc_info=True)
+
+
+def _cleanup_interrupted_video_tasks() -> None:
+    for record in video_task_store.take_interrupted():
+        _write_terminal_video_log(record)
+        for suffix in (".video.tmp", ".mp4", ".webm", ".ogv"):
+            candidate = (GENERATED_DIR / f"{record.id}{suffix}").resolve()
+            try:
+                candidate.relative_to(GENERATED_DIR.resolve())
+                candidate.unlink(missing_ok=True)
+            except (OSError, RuntimeError, ValueError):
+                continue
+
+
 video_task_runner = build_video_task_runner(
     token_manager=token_manager,
     client=client,
@@ -1614,7 +1683,10 @@ video_task_manager = VideoTaskManager(
     max_workers=2,
     max_pending=20,
     on_submitted=_write_submitted_video_log,
+    on_terminal=_write_terminal_video_log,
 )
+
+_cleanup_interrupted_video_tasks()
 
 
 def _shutdown_video_services() -> None:
@@ -1647,6 +1719,7 @@ app.include_router(
         task_store=video_task_store,
         require_service_api_key=_require_service_api_key,
         public_generated_url=_public_generated_url,
+        generated_dir=GENERATED_DIR,
     )
 )
 
@@ -1662,7 +1735,7 @@ app.include_router(
         video_model_catalog=VIDEO_MODEL_CATALOG,
         supported_ratios=SUPPORTED_RATIOS,
         resolve_model=resolve_model,
-        resolve_ratio_and_resolution=resolve_ratio_and_resolution,
+        resolve_image_geometry=resolve_image_geometry,
         require_service_api_key=_require_service_api_key,
         set_request_task_progress=_set_request_task_progress,
         set_request_credit_context=_set_request_credit_context,

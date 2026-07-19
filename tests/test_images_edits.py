@@ -1,17 +1,19 @@
 import base64
+import io
 import logging
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from api.routes.generation import build_generation_router
 from core.models import (
     MODEL_CATALOG,
     SUPPORTED_RATIOS,
     VIDEO_MODEL_CATALOG,
+    resolve_image_geometry,
     resolve_model,
-    resolve_ratio_and_resolution,
 )
 
 
@@ -47,6 +49,12 @@ class FakeAdobeClient:
         return b"edited-image-bytes", {"progress": 100}
 
 
+def png_bytes(width: int, height: int) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", (width, height), (40, 80, 120)).save(output, format="PNG")
+    return output.getvalue()
+
+
 def make_client(tmp_path: Path, adobe_client: FakeAdobeClient):
     credit_contexts: list[tuple[str, str]] = []
     logging_fields: list[tuple[str, str]] = []
@@ -63,7 +71,7 @@ def make_client(tmp_path: Path, adobe_client: FakeAdobeClient):
             video_model_catalog=VIDEO_MODEL_CATALOG,
             supported_ratios=SUPPORTED_RATIOS,
             resolve_model=resolve_model,
-            resolve_ratio_and_resolution=resolve_ratio_and_resolution,
+            resolve_image_geometry=resolve_image_geometry,
             require_service_api_key=lambda request: None,
             set_request_task_progress=lambda request, **kwargs: None,
             set_request_credit_context=lambda request, model, resolution: (
@@ -139,6 +147,64 @@ def test_edits_accepts_bracket_field_name_and_multiple_images(tmp_path: Path):
     assert adobe.generate_kwargs["source_image_ids"] == ["img-1", "img-2"]
     body = response.json()
     assert body["usage"]["input_tokens_details"]["image_tokens"] == 600
+
+
+def test_edits_free_uses_first_image_ratio_for_gpt_image(tmp_path: Path):
+    adobe = FakeAdobeClient()
+    client, _, _ = make_client(tmp_path, adobe)
+
+    response = client.post(
+        "/v1/images/edits",
+        data={"prompt": "merge", "model": "gpt-image-2", "aspect_ratio": "free"},
+        files=[
+            ("image[]", ("portrait.png", png_bytes(1000, 1379), "image/png")),
+            ("image[]", ("landscape.png", png_bytes(1600, 900), "image/png")),
+        ],
+    )
+
+    assert response.status_code == 200, response.text
+    assert adobe.generate_kwargs["aspect_ratio"] == "3:4"
+    assert adobe.generate_kwargs["output_size"] is None
+
+
+def test_edits_free_passes_primary_image_size_to_auto_capable_model(tmp_path: Path):
+    adobe = FakeAdobeClient()
+    client, _, _ = make_client(tmp_path, adobe)
+
+    response = client.post(
+        "/v1/images/edits",
+        data={
+            "prompt": "edit",
+            "model": "firefly-nano-banana-pro",
+            "aspect_ratio": "auto",
+        },
+        files={"image": ("portrait.png", png_bytes(1000, 1379), "image/png")},
+    )
+
+    assert response.status_code == 200, response.text
+    assert adobe.generate_kwargs["aspect_ratio"] == "auto"
+    assert adobe.generate_kwargs["fallback_aspect_ratio"] == "3:4"
+    size = adobe.generate_kwargs["output_size"]
+    assert size["width"] < size["height"]
+    assert abs(size["width"] / size["height"] - 1000 / 1379) < 0.01
+
+
+def test_edits_free_rejects_unreadable_first_image(tmp_path: Path):
+    adobe = FakeAdobeClient()
+    client, _, _ = make_client(tmp_path, adobe)
+
+    response = client.post(
+        "/v1/images/edits",
+        data={"prompt": "edit", "model": "gpt-image-2", "aspect_ratio": "free"},
+        files=[
+            ("image[]", ("broken.png", b"not-an-image", "image/png")),
+            ("image[]", ("valid.png", png_bytes(1600, 900), "image/png")),
+        ],
+    )
+
+    assert response.status_code == 400
+    assert "first input image" in response.json()["error"]["message"]
+    assert adobe.uploads == []
 
 
 def test_edits_b64_json_response(tmp_path: Path):

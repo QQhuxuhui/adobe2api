@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Callable
+
+
+logger = logging.getLogger("adobe2api.video_tasks")
 
 
 TERMINAL_VIDEO_TASK_STATUSES = frozenset({"completed", "failed"})
@@ -89,6 +93,7 @@ class VideoTaskStore:
         self._max_items = max(1, int(max_items or 500))
         self._lock = threading.Lock()
         self._items: dict[str, VideoTaskRecord] = {}
+        self._interrupted: list[VideoTaskRecord] = []
         self._append_since_compact = 0
         self._compact_interval = 200
         self._file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,7 +101,7 @@ class VideoTaskStore:
             self._file_path.touch()
         with self._lock:
             self._load_locked()
-            self._fail_interrupted_locked()
+            self._interrupted = self._fail_interrupted_locked()
 
     @staticmethod
     def _record_from_payload(payload: dict) -> VideoTaskRecord | None:
@@ -153,13 +158,14 @@ class VideoTaskStore:
             # and retry maintenance compaction on the next write.
             return
 
-    def _fail_interrupted_locked(self) -> None:
+    def _fail_interrupted_locked(self) -> list[VideoTaskRecord]:
         now = time.time()
         interrupted = [
             record
             for record in self._items.values()
             if record.status in ACTIVE_VIDEO_TASK_STATUSES
         ]
+        updated_records: list[VideoTaskRecord] = []
         for record in interrupted:
             updated = replace(
                 record,
@@ -170,7 +176,15 @@ class VideoTaskStore:
             )
             self._append_locked(updated)
             self._items[updated.id] = updated
+            updated_records.append(replace(updated))
         self._compact_if_needed_locked()
+        return updated_records
+
+    def take_interrupted(self) -> list[VideoTaskRecord]:
+        with self._lock:
+            records = [replace(record) for record in self._interrupted]
+            self._interrupted.clear()
+            return records
 
     def create(self, record: VideoTaskRecord) -> VideoTaskRecord:
         item = replace(record)
@@ -267,12 +281,14 @@ class VideoTaskManager:
         max_workers: int = 2,
         max_pending: int = 20,
         on_submitted: Callable[[VideoTaskSpec, VideoTaskRecord], None] | None = None,
+        on_terminal: Callable[[VideoTaskRecord], None] | None = None,
     ) -> None:
         self.store = store
         self._runner = runner
         self._max_workers = max(1, int(max_workers or 1))
         self._max_pending = max(0, int(max_pending or 0))
         self._on_submitted = on_submitted
+        self._on_terminal = on_terminal
         self._executor = ThreadPoolExecutor(
             max_workers=self._max_workers,
             thread_name_prefix="video-task",
@@ -351,19 +367,31 @@ class VideoTaskManager:
         self._admission.release()
 
     def _run(self, spec: VideoTaskSpec) -> None:
-        self.store.update(
-            spec.id,
-            status="in_progress",
-            started_at=time.time(),
-            progress=0.0,
-        )
+        try:
+            self.store.update(
+                spec.id,
+                status="in_progress",
+                started_at=time.time(),
+                progress=0.0,
+            )
+        except Exception as exc:
+            self._mark_failed(
+                spec.id,
+                exc,
+                error_code="task_state_persist_failed",
+            )
+            return
 
         def update_progress(value: float) -> None:
             try:
                 normalized = max(0.0, min(float(value), 99.0))
             except (TypeError, ValueError):
                 return
-            self.store.update(spec.id, progress=normalized)
+            try:
+                self.store.update(spec.id, progress=normalized)
+            except Exception:
+                # Progress is advisory and must not abort a generation.
+                return
 
         try:
             outcome = self._runner(spec, update_progress)
@@ -379,13 +407,52 @@ class VideoTaskManager:
                 error_message=None,
             )
         except Exception as exc:
-            self.store.update(
-                spec.id,
-                status="failed",
-                error_code=str(getattr(exc, "error_code", "") or "generation_failed"),
-                error_message=str(exc)[:500],
-                completed_at=time.time(),
+            error_code = str(
+                getattr(exc, "error_code", "") or "generation_failed"
             )
+            if isinstance(exc, VideoTaskStorageError):
+                error_code = "task_state_persist_failed"
+            self._mark_failed(spec.id, exc, error_code=error_code)
+
+    def _mark_failed(
+        self,
+        task_id: str,
+        error: Exception,
+        *,
+        error_code: str,
+    ) -> None:
+        normalized_code = str(error_code or "generation_failed")
+        for attempt in range(2):
+            try:
+                updated = self.store.update(
+                    task_id,
+                    status="failed",
+                    error_code=normalized_code,
+                    error_message=str(error)[:500],
+                    completed_at=time.time(),
+                )
+                if (
+                    updated is not None
+                    and self._on_terminal is not None
+                ):
+                    try:
+                        self._on_terminal(updated)
+                    except Exception:
+                        logger.warning(
+                            "video terminal callback failed task_id=%s",
+                            task_id,
+                            exc_info=True,
+                        )
+                return
+            except Exception:
+                logger.warning(
+                    "failed to persist terminal video task state task_id=%s attempt=%s",
+                    task_id,
+                    attempt + 1,
+                    exc_info=True,
+                )
+        # The durable record could not be updated after a retry. The worker is
+        # still allowed to exit, but the failure is explicit in service logs.
 
     def close(self) -> None:
         with self._lock:
@@ -395,14 +462,22 @@ class VideoTaskManager:
             pending = list(self._futures.items())
         for task_id, future in pending:
             if future.cancel():
-                self.store.update(
-                    task_id,
-                    status="failed",
-                    error_code="service_shutdown",
-                    error_message="Video task cancelled during service shutdown",
-                    completed_at=time.time(),
-                )
-        self._executor.shutdown(wait=False, cancel_futures=True)
+                try:
+                    updated = self.store.update(
+                        task_id,
+                        status="failed",
+                        error_code="service_shutdown",
+                        error_message="Video task cancelled during service shutdown",
+                        completed_at=time.time(),
+                    )
+                    if updated is not None and self._on_terminal is not None:
+                        try:
+                            self._on_terminal(updated)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
 
 def build_video_task_runner(
@@ -420,6 +495,14 @@ def build_video_task_runner(
     adobe_error_cls,
     logger,
 ) -> VideoTaskRunner:
+    def warn(message: str, *args) -> None:
+        if logger is None:
+            return
+        try:
+            logger.warning(message, *args, exc_info=True)
+        except Exception:
+            return
+
     def log_payload(
         spec: VideoTaskSpec,
         *,
@@ -561,7 +644,10 @@ def build_video_task_runner(
                     progress_cb=upstream_progress,
                     on_generated_file_written=on_generated_file_written,
                 )
-                token_manager.report_success(token)
+                try:
+                    token_manager.report_success(token)
+                except Exception:
+                    warn("failed to record video token success")
                 result_url = (
                     f"{spec.result_url_prefix.rstrip('/')}/{generated.path.name}"
                 )
@@ -574,18 +660,31 @@ def build_video_task_runner(
                     token_attempt=attempt,
                     preview_url=result_url,
                 )
-                log_generation = request_log_store.upsert(spec.log_id, payload)
-                if token_id:
-                    credits_tracker.complete(
-                        token_id=token_id,
-                        account_id=account_id or None,
-                        request_id=spec.id,
-                        log_id=spec.log_id,
-                        log_generation=log_generation,
-                        payload=payload,
-                        model_id=spec.credit_model_id,
-                        output_resolution=spec.resolution,
+                log_generation = None
+                try:
+                    log_generation = request_log_store.upsert(spec.log_id, payload)
+                except Exception:
+                    warn(
+                        "failed to persist completed video request log id=%s",
+                        spec.log_id,
                     )
+                if token_id:
+                    try:
+                        credits_tracker.complete(
+                            token_id=token_id,
+                            account_id=account_id or None,
+                            request_id=spec.id,
+                            log_id=spec.log_id,
+                            log_generation=log_generation,
+                            payload=payload,
+                            model_id=spec.credit_model_id,
+                            output_resolution=spec.resolution,
+                        )
+                    except Exception:
+                        warn(
+                            "failed to account completed video task id=%s",
+                            spec.id,
+                        )
                 return VideoTaskOutcome(
                     result_path=generated.path,
                     result_mime=generated.mime_type,

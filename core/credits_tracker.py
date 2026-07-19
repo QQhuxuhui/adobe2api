@@ -130,6 +130,7 @@ class CreditsTracker:
         self._state_versions: dict[str, int] = {}
         self._balance_snapshots: dict[str, float] = {}
         self._worker: threading.Thread | None = None
+        self._closed = False
         if start_worker:
             self._worker = threading.Thread(
                 target=self._run,
@@ -271,6 +272,9 @@ class CreditsTracker:
         model_id: str,
         output_resolution: Optional[str],
     ) -> None:
+        with self._lock:
+            if self._closed:
+                return
         attribution = self._finish(
             token_id,
             request_id,
@@ -454,10 +458,21 @@ class CreditsTracker:
                 self._queue.task_done()
 
     def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            worker = self._worker
+        if worker is not None:
+            # Drain queued measurements before asking the worker to stop. This
+            # keeps shutdown ordering deterministic for video task accounting.
+            self._queue.join()
         self._stop_event.set()
-        try:
-            self._queue.put_nowait(None)
-        except queue.Full:
-            pass
-        if self._worker is not None:
-            self._worker.join(timeout=2.0)
+        if worker is not None:
+            try:
+                self._queue.put_nowait(None)
+            except queue.Full:
+                pass
+            worker.join()
+            with self._lock:
+                self._worker = None

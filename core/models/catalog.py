@@ -16,6 +16,25 @@ SUPPORTED_RATIOS = {
     "8:1",
     "2:3",
 }
+GEMINI_PRO_FIXED_RATIOS = (
+    "1:1",
+    "2:3",
+    "3:2",
+    "3:4",
+    "4:3",
+    "4:5",
+    "5:4",
+    "9:16",
+    "16:9",
+    "21:9",
+)
+GEMINI_FLASH_FIXED_RATIOS = (
+    *GEMINI_PRO_FIXED_RATIOS,
+    "1:8",
+    "1:4",
+    "4:1",
+    "8:1",
+)
 RATIO_SUFFIX_MAP = {
     "1:1": "1x1",
     "16:9": "16x9",
@@ -42,6 +61,7 @@ GPT_IMAGE_RATIO_SUFFIX_MAP = {
     "3:4": "3x4",
     "2:3": "2x3",
 }
+GPT_IMAGE_FIXED_RATIOS = tuple(GPT_IMAGE_RATIO_SUFFIX_MAP)
 
 MODEL_CATALOG: dict[str, dict] = {}
 
@@ -53,6 +73,7 @@ def _register_nano_banana_family(
     upstream_model_version: str,
     family_label: str,
     ratio_suffix_map: dict[str, str] = RATIO_SUFFIX_MAP,
+    supported_ratios: tuple[str, ...] = GEMINI_PRO_FIXED_RATIOS,
 ) -> None:
     for res in ("1k", "2k", "4k"):
         for ratio, suffix in ratio_suffix_map.items():
@@ -63,6 +84,8 @@ def _register_nano_banana_family(
                 "upstream_model_version": upstream_model_version,
                 "output_resolution": res.upper(),
                 "aspect_ratio": ratio,
+                "supports_auto_aspect_ratio": True,
+                "supported_aspect_ratios": supported_ratios,
                 "description": f"{family_label} ({res.upper()} {ratio})",
             }
 
@@ -77,6 +100,8 @@ def _register_gpt_image_family() -> None:
                 "upstream_model_version": "2",
                 "output_resolution": res.upper(),
                 "aspect_ratio": ratio,
+                "supports_auto_aspect_ratio": False,
+                "supported_aspect_ratios": GPT_IMAGE_FIXED_RATIOS,
                 "description": f"Firefly GPT Image ({res.upper()} {ratio})",
             }
 
@@ -99,6 +124,7 @@ _register_nano_banana_family(
     upstream_model_version="nano-banana-3",
     family_label="Firefly Nano Banana 2",
     ratio_suffix_map=NANO_BANANA2_RATIO_SUFFIX_MAP,
+    supported_ratios=GEMINI_FLASH_FIXED_RATIOS,
 )
 _register_gpt_image_family()
 
@@ -110,6 +136,8 @@ def _register_base_model(
     upstream_model_id: str,
     upstream_model_version: str,
     label: str,
+    supports_auto_aspect_ratio: bool,
+    supported_aspect_ratios: tuple[str, ...],
 ) -> None:
     # 基础模型: 不带分辨率/比例后缀。分辨率由请求 quality(1k/2k/4k) 决定,
     # 比例由请求 aspect_ratio 或 size 决定(不写死 aspect_ratio → resolver 用请求值)。
@@ -120,6 +148,8 @@ def _register_base_model(
         "upstream_model_version": upstream_model_version,
         "output_resolution": "2K",  # 默认;quality 参数可覆盖为 1K/4K
         "dynamic": True,
+        "supports_auto_aspect_ratio": supports_auto_aspect_ratio,
+        "supported_aspect_ratios": supported_aspect_ratios,
         "description": f"{label} (动态分辨率/比例,由请求参数决定)",
     }
 
@@ -130,6 +160,8 @@ _register_base_model(
     upstream_model_id="gpt-image",
     upstream_model_version="2",
     label="Firefly GPT Image",
+    supports_auto_aspect_ratio=False,
+    supported_aspect_ratios=GPT_IMAGE_FIXED_RATIOS,
 )
 _register_base_model(
     "firefly-nano-banana-pro",
@@ -137,6 +169,8 @@ _register_base_model(
     upstream_model_id="gemini-flash",
     upstream_model_version="nano-banana-2",
     label="Firefly Nano Banana Pro",
+    supports_auto_aspect_ratio=True,
+    supported_aspect_ratios=GEMINI_PRO_FIXED_RATIOS,
 )
 _register_base_model(
     "firefly-nano-banana2",
@@ -144,6 +178,8 @@ _register_base_model(
     upstream_model_id="gemini-flash",
     upstream_model_version="nano-banana-3",
     label="Firefly Nano Banana 2",
+    supports_auto_aspect_ratio=True,
+    supported_aspect_ratios=GEMINI_FLASH_FIXED_RATIOS,
 )
 
 # OpenAI 兼容别名: 上游模型名以 "gpt-image-" 开头(sub2api /v1/images/generations
@@ -155,6 +191,8 @@ _register_base_model(
     upstream_model_id="gpt-image",
     upstream_model_version="2",
     label="Firefly GPT Image (gpt-image-1 别名)",
+    supports_auto_aspect_ratio=False,
+    supported_aspect_ratios=GPT_IMAGE_FIXED_RATIOS,
 )
 _register_base_model(
     "gpt-image-2",
@@ -162,9 +200,12 @@ _register_base_model(
     upstream_model_id="gpt-image",
     upstream_model_version="2",
     label="Firefly GPT Image (gpt-image-2 别名)",
+    supports_auto_aspect_ratio=False,
+    supported_aspect_ratios=GPT_IMAGE_FIXED_RATIOS,
 )
 
 DEFAULT_MODEL_ID = "firefly-nano-banana-pro-2k-16x9"
+DEFAULT_AUTO_MODEL_ID = "firefly-nano-banana-pro"
 
 VIDEO_MODEL_CATALOG: dict[str, dict] = {
     "firefly-sora2-4s-9x16": {
@@ -273,3 +314,45 @@ for dur in (5, 10, 15):
             "generate_audio": True,
             "description": f"Firefly Kling 3.0 video model ({dur}s {ratio} 720p)",
         }
+
+# Public model aliases used by new-api.  The concrete Adobe suffix is selected
+# from request parameters by core.models.video_resolver rather than being a
+# separate model entry for every duration/ratio/resolution combination.
+VIDEO_MODEL_CATALOG.update(
+    {
+        "sora-2": {
+            "dynamic": True,
+            "engine": "sora2",
+            "upstream_model": "openai:firefly:colligo:sora2",
+            "default_duration": 4,
+            "default_size": "720x1280",
+            "description": "Sora 2 video (parameters select Adobe output)",
+        },
+        "sora-2-pro": {
+            "dynamic": True,
+            "engine": "sora2-pro",
+            "upstream_model": "openai:firefly:colligo:sora2-pro",
+            "default_duration": 4,
+            "default_size": "720x1280",
+            "description": "Sora 2 Pro video (parameters select Adobe output)",
+        },
+        "veo-3.1-generate-preview": {
+            "dynamic": True,
+            "engine": "veo31-standard",
+            "upstream_model": "google:firefly:colligo:veo31",
+            "default_duration": 8,
+            "default_aspect_ratio": "16:9",
+            "default_resolution": "720p",
+            "description": "Veo 3.1 video (parameters select Adobe output)",
+        },
+        "veo-3.1-fast-generate-preview": {
+            "dynamic": True,
+            "engine": "veo31-fast",
+            "upstream_model": "google:firefly:colligo:veo31-fast",
+            "default_duration": 8,
+            "default_aspect_ratio": "16:9",
+            "default_resolution": "720p",
+            "description": "Veo 3.1 Fast video (parameters select Adobe output)",
+        },
+    }
+)

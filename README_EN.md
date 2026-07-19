@@ -79,6 +79,12 @@ Current supported model families are:
 - `firefly-veo31-fast-*` (video)
 - `firefly-kling3-*` (video, Kling 3.0 with frame references)
 
+The new-api-compatible public video aliases are `sora-2`, `sora-2-pro`,
+`veo-3.1-generate-preview`, and `veo-3.1-fast-generate-preview`. Sora defaults
+to 4 seconds and `720x1280`; Veo defaults to 8 seconds, `16:9`, and `720p`.
+Request parameters select the concrete Adobe suffix model, while legacy
+`firefly-*` video IDs remain supported.
+
 Nano Banana image models (`nano-banana-2`):
 
 - Pattern: `firefly-nano-banana-{resolution}-{ratio}`
@@ -125,11 +131,14 @@ GPT Image models (experimental):
   - `firefly-gpt-image-4k-1x1`
   - `firefly-gpt-image-2k-21x9`
 
-About `auto`:
+About `free` / `auto`:
 
-- Current implementation does **not** support `aspect_ratio=auto`
-- If `auto` is sent, the service falls back to `1:1`
-- Prefer sending an explicit ratio or using a model ID with a ratio suffix
+- They are compatibility aliases; with input images, the first image controls the output ratio
+- Adobe/Gemini models first try a size derived from the first image, then fall back to that model's nearest standard ratio if upstream rejects it
+- `gpt-image-2` maps the first image to that model's nearest standard ratio
+- Without an input image, `size` is used first; without either, Adobe/Gemini attempts `auto` and GPT Image uses `1:1`
+- When `free` / `auto` is present without an explicit model, the dynamic `firefly-nano-banana-pro` model is used
+- An explicitly selected model ID with a ratio suffix keeps its fixed ratio
 
 Sora2 video models:
 

@@ -49,6 +49,7 @@ def make_tracker(
     refresh_results: list[object] | None = None,
     learned: dict[str, float] | None = None,
     queue_size: int = 200,
+    start_worker: bool = False,
 ) -> tuple[CreditsTracker, FakeTokenManager, FakeRefreshManager, CaptureLogStore]:
     learned_path = tmp_path / "credit_costs_learned.json"
     if learned is not None:
@@ -64,9 +65,22 @@ def make_tracker(
         model_catalog=MODEL_CATALOG,
         video_model_catalog=VIDEO_MODEL_CATALOG,
         queue_size=queue_size,
-        start_worker=False,
+        start_worker=start_worker,
     )
     return tracker, tokens, refresh, logs
+
+
+def test_close_is_idempotent_after_worker_shutdown(tmp_path: Path):
+    tracker, _tokens, _refresh, _logs = make_tracker(
+        tmp_path,
+        start_worker=True,
+    )
+
+    tracker.close()
+    tracker.close()
+
+    assert tracker._worker is None
+    assert tracker._queue.unfinished_tasks == 0
 
 
 @pytest.mark.parametrize(

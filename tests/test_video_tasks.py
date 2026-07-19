@@ -171,6 +171,54 @@ def test_manager_completes_task_and_persists_outcome(tmp_path: Path):
         manager.close()
 
 
+class FailingOnceInProgressStore(VideoTaskStore):
+    def __init__(self, path: Path):
+        super().__init__(path)
+        self.remaining_failures = 1
+
+    def update(self, task_id: str, **changes):
+        if self.remaining_failures and changes.get("status") == "in_progress":
+            self.remaining_failures -= 1
+            raise VideoTaskStorageError("transient state write failure")
+        return super().update(task_id, **changes)
+
+
+def test_manager_converts_in_progress_store_failure_to_terminal_failed(tmp_path: Path):
+    store = FailingOnceInProgressStore(tmp_path / "tasks.jsonl")
+    manager = VideoTaskManager(
+        store,
+        lambda spec, progress: VideoTaskOutcome(
+            tmp_path / f"{spec.id}.mp4", "video/mp4", "url"
+        ),
+        max_workers=1,
+        max_pending=0,
+    )
+    try:
+        manager.submit(make_spec("state-write-fails"))
+        failed = wait_for_status(store, "state-write-fails", "failed")
+        assert failed.error_code == "task_state_persist_failed"
+    finally:
+        manager.close()
+
+
+def test_manager_close_waits_for_running_worker(tmp_path: Path):
+    started = threading.Event()
+    release = threading.Event()
+    store = VideoTaskStore(tmp_path / "tasks.jsonl")
+
+    def runner(spec, progress):
+        started.set()
+        assert release.wait(timeout=2)
+        return VideoTaskOutcome(tmp_path / f"{spec.id}.mp4", "video/mp4", "url")
+
+    manager = VideoTaskManager(store, runner, max_workers=1, max_pending=0)
+    manager.submit(make_spec("close-waits"))
+    assert started.wait(timeout=1)
+    release.set()
+    manager.close()
+    assert store.get("close-waits").status == "completed"
+
+
 def test_manager_rejects_when_running_and_pending_capacity_is_full(
     tmp_path: Path,
 ):
@@ -225,6 +273,29 @@ def test_manager_releases_slot_after_failure(tmp_path: Path):
         manager.close()
 
 
+def test_manager_calls_terminal_hook_for_worker_failure(tmp_path: Path):
+    store = VideoTaskStore(tmp_path / "tasks.jsonl")
+    terminal: list[VideoTaskRecord] = []
+
+    def runner(spec, progress):
+        raise RuntimeError("token pool unavailable")
+
+    manager = VideoTaskManager(
+        store,
+        runner,
+        max_workers=1,
+        max_pending=0,
+        on_terminal=lambda record: terminal.append(record),
+    )
+    try:
+        manager.submit(make_spec("terminal-hook"))
+        failed = wait_for_status(store, "terminal-hook", "failed")
+        assert failed.error_code == "generation_failed"
+        assert [record.id for record in terminal] == ["terminal-hook"]
+    finally:
+        manager.close()
+
+
 def test_manager_close_marks_not_started_tasks_failed(tmp_path: Path):
     started = threading.Event()
     gate = threading.Event()
@@ -240,11 +311,11 @@ def test_manager_close_marks_not_started_tasks_failed(tmp_path: Path):
     assert started.wait(timeout=1)
     manager.submit(make_spec("pending"))
 
+    gate.set()
     manager.close()
 
     pending = wait_for_status(store, "pending", "failed")
     assert pending.error_code == "service_shutdown"
-    gate.set()
     wait_for_status(store, "running", "completed")
 
 

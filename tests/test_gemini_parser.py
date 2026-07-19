@@ -279,6 +279,29 @@ def test_parse_veo_request_rejects_unsupported_shapes_and_combinations(payload):
     )
 
 
+def test_parse_veo_request_rejects_huge_duration_as_invalid_argument():
+    payload = {
+        "instances": [{"prompt": "p"}],
+        "parameters": {"durationSeconds": 10**1000},
+    }
+    _assert_invalid(
+        lambda: parse_veo_request(json.dumps(payload).encode("utf-8"), _veo_spec())
+    )
+
+
+@pytest.mark.parametrize("field", ["seed", "safetySettings", "image"])
+def test_parse_veo_request_rejects_nonempty_top_level_unsupported_fields(field):
+    payload = {
+        "instances": [{"prompt": "p"}],
+        "parameters": {},
+        field: {"value": 1} if field != "seed" else 1,
+    }
+
+    _assert_invalid(
+        lambda: parse_veo_request(json.dumps(payload).encode("utf-8"), _veo_spec())
+    )
+
+
 def test_read_limited_body_uses_exact_64_mib_limit_and_caches_body():
     assert GEMINI_NATIVE_MAX_BODY_BYTES == 64 * 1024 * 1024
     request, calls = _request_for_chunks([b'{"contents":', b"[]}"])
@@ -574,6 +597,17 @@ def test_flash_accepts_its_exact_ratio_set(ratio):
         _body(generation_config={"imageConfig": {"aspectRatio": ratio}}),
         _flash_spec(),
     )
+    assert parsed.aspect_ratio == ratio
+
+
+@pytest.mark.parametrize("ratio", ["free", "auto"])
+@pytest.mark.parametrize("model_spec", [_pro_spec(), _flash_spec()])
+def test_image_models_accept_free_and_auto_compatibility_ratios(ratio, model_spec):
+    parsed = parse_gemini_request(
+        _body(generation_config={"imageConfig": {"aspectRatio": ratio}}),
+        model_spec,
+    )
+
     assert parsed.aspect_ratio == ratio
 
 

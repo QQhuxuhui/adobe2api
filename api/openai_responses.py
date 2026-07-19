@@ -29,6 +29,7 @@ class ResponsesImageRequest:
     input_image_urls: tuple[str, ...]
     stream: bool
     size: str | None
+    aspect_ratio: str | None
     quality: str | None
     output_format: str
     output_compression: int | None
@@ -55,6 +56,7 @@ _TOOL_FIELDS = {
     "type",
     "model",
     "size",
+    "aspect_ratio",
     "quality",
     "output_format",
     "output_compression",
@@ -237,6 +239,9 @@ def parse_responses_image_request(
         stream=bool(data.get("stream", False)),
         size=str(effective["size"]).strip()
         if effective.get("size") is not None
+        else None,
+        aspect_ratio=str(effective["aspect_ratio"]).strip()
+        if effective.get("aspect_ratio") is not None
         else None,
         quality=str(effective["quality"]).strip()
         if effective.get("quality") is not None

@@ -1,16 +1,19 @@
 import logging
+import io
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from api.routes.generation import build_generation_router
 from core.models import (
     MODEL_CATALOG,
     SUPPORTED_RATIOS,
     VIDEO_MODEL_CATALOG,
+    resolve_image_geometry,
     resolve_model,
-    resolve_ratio_and_resolution,
 )
 from core.stores import JobStore
 
@@ -81,10 +84,24 @@ class JobAdobeClient:
     retry_max_attempts = 1
     token_rotation_strategy = "round_robin"
     gpt_image_quality = "standard"
+    generate_timeout = 60
+
+    def __init__(self):
+        self.generate_kwargs = None
+
+    def upload_image(self, token, image_bytes, mime):
+        return "source-1"
 
     def generate(self, **kwargs):
         assert kwargs["token"] == "token-value"
+        self.generate_kwargs = kwargs
         return b"generated", {"progress": 100}
+
+
+def png_bytes(width: int, height: int) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", (width, height), (10, 20, 30)).save(output, format="PNG")
+    return output.getvalue()
 
 
 def make_client(
@@ -95,6 +112,8 @@ def make_client(
     adobe_client=None,
     credits_tracker=None,
     request_log_store=None,
+    input_images=None,
+    execute_retries: bool = False,
 ):
     credit_contexts: list[tuple[str, str]] = []
     api = FastAPI()
@@ -110,19 +129,23 @@ def make_client(
             video_model_catalog=VIDEO_MODEL_CATALOG,
             supported_ratios=SUPPORTED_RATIOS,
             resolve_model=resolve_model,
-            resolve_ratio_and_resolution=resolve_ratio_and_resolution,
+            resolve_image_geometry=resolve_image_geometry,
             require_service_api_key=lambda request: None,
             set_request_task_progress=lambda request, **kwargs: None,
             set_request_credit_context=lambda request, model, resolution: (
                 credit_contexts.append((model, resolution))
             ),
-            run_with_token_retries=lambda **kwargs: {"ok": True},
+            run_with_token_retries=(
+                (lambda **kwargs: kwargs["run_once"]("token-value"))
+                if execute_retries
+                else (lambda **kwargs: {"ok": True})
+            ),
             set_request_error_detail=lambda request, **kwargs: "ERR-TEST",
             set_request_preview=lambda request, url, kind="image": None,
             public_image_url=lambda request, job_id: f"/generated/{job_id}.png",
             public_generated_url=lambda request, filename: f"/generated/{filename}",
             resolve_video_options=lambda data: (True, "", "frame"),
-            load_input_images=lambda messages: [],
+            load_input_images=lambda messages: list(input_images or []),
             normalize_image_mime=lambda mime: str(mime or "image/jpeg"),
             set_request_logging_fields=lambda request, model, prompt: None,
             prepare_video_source_image=lambda image, ratio, resolution: (
@@ -159,6 +182,29 @@ def test_openai_image_route_captures_resolved_model_and_resolution(tmp_path: Pat
     assert credit_contexts == [("firefly-gpt-image", "4K")]
 
 
+def test_chat_free_resolves_after_loading_primary_image(tmp_path: Path):
+    adobe = JobAdobeClient()
+    client, _ = make_client(
+        tmp_path,
+        token_manager=JobTokenManager(),
+        adobe_client=adobe,
+        input_images=[(png_bytes(1000, 1379), "image/png")],
+        execute_retries=True,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-image-2",
+            "messages": [{"role": "user", "content": "edit"}],
+            "aspect_ratio": "free",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert adobe.generate_kwargs["aspect_ratio"] == "3:4"
+
+
 def test_video_chat_route_captures_catalog_resolution(tmp_path: Path):
     client, credit_contexts = make_client(tmp_path)
 
@@ -172,6 +218,61 @@ def test_video_chat_route_captures_catalog_resolution(tmp_path: Path):
 
     assert response.status_code == 200
     assert credit_contexts == [("firefly-veo31-8s-16x9-1080p", "1080p")]
+
+
+def test_v1_models_exposes_public_video_aliases(tmp_path: Path):
+    client, _credit_contexts = make_client(tmp_path)
+    response = client.get("/v1/models")
+    assert response.status_code == 200
+    ids = {item["id"] for item in response.json()["data"]}
+    assert {
+        "sora-2",
+        "sora-2-pro",
+        "veo-3.1-generate-preview",
+        "veo-3.1-fast-generate-preview",
+    }.issubset(ids)
+
+
+def test_chat_video_alias_uses_request_parameters_for_credit_mapping(tmp_path: Path):
+    client, credit_contexts = make_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "veo-3.1-generate-preview",
+            "messages": [{"role": "user", "content": "p"}],
+            "duration": 8,
+            "aspect_ratio": "9:16",
+            "resolution": "1080p",
+        },
+    )
+    assert response.status_code == 200
+    assert credit_contexts == [("firefly-veo31-8s-9x16-1080p", "1080p")]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("seed", 1),
+        ("safetySettings", {"level": "strict"}),
+        ("image", {"bytes": "not-supported"}),
+    ],
+)
+def test_chat_video_alias_rejects_nonempty_unsupported_parameters(
+    tmp_path: Path, field: str, value
+):
+    client, _credit_contexts = make_client(tmp_path)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "veo-3.1-generate-preview",
+            "messages": [{"role": "user", "content": "p"}],
+            field: value,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsupported_parameter"
 
 
 def test_async_job_success_updates_log_and_submits_credit_measurement(tmp_path: Path):

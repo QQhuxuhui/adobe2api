@@ -14,8 +14,8 @@ from core.models import (
     MODEL_CATALOG,
     SUPPORTED_RATIOS,
     VIDEO_MODEL_CATALOG,
+    resolve_image_geometry,
     resolve_model,
-    resolve_ratio_and_resolution,
 )
 
 
@@ -31,9 +31,9 @@ class UpstreamError(Exception):
     pass
 
 
-def png_bytes() -> bytes:
+def png_bytes(width: int = 2, height: int = 2) -> bytes:
     output = io.BytesIO()
-    Image.new("RGB", (2, 2), (0, 0, 255)).save(output, format="PNG")
+    Image.new("RGB", (width, height), (0, 0, 255)).save(output, format="PNG")
     return output.getvalue()
 
 
@@ -82,7 +82,7 @@ class Harness:
                 video_model_catalog=VIDEO_MODEL_CATALOG,
                 supported_ratios=SUPPORTED_RATIOS,
                 resolve_model=resolve_model,
-                resolve_ratio_and_resolution=resolve_ratio_and_resolution,
+                resolve_image_geometry=resolve_image_geometry,
                 require_service_api_key=require_key,
                 set_request_task_progress=lambda request, **kwargs: None,
                 set_request_credit_context=lambda request, model, resolution: self.credit_contexts.append(
@@ -220,6 +220,51 @@ def test_input_image_is_uploaded_and_forwarded(tmp_path: Path):
     assert response.status_code == 200
     assert harness.adobe.uploads == [("token-value", png_bytes(), "image/png")]
     assert harness.adobe.generate_kwargs["source_image_ids"] == ["source-1"]
+
+
+def test_responses_free_uses_loaded_primary_image_for_gpt_ratio(tmp_path: Path):
+    harness = Harness(tmp_path)
+    harness.loaded_images = [(png_bytes(1000, 1379), "image/png")]
+
+    response = harness.http.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-image-2",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "edit"},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,aW1hZ2U=",
+                        },
+                    ],
+                }
+            ],
+            "aspect_ratio": "free",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert harness.adobe.generate_kwargs["aspect_ratio"] == "3:4"
+
+
+def test_responses_tool_aspect_ratio_overrides_top_level_value(tmp_path: Path):
+    harness = Harness(tmp_path)
+
+    response = harness.http.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-image-2",
+            "input": "draw",
+            "aspect_ratio": "16:9",
+            "tools": [{"type": "image_generation", "aspect_ratio": "free"}],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert harness.adobe.generate_kwargs["aspect_ratio"] == "1:1"
 
 
 @pytest.mark.parametrize(

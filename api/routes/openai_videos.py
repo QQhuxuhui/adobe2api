@@ -14,6 +14,7 @@ from core.video_tasks import (
     VideoTaskSpec,
     VideoTaskStorageError,
 )
+from core.models.video_resolver import VideoModelRequestError, resolve_video_model
 
 
 OPENAI_VIDEO_MAX_BODY_BYTES = 1024 * 1024
@@ -31,13 +32,34 @@ SORA_PRO_SIZE_MAP = {
 UNSUPPORTED_VIDEO_INPUT_FIELDS = frozenset(
     {
         "input_reference",
+        "inputReference",
         "characters",
         "character",
         "image",
         "images",
         "video",
         "reference_images",
+        "referenceImages",
+        "safety_identifier",
+        "safetyIdentifier",
+        "safety_settings",
+        "safetySettings",
+        "generation_config",
+        "generationConfig",
+        "generate_audio",
+        "generateAudio",
+        "negative_prompt",
+        "negativePrompt",
+        "reference_mode",
+        "referenceMode",
+        "seed",
+        "safety_id",
+        "safetyId",
     }
+)
+
+OPENAI_VIDEO_ALLOWED_FIELDS = frozenset(
+    {"model", "prompt", "seconds", "size", "metadata"}
 )
 
 
@@ -143,17 +165,15 @@ def _parse_seconds(value: Any) -> int:
             "invalid_seconds",
         )
     try:
-        seconds = int(value)
-    except (TypeError, ValueError) as exc:
+        numeric = float(value)
+        if not numeric.is_integer():
+            raise ValueError
+        seconds = int(numeric)
+    except (TypeError, ValueError, OverflowError) as exc:
         raise OpenAIVideoRequestError(
             "seconds must be one of 4, 8, or 12",
             "invalid_seconds",
         ) from exc
-    if str(value).strip() not in {str(seconds), f"{seconds}.0"}:
-        raise OpenAIVideoRequestError(
-            "seconds must be one of 4, 8, or 12",
-            "invalid_seconds",
-        )
     if seconds not in SORA_SECONDS:
         raise OpenAIVideoRequestError(
             "seconds must be one of 4, 8, or 12",
@@ -189,6 +209,7 @@ def build_openai_videos_router(
     task_store,
     require_service_api_key: Callable[[Request], None],
     public_generated_url: Callable[[Request, str], str],
+    generated_dir: Path,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -225,32 +246,48 @@ def build_openai_videos_router(
                     "missing_prompt",
                 )
             prompt = prompt.strip()
+            for field, value in body.items():
+                if field not in OPENAI_VIDEO_ALLOWED_FIELDS and _nonempty(value):
+                    raise OpenAIVideoRequestError(
+                        f"Unsupported parameter: {field}",
+                        "unsupported_parameter",
+                    )
             for field in UNSUPPORTED_VIDEO_INPUT_FIELDS:
                 if field in body and _nonempty(body.get(field)):
                     raise OpenAIVideoRequestError(
                         f"Unsupported parameter: {field}",
                         "unsupported_parameter",
                     )
-
-            seconds = _parse_seconds(body.get("seconds"))
-            size = body.get("size") or "1280x720"
-            if not isinstance(size, str):
-                raise OpenAIVideoRequestError("Invalid video size", "invalid_size")
-            size = size.strip()
-            allowed_sizes = SORA_PRO_SIZE_MAP if model == "sora-2-pro" else SORA_SIZE_MAP
-            if size not in allowed_sizes:
-                raise OpenAIVideoRequestError(
-                    f"Invalid size for {model}",
-                    "invalid_size",
+            metadata = body.get("metadata")
+            if isinstance(metadata, dict) and _nonempty(metadata):
+                nested_input = metadata.get("input")
+                field_name = (
+                    "metadata.input.media"
+                    if isinstance(nested_input, dict)
+                    and _nonempty(nested_input.get("media"))
+                    else "metadata"
                 )
-            aspect_ratio, resolution = allowed_sizes[size]
-            suffix = aspect_ratio.replace(":", "x")
-            model_family = "sora2-pro" if model == "sora-2-pro" else "sora2"
-            upstream_model = (
-                "openai:firefly:colligo:sora2-pro"
-                if model == "sora-2-pro"
-                else "openai:firefly:colligo:sora2"
-            )
+                raise OpenAIVideoRequestError(
+                    f"Unsupported parameter: {field_name}",
+                    "unsupported_parameter",
+                )
+            elif _nonempty(metadata):
+                raise OpenAIVideoRequestError(
+                    "Unsupported parameter: metadata",
+                    "unsupported_parameter",
+                )
+
+            try:
+                resolved = resolve_video_model(model, body)
+            except VideoModelRequestError as exc:
+                code = "invalid_size" if "size" in str(exc).lower() else str(exc.code)
+                raise OpenAIVideoRequestError(str(exc), code) from exc
+            seconds = resolved.duration
+            size = resolved.requested_size
+            aspect_ratio = resolved.aspect_ratio
+            resolution = resolved.resolution
+            model_family = resolved.engine
+            upstream_model = resolved.upstream_model
             task_id = f"video_{uuid.uuid4().hex}"
             log_id = str(getattr(request.state, "log_id", "") or uuid.uuid4().hex[:12])
             url_prefix = str(public_generated_url(request, ""))
@@ -267,7 +304,7 @@ def build_openai_videos_router(
                 resolution=resolution,
                 requested_size=size,
                 negative_prompt="",
-                credit_model_id=f"firefly-{model_family}-{seconds}s-{suffix}",
+                credit_model_id=resolved.credit_model_id,
                 result_url_prefix=url_prefix,
                 log_id=log_id,
             )
@@ -324,7 +361,30 @@ def build_openai_videos_router(
                 "server_error",
             )
         path = Path(str(record.result_path or ""))
+        try:
+            root = Path(generated_dir).resolve()
+            path = path.resolve()
+            path.relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            return openai_video_error(
+                404,
+                "Generated video file is no longer available",
+                "video_file_not_found",
+            )
         if not path.exists() or not path.is_file():
+            return openai_video_error(
+                404,
+                "Generated video file is no longer available",
+                "video_file_not_found",
+            )
+        allowed_mime_by_suffix = {
+            ".mp4": "video/mp4",
+            ".webm": "video/webm",
+            ".ogv": "video/ogg",
+        }
+        expected_mime = allowed_mime_by_suffix.get(path.suffix.lower())
+        actual_mime = str(record.result_mime or "video/mp4").split(";", 1)[0].lower()
+        if expected_mime is None or actual_mime != expected_mime:
             return openai_video_error(
                 404,
                 "Generated video file is no longer available",
