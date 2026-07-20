@@ -834,28 +834,29 @@ def build_generation_router(
         if not prompt:
             raise HTTPException(status_code=400, detail="prompt cannot be empty")
 
-        ratio = data.aspect_ratio.strip() or "16:9"
-        if ratio not in supported_ratios:
+        requested_ratio = data.aspect_ratio.strip().lower() or "auto"
+        if requested_ratio not in supported_ratios and requested_ratio not in {
+            "free",
+            "auto",
+        }:
             raise HTTPException(status_code=400, detail="unsupported aspect ratio")
 
-        output_resolution = (data.output_resolution or "2K").upper()
-        if output_resolution not in {"1K", "2K", "4K"}:
+        requested_resolution = (data.output_resolution or "2K").upper()
+        if requested_resolution not in {"1K", "2K", "4K"}:
             raise HTTPException(status_code=400, detail="unsupported output_resolution")
 
-        model_conf = resolve_model(data.model)
-        if data.model:
-            output_resolution = model_conf["output_resolution"]
-
-        resolved_model_id = str(data.model or "").strip()
-        if not resolved_model_id:
-            resolved_model_id = next(
-                (
-                    candidate_id
-                    for candidate_id, candidate_conf in model_catalog.items()
-                    if candidate_conf is model_conf
-                ),
-                "unknown",
-            )
+        geometry = resolve_image_geometry(
+            {
+                "aspect_ratio": requested_ratio,
+                "quality": requested_resolution,
+            },
+            data.model,
+            [],
+        )
+        ratio = geometry.aspect_ratio
+        output_resolution = geometry.output_resolution
+        resolved_model_id = geometry.model_id
+        model_conf = resolve_model(resolved_model_id)
         set_request_credit_context(request, resolved_model_id, output_resolution)
 
         job = store.create(prompt=prompt, aspect_ratio=ratio)
@@ -959,6 +960,8 @@ def build_generation_router(
                             else None
                         ),
                         detail_level=model_conf.get("detail_level"),
+                        output_size=geometry.output_size,
+                        fallback_aspect_ratio=geometry.fallback_aspect_ratio,
                         out_path=out_path,
                     )
                     if image_bytes is not None:

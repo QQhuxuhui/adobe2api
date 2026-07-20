@@ -343,7 +343,7 @@ def parse_gemini_request(
     if type(candidate_count) is not int or candidate_count != 1:
         raise _invalid("candidateCount must be 1")
 
-    aspect_ratio = _config_field(image_config, "aspectRatio", "aspect_ratio", "1:1")
+    aspect_ratio = _config_field(image_config, "aspectRatio", "aspect_ratio", "auto")
     if not isinstance(aspect_ratio, str):
         raise _invalid("aspectRatio must be a supported string")
     if (

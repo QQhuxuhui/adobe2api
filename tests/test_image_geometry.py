@@ -65,6 +65,31 @@ def test_gpt_image_maps_primary_image_to_its_nearest_supported_ratio():
     assert resolved.output_size is None
 
 
+def test_omitted_ratio_defaults_to_auto_with_primary_image():
+    resolved = resolve_image_geometry(
+        {"quality": "2k"},
+        "firefly-nano-banana-pro",
+        [(png_bytes(1000, 1379), "image/png")],
+    )
+
+    assert resolved.aspect_ratio == "auto"
+    assert resolved.usage_ratio == "1000:1379"
+    assert resolved.output_size is not None
+    assert resolved.fallback_aspect_ratio == "3:4"
+
+
+def test_omitted_ratio_maps_gpt_primary_image_to_nearest_ratio():
+    resolved = resolve_image_geometry(
+        {},
+        "gpt-image-2",
+        [(png_bytes(1000, 1379), "image/png")],
+    )
+
+    assert resolved.aspect_ratio == "3:4"
+    assert resolved.usage_ratio == "3:4"
+    assert resolved.output_size is None
+
+
 def test_multiple_images_always_use_first_image_dimensions():
     resolved = resolve_image_geometry(
         {"aspect_ratio": "free"},
@@ -89,9 +114,30 @@ def test_omitted_model_does_not_apply_default_models_fixed_ratio_to_free():
     assert resolved.model_id == "firefly-nano-banana-pro"
 
 
+def test_omitted_ratio_and_model_use_dynamic_auto_default():
+    resolved = resolve_image_geometry({}, None, [])
+
+    assert resolved.aspect_ratio == "auto"
+    assert resolved.usage_ratio == "1:1"
+    assert resolved.output_size is None
+    assert resolved.model_id == "firefly-nano-banana-pro"
+
+
 def test_explicit_fixed_ratio_model_wins_without_decoding_primary_image():
     resolved = resolve_image_geometry(
         {"aspect_ratio": "free"},
+        "firefly-nano-banana-pro-2k-16x9",
+        [(b"not-an-image", "image/png")],
+    )
+
+    assert resolved.aspect_ratio == "16:9"
+    assert resolved.usage_ratio == "16:9"
+    assert resolved.output_size is None
+
+
+def test_explicit_fixed_ratio_model_wins_when_ratio_is_omitted():
+    resolved = resolve_image_geometry(
+        {},
         "firefly-nano-banana-pro-2k-16x9",
         [(b"not-an-image", "image/png")],
     )

@@ -601,6 +601,25 @@ def test_gemini_free_uses_primary_image_ratio_and_size_override(tmp_path: Path):
     assert abs(actual - 1000 / 1379) < 0.01
 
 
+def test_gemini_omitted_ratio_defaults_to_auto_with_primary_image(tmp_path: Path):
+    harness = Harness(tmp_path)
+    request = image_request(size="2K", inline_image=png_bytes(1000, 1379))
+    del request["generationConfig"]["imageConfig"]["aspectRatio"]
+
+    response = post(
+        harness,
+        "gemini-3-pro-image",
+        "generateContent",
+        request,
+    )
+
+    assert response.status_code == 200, response.text
+    call = harness.client_impl.generate_calls[0]
+    assert call["aspect_ratio"] == "auto"
+    assert call["fallback_aspect_ratio"] == "3:4"
+    assert call["output_size"]["width"] < call["output_size"]["height"]
+
+
 def test_gemini_free_without_input_image_forwards_size_less_auto(tmp_path: Path):
     harness = Harness(tmp_path)
     response = post(

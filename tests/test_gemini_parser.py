@@ -631,9 +631,9 @@ def test_parse_rejects_unknown_or_non_string_ratios(ratio):
     )
 
 
-def test_parse_uses_default_ratio_and_image_size():
+def test_parse_defaults_omitted_ratio_to_auto_and_image_size_to_1k():
     parsed = parse_gemini_request(_body(), _pro_spec())
-    assert parsed.aspect_ratio == "1:1"
+    assert parsed.aspect_ratio == "auto"
     assert parsed.image_size == "1K"
 
 

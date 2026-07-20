@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field, StrictInt
 
 class GenerateRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=1200)
-    aspect_ratio: str = Field(default="16:9")
+    aspect_ratio: str = Field(default="auto")
     output_resolution: str = Field(default="2K")
     model: Optional[str] = None
 

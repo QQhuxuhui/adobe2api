@@ -6,9 +6,10 @@ Restore the historical `aspect_ratio=free` behavior across every supported
 image-to-image protocol while respecting each upstream model's output-size
 capabilities.
 
-`free` and `auto` are equivalent compatibility values. They request an output
-ratio based on the primary input image when one exists. Explicit ratios and
-fixed-ratio model IDs keep their current behavior.
+`free` and `auto` are equivalent compatibility values. An omitted ratio is
+normalized to `auto`. These values request an output ratio based on the primary
+input image when one exists. Explicit ratios and fixed-ratio model IDs keep
+their current behavior.
 
 ## Supported Entry Points
 
@@ -19,6 +20,7 @@ The same internal resolution flow applies to:
 - `POST /v1/responses`
 - Gemini native `generateContent` image requests
 - `POST /v1/images/generations` for requests without input images
+- `POST /api/v1/generate` for legacy asynchronous generation
 
 Each protocol remains responsible for parsing its own request and loading its
 input image bytes. Ratio selection happens only after those bytes are
@@ -31,10 +33,11 @@ Ratio precedence is:
 1. A fixed-ratio model ID explicitly supplied by the caller always wins. The
    catalog default does not count as an explicit fixed-ratio selection.
 2. An explicit supported ratio such as `16:9` is used unchanged.
-3. `free` or `auto` with input images uses the first image as the primary
+3. An omitted ratio is normalized to `auto` before model selection.
+4. `free` or `auto` with input images uses the first image as the primary
    image.
-4. `free` or `auto` without an input image uses `size` when present.
-5. Without an input image or `size`, an auto-capable upstream receives `auto`;
+5. `free` or `auto` without an input image uses `size` when present.
+6. Without an input image or `size`, an auto-capable upstream receives `auto`;
    a fixed-size upstream falls back to `1:1`.
 
 Invalid values other than `free` and `auto` keep the existing compatibility
@@ -128,9 +131,10 @@ Dimension inspection reads metadata without decoding pixel data, applies EXIF
 orientation before selecting a ratio, and maps Pillow decompression-bomb errors
 to the same invalid-image 400 response.
 
-When `free` or `auto` is explicit and the caller omits `model`, resolution uses
-the dynamic `firefly-nano-banana-pro` model ID. Responses, logs, and credit
-measurement therefore do not claim a fixed `16:9` model for an auto payload.
+When the ratio is omitted or `free`/`auto` is explicit and the caller omits
+`model`, resolution uses the dynamic `firefly-nano-banana-pro` model ID.
+Responses, logs, and credit measurement therefore do not claim a fixed `16:9`
+model for an auto payload.
 
 An explicit fixed ratio never requires image decoding. Unsupported upstream
 ratios are resolved before payload construction, so `gpt-image-2` will not
@@ -141,6 +145,7 @@ receive `auto` and will not fail with an avoidable 422-style error.
 Regression tests will cover:
 
 - `free` and `auto` through chat, images edits, Responses, and Gemini;
+- omitted ratios through the shared resolver and Gemini native parsing;
 - landscape, portrait, square, and non-standard primary image dimensions;
 - `auto` forwarding for auto-capable model families;
 - auto-capable payloads use a primary-image-derived top-level `size` instead of

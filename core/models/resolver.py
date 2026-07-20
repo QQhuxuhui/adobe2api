@@ -314,7 +314,7 @@ def resolve_image_geometry(
 ) -> ResolvedImageGeometry:
     requested_ratio = str(
         data.get("aspect_ratio") or data.get("aspectRatio") or ""
-    ).strip().lower()
+    ).strip().lower() or "auto"
     requested_size = data.get("size")
     if not model_id and requested_ratio in {"free", "auto"}:
         resolved_model_id = DEFAULT_AUTO_MODEL_ID
@@ -328,13 +328,6 @@ def resolve_image_geometry(
     fixed_model_ratio = str(model_conf.get("aspect_ratio") or "").strip()
     if model_id and fixed_model_ratio:
         requested_ratio = fixed_model_ratio
-    elif not requested_ratio:
-        if requested_size:
-            requested_ratio = ratio_from_size(requested_size)
-        elif fixed_model_ratio:
-            requested_ratio = fixed_model_ratio
-        else:
-            requested_ratio = "1:1"
 
     supported_ratios = tuple(
         model_conf.get("supported_aspect_ratios") or sorted(SUPPORTED_RATIOS)

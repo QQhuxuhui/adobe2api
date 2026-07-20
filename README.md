@@ -136,10 +136,11 @@ GPT Image 图像模型（实验接入）：
 关于 `free` / `auto`：
 
 - 两者是兼容别名；有输入图时，第一张图决定输出比例
+- 未传 `aspect_ratio` 时按 `auto` 处理
 - Adobe/Gemini 模型先尝试按第一张图生成等比例输出尺寸；上游不接受时回退到该模型最接近的标准比例
 - `gpt-image-2` 会映射到该模型最接近的标准比例
 - 没有输入图时优先读取 `size`；也没有 `size` 时 Adobe/Gemini 尝试 `auto`，GPT Image 使用 `1:1`
-- 没有显式传模型但传了 `free` / `auto` 时，使用动态模型 `firefly-nano-banana-pro`
+- 没有显式传模型且比例缺省或传了 `free` / `auto` 时，使用动态模型 `firefly-nano-banana-pro`
 - 用户显式选择带比例后缀的模型 ID 时，模型 ID 中的固定比例优先
 
 Sora2 视频模型：

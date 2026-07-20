@@ -316,3 +316,24 @@ def test_async_job_success_updates_log_and_submits_credit_measurement(tmp_path: 
     assert completion["output_resolution"] == "2K"
     assert completion["payload"]["task_status"] == "COMPLETED"
     assert request_logs.records[-1]["token_account_email"] == "primary@example.com"
+
+
+def test_async_job_defaults_omitted_ratio_to_auto(tmp_path: Path):
+    jobs = JobStore()
+    adobe_client = JobAdobeClient()
+    client, credit_contexts = make_client(
+        tmp_path,
+        store=jobs,
+        token_manager=JobTokenManager(),
+        adobe_client=adobe_client,
+        credits_tracker=CaptureCreditsTracker(),
+    )
+
+    response = client.post(
+        "/api/v1/generate",
+        json={"prompt": "draw this", "output_resolution": "2K"},
+    )
+
+    assert response.status_code == 200
+    assert adobe_client.generate_kwargs["aspect_ratio"] == "auto"
+    assert credit_contexts == [("firefly-nano-banana-pro", "2K")]

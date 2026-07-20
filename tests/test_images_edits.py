@@ -108,11 +108,12 @@ def make_client(tmp_path: Path, adobe_client: FakeAdobeClient):
 def test_edits_happy_path_url(tmp_path: Path):
     adobe = FakeAdobeClient()
     client, credit_contexts, logging_fields = make_client(tmp_path, adobe)
+    image = png_bytes(1536, 1024)
 
     response = client.post(
         "/v1/images/edits",
         data={"prompt": "make it night", "model": "gpt-image-2", "size": "1536x1024"},
-        files={"image": ("a.png", b"png-bytes", "image/png")},
+        files={"image": ("a.png", image, "image/png")},
     )
 
     assert response.status_code == 200, response.text
@@ -123,7 +124,7 @@ def test_edits_happy_path_url(tmp_path: Path):
     assert body["usage"]["input_tokens_details"]["image_tokens"] == 300
     assert credit_contexts == [("gpt-image-2", "2K")]
     assert logging_fields == [("gpt-image-2", "make it night")]
-    assert adobe.uploads == [("token-value", b"png-bytes", "image/png")]
+    assert adobe.uploads == [("token-value", image, "image/png")]
     assert adobe.generate_kwargs["source_image_ids"] == ["img-1"]
     assert adobe.generate_kwargs["aspect_ratio"] == "3:2"
     assert adobe.generate_kwargs["upstream_model_id"] == "gpt-image"
@@ -138,8 +139,8 @@ def test_edits_accepts_bracket_field_name_and_multiple_images(tmp_path: Path):
         "/v1/images/edits",
         data={"prompt": "merge these"},
         files=[
-            ("image[]", ("a.png", b"first", "image/png")),
-            ("image[]", ("b.jpg", b"second", "image/jpeg")),
+            ("image[]", ("a.png", png_bytes(1200, 800), "image/png")),
+            ("image[]", ("b.png", png_bytes(800, 1200), "image/png")),
         ],
     )
 
@@ -214,7 +215,7 @@ def test_edits_b64_json_response(tmp_path: Path):
     response = client.post(
         "/v1/images/edits",
         data={"prompt": "night", "response_format": "b64_json"},
-        files={"image": ("a.png", b"png-bytes", "image/png")},
+        files={"image": ("a.png", png_bytes(1024, 1024), "image/png")},
     )
 
     assert response.status_code == 200, response.text
@@ -230,7 +231,7 @@ def test_edits_mask_is_ignored(tmp_path: Path):
         "/v1/images/edits",
         data={"prompt": "night"},
         files=[
-            ("image", ("a.png", b"png-bytes", "image/png")),
+            ("image", ("a.png", png_bytes(1024, 1024), "image/png")),
             ("mask", ("m.png", b"mask-bytes", "image/png")),
         ],
     )
@@ -281,7 +282,7 @@ def test_edits_maps_quota_error_to_429(tmp_path: Path):
     response = client.post(
         "/v1/images/edits",
         data={"prompt": "night"},
-        files={"image": ("a.png", b"png-bytes", "image/png")},
+        files={"image": ("a.png", png_bytes(1024, 1024), "image/png")},
     )
 
     assert response.status_code == 429

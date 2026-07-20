@@ -134,10 +134,11 @@ GPT Image models (experimental):
 About `free` / `auto`:
 
 - They are compatibility aliases; with input images, the first image controls the output ratio
+- An omitted `aspect_ratio` is treated as `auto`
 - Adobe/Gemini models first try a size derived from the first image, then fall back to that model's nearest standard ratio if upstream rejects it
 - `gpt-image-2` maps the first image to that model's nearest standard ratio
 - Without an input image, `size` is used first; without either, Adobe/Gemini attempts `auto` and GPT Image uses `1:1`
-- When `free` / `auto` is present without an explicit model, the dynamic `firefly-nano-banana-pro` model is used
+- When no model is explicit and the ratio is omitted or set to `free` / `auto`, the dynamic `firefly-nano-banana-pro` model is used
 - An explicitly selected model ID with a ratio suffix keeps its fixed ratio
 
 Sora2 video models:
