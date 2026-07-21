@@ -292,6 +292,20 @@ def build_generation_router(
                     }
                 },
             )
+        # 真实 gpt-image 默认返回 b64_json(不返回可访问 url);对齐该行为,
+        # 同时避免把内网 /generated URL 透传给客户端。显式 response_format=url
+        # 仍按旧行为返回可访问链接(需正确配置 PUBLIC_BASE_URL)。
+        response_format = str(data.get("response_format") or "b64_json").strip().lower()
+        if response_format not in {"url", "b64_json"}:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "response_format must be url or b64_json",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
         geometry = resolve_image_geometry(data, model_id, [])
         ratio = geometry.aspect_ratio
         usage_ratio = geometry.usage_ratio
@@ -332,10 +346,20 @@ def build_generation_router(
                 )
                 image_url = public_image_url(request, artifact.job_id)
                 set_request_preview(request, image_url, kind="image")
+                # 对齐真实 gpt-image 返回: data[].b64_json + revised_prompt。
+                # adobe/Firefly 上游无提示词改写,revised_prompt 回显原始 prompt,
+                # 避免与真官方账号在结构上出现"有/无该字段"的差异。
+                if response_format == "url":
+                    item = {"url": image_url, "revised_prompt": prompt}
+                else:
+                    item = {
+                        "b64_json": base64.b64encode(artifact.image_bytes).decode(),
+                        "revised_prompt": prompt,
+                    }
                 return {
                     "created": int(time.time()),
                     "model": resolved_model_id,
-                    "data": [{"url": image_url}],
+                    "data": [item],
                     # 该接口不上传输入图(client.generate 无 source_image_ids),
                     # 输入图 token 恒为 0,不按请求里未使用的图片字段虚计费
                     "usage": build_image_usage(

@@ -67,8 +67,9 @@ def build_image_usage(
     """按 OpenAI gpt-image-1 口径构造 usage(token 计费用)。
     输出图像 token = 表[质量档(由分辨率映射)][朝向(由比例映射)];
     输入 = 提示词 token(CJK 感知) + 输入图 token(图生图/改图)。
-    同时给出 chat(prompt/completion) 与 responses/images(input/output) 两套命名,
-    图像输出 token 放进 output_tokens_details.image_tokens(下游图像计费取此字段)。
+    字段结构对齐真实 gpt-image /v1/images/generations 返回: 仅 input/output
+    命名(无 chat 的 prompt/completion 冗余),input/output_tokens_details 各含
+    image_tokens 与 text_tokens。下游图像计费取 output_tokens_details.image_tokens。
     """
     quality = _RES_TO_QUALITY.get(str(output_resolution or "2K").upper(), "medium")
     orient = _orientation_of(ratio)
@@ -79,14 +80,11 @@ def build_image_usage(
     input_tokens = text_in + img_in
 
     return {
-        "prompt_tokens": input_tokens,
-        "completion_tokens": img_out,
-        "total_tokens": input_tokens + img_out,
         "input_tokens": input_tokens,
         "output_tokens": img_out,
-        "input_tokens_details": {"text_tokens": text_in, "image_tokens": img_in},
-        "output_tokens_details": {"image_tokens": img_out},
-        "completion_tokens_details": {"image_tokens": img_out},
+        "total_tokens": input_tokens + img_out,
+        "input_tokens_details": {"image_tokens": img_in, "text_tokens": text_in},
+        "output_tokens_details": {"image_tokens": img_out, "text_tokens": 0},
     }
 
 
