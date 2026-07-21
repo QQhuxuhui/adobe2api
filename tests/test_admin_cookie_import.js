@@ -36,7 +36,7 @@ test("browser loading exposes the complete AdminCookieImport contract", () => {
   );
 });
 
-test("collectRetryItems keeps only accounts whose import failed", () => {
+test("collectRetryItems keeps accounts whose import or refresh failed", () => {
   const { collectRetryItems } = require("../static/admin_cookie_import.js");
   const items = [
     { name: "账号A", cookie: "a=1" },
@@ -53,15 +53,19 @@ test("collectRetryItems keeps only accounts whose import failed", () => {
 
   assert.deepEqual(collectRetryItems(items, results), [
     { name: "账号B", cookie: "b=2" },
+    { name: "账号C", cookie: "c=3" },
     { name: "账号D", cookie: "d=4" },
   ]);
 });
 
-test("collectRetryItems returns nothing when every import succeeded", () => {
+test("collectRetryItems returns nothing when every account fully succeeded", () => {
   const { collectRetryItems } = require("../static/admin_cookie_import.js");
-  const items = [{ name: "账号A", cookie: "a=1" }];
+  const items = [{ name: "账号A", cookie: "a=1" }, { name: "账号B", cookie: "b=2" }];
 
-  assert.deepEqual(collectRetryItems(items, [{ profile: {} }]), []);
+  assert.deepEqual(
+    collectRetryItems(items, [{ profile: {} }, { profile: {}, refresh_error: "  " }]),
+    [],
+  );
   assert.deepEqual(collectRetryItems([], []), []);
   assert.deepEqual(collectRetryItems(null, null), []);
 });

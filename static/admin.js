@@ -1365,7 +1365,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       retryImportItems = collectRetryItems(items, results);
       updateRetryImportButton();
       const retryNote = retryImportItems.length
-        ? `，可点击「重试失败账号」仅重新导入失败的 ${retryImportItems.length} 个账号`
+        ? `，可点击「重试失败账号」仅重新处理导入/刷新失败的 ${retryImportItems.length} 个账号`
         : "";
 
       if (items.length > 1) {
@@ -1390,7 +1390,7 @@ document.addEventListener("DOMContentLoaded", async () => {
             ? "（邮箱已存在，已更新原账号）"
             : "";
           if (refreshError) {
-            showMsg(refreshMsg, `Cookie ${actionLabel}成功${dedupNote}，但自动刷新失败：${refreshError}`, true, { duration: 8000 });
+            showMsg(refreshMsg, `Cookie ${actionLabel}成功${dedupNote}，但自动刷新失败：${refreshError}${retryNote}`, true, { duration: 8000 });
           } else {
             showMsg(refreshMsg, `Cookie ${actionLabel}成功${dedupNote}，并已自动刷新`, false, { duration: 8000 });
           }

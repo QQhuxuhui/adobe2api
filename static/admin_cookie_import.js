@@ -119,7 +119,8 @@
     const resultList = Array.isArray(results) ? results : [];
     return itemList.filter((_, idx) => {
       const result = resultList[idx];
-      return !result || result.error != null;
+      if (!result || result.error != null) return true;
+      return String(result.refresh_error || "").trim() !== "";
     });
   }
 
