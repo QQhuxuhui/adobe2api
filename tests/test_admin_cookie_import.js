@@ -28,11 +28,57 @@ test("browser loading exposes the complete AdminCookieImport contract", () => {
   assert.deepEqual(
     Object.keys(context.AdminCookieImport).sort(),
     [
+      "collectRetryItems",
       "cookieToHeaderString",
       "parseCookieFilesToItems",
       "toCookieBatchItems",
     ],
   );
+});
+
+test("collectRetryItems keeps only accounts whose import failed", () => {
+  const { collectRetryItems } = require("../static/admin_cookie_import.js");
+  const items = [
+    { name: "账号A", cookie: "a=1" },
+    { name: "账号B", cookie: "b=2" },
+    { name: "账号C", cookie: "c=3" },
+    { name: "账号D", cookie: "d=4" },
+  ];
+  const results = [
+    { profile: { import_action: "created" } },
+    { error: new Error("导入失败") },
+    { profile: { import_action: "updated" }, refresh_error: "刷新失败" },
+    undefined,
+  ];
+
+  assert.deepEqual(collectRetryItems(items, results), [
+    { name: "账号B", cookie: "b=2" },
+    { name: "账号D", cookie: "d=4" },
+  ]);
+});
+
+test("collectRetryItems returns nothing when every import succeeded", () => {
+  const { collectRetryItems } = require("../static/admin_cookie_import.js");
+  const items = [{ name: "账号A", cookie: "a=1" }];
+
+  assert.deepEqual(collectRetryItems(items, [{ profile: {} }]), []);
+  assert.deepEqual(collectRetryItems([], []), []);
+  assert.deepEqual(collectRetryItems(null, null), []);
+});
+
+test("admin wires a retry button that re-imports only failed accounts", () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, "..", "static", "admin.js"),
+    "utf8",
+  );
+  const html = fs.readFileSync(
+    path.join(__dirname, "..", "static", "admin.html"),
+    "utf8",
+  );
+
+  assert.match(html, /id="retryCookieImportBtn"/);
+  assert.match(source, /retryCookieImportBtn/);
+  assert.match(source, /collectRetryItems/);
 });
 
 test("cookieToHeaderString handles strings, arrays, and wrappers", () => {

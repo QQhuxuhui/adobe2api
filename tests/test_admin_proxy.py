@@ -242,7 +242,7 @@ def test_proxy_test_frontend_contract():
     assert 'id="proxyTestResult"' in html
     assert 'role="status"' in html
     assert 'aria-live="polite"' in html
-    assert '/static/admin.js?v=20260717-7' in html
+    assert '/static/admin.js?v=20260721-1' in html
     assert 'confProxy.addEventListener("input", invalidateProxyTestResult)' in script
     assert "proxyTestGate.invalidate();" in script
     assert 'fetch("/api/v1/config/test-proxy"' in script

@@ -114,7 +114,17 @@
     return { items, errors };
   }
 
+  function collectRetryItems(items, results) {
+    const itemList = Array.isArray(items) ? items : [];
+    const resultList = Array.isArray(results) ? results : [];
+    return itemList.filter((_, idx) => {
+      const result = resultList[idx];
+      return !result || result.error != null;
+    });
+  }
+
   return {
+    collectRetryItems,
     cookieToHeaderString,
     parseCookieFilesToItems,
     toCookieBatchItems,

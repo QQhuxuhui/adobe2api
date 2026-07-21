@@ -104,6 +104,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     updateInputValue,
   } = window.AdminUiState;
   const {
+    collectRetryItems,
     parseCookieFilesToItems,
     toCookieBatchItems,
   } = window.AdminCookieImport;
@@ -910,6 +911,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const cookieInput = document.getElementById("cookieInput");
   const cookieFile = document.getElementById("cookieFile");
   const importCookieBtn = document.getElementById("importCookieBtn");
+  const retryCookieImportBtn = document.getElementById("retryCookieImportBtn");
   const refreshMsg = document.getElementById("refreshMsg");
   let currentBatchConcurrency = 5;
   const PROXY_TEST_ERROR_MESSAGES = {
@@ -1272,35 +1274,24 @@ document.addEventListener("DOMContentLoaded", async () => {
     return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
   }
 
-  async function importCookies() {
-    const text = String(cookieInput?.value || "").trim();
-    if (!text) {
-      showMsg(refreshMsg, "请先粘贴或上传 Cookie", true);
-      return;
-    }
+  let retryImportItems = [];
 
-    let items = [];
-    try {
-      let parsed = text;
-      try {
-        parsed = JSON.parse(text);
-      } catch (_) {
-        parsed = text;
-      }
-      items = toCookieBatchItems(parsed);
-    } catch (err) {
-      showMsg(refreshMsg, err.message || "Cookie 解析失败", true);
-      return;
+  function updateRetryImportButton() {
+    if (!retryCookieImportBtn) return;
+    if (retryImportItems.length) {
+      retryCookieImportBtn.textContent = `重试失败账号（${retryImportItems.length}）`;
+      retryCookieImportBtn.style.display = "";
+    } else {
+      retryCookieImportBtn.style.display = "none";
     }
+  }
 
-    if (!items.length) {
-      showMsg(refreshMsg, "未找到可导入的 Cookie", true);
-      return;
-    }
-
+  async function runCookieImportBatch(items, { retryRun = false } = {}) {
+    const actionLabel = retryRun ? "重试" : "导入";
     const batchLimit = Math.max(1, Math.min(100, Number(confBatchConcurrency?.value || currentBatchConcurrency || 5)));
     try {
       if (importCookieBtn) importCookieBtn.disabled = true;
+      if (retryCookieImportBtn) retryCookieImportBtn.disabled = true;
       const workerCount = Math.min(batchLimit, items.length);
       const progress = {
         total: items.length,
@@ -1315,7 +1306,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       const updateImportProgress = () => {
         showMsg(
           refreshMsg,
-          `已解析 ${progress.total} 个 Cookie，处理中 ${progress.completed}/${progress.total}，导入成功 ${progress.imported}（含去重更新 ${progress.deduped}），导入失败 ${progress.failed}，刷新失败 ${progress.refreshFailed}（并行 ${workerCount} 个）...`,
+          `正在${actionLabel} ${progress.total} 个 Cookie，处理中 ${progress.completed}/${progress.total}，导入成功 ${progress.imported}（含去重更新 ${progress.deduped}），导入失败 ${progress.failed}，刷新失败 ${progress.refreshFailed}（并行 ${workerCount} 个）...`,
           progress.failed > 0 || progress.refreshFailed > 0,
           { duration: 0 }
         );
@@ -1371,36 +1362,86 @@ document.addEventListener("DOMContentLoaded", async () => {
 
       await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
 
+      retryImportItems = collectRetryItems(items, results);
+      updateRetryImportButton();
+      const retryNote = retryImportItems.length
+        ? `，可点击「重试失败账号」仅重新导入失败的 ${retryImportItems.length} 个账号`
+        : "";
+
       if (items.length > 1) {
         showMsg(
           refreshMsg,
-          `批量 Cookie 导入完成：成功 ${progress.imported}（含去重更新 ${progress.deduped}），导入失败 ${progress.failed}，刷新失败 ${progress.refreshFailed}`,
+          `批量 Cookie ${actionLabel}完成：成功 ${progress.imported}（含去重更新 ${progress.deduped}），导入失败 ${progress.failed}，刷新失败 ${progress.refreshFailed}${retryNote}`,
           progress.failed > 0 || progress.refreshFailed > 0,
           { duration: 8000 }
         );
       } else {
         const singleResult = results[0];
-        const refreshError = String(singleResult?.refresh_error || "").trim();
         if (singleResult?.error) {
-          throw singleResult.error;
-        }
-        const dedupNote = String(singleResult?.profile?.import_action || "") === "updated"
-          ? "（邮箱已存在，已更新原账号）"
-          : "";
-        if (refreshError) {
-          showMsg(refreshMsg, `Cookie 导入成功${dedupNote}，但自动刷新失败：${refreshError}`, true, { duration: 8000 });
+          showMsg(
+            refreshMsg,
+            `${singleResult.error.message || "Cookie 导入失败"}${retryNote}`,
+            true,
+            { duration: 8000 }
+          );
         } else {
-          showMsg(refreshMsg, `Cookie 导入成功${dedupNote}，并已自动刷新`, false, { duration: 8000 });
+          const refreshError = String(singleResult?.refresh_error || "").trim();
+          const dedupNote = String(singleResult?.profile?.import_action || "") === "updated"
+            ? "（邮箱已存在，已更新原账号）"
+            : "";
+          if (refreshError) {
+            showMsg(refreshMsg, `Cookie ${actionLabel}成功${dedupNote}，但自动刷新失败：${refreshError}`, true, { duration: 8000 });
+          } else {
+            showMsg(refreshMsg, `Cookie ${actionLabel}成功${dedupNote}，并已自动刷新`, false, { duration: 8000 });
+          }
         }
       }
-      if (cookieInput) cookieInput.value = "";
-      if (cookieFile) cookieFile.value = "";
       await loadTokens();
     } catch (err) {
-      showMsg(refreshMsg, err.message || "Cookie 导入失败", true, { duration: 8000 });
+      showMsg(refreshMsg, err.message || `Cookie ${actionLabel}失败`, true, { duration: 8000 });
     } finally {
       if (importCookieBtn) importCookieBtn.disabled = false;
+      if (retryCookieImportBtn) retryCookieImportBtn.disabled = false;
     }
+  }
+
+  async function importCookies() {
+    const text = String(cookieInput?.value || "").trim();
+    if (!text) {
+      showMsg(refreshMsg, "请先粘贴或上传 Cookie", true);
+      return;
+    }
+
+    let items = [];
+    try {
+      let parsed = text;
+      try {
+        parsed = JSON.parse(text);
+      } catch (_) {
+        parsed = text;
+      }
+      items = toCookieBatchItems(parsed);
+    } catch (err) {
+      showMsg(refreshMsg, err.message || "Cookie 解析失败", true);
+      return;
+    }
+
+    if (!items.length) {
+      showMsg(refreshMsg, "未找到可导入的 Cookie", true);
+      return;
+    }
+
+    await runCookieImportBatch(items);
+    if (cookieInput) cookieInput.value = "";
+    if (cookieFile) cookieFile.value = "";
+  }
+
+  async function retryFailedCookieImports() {
+    if (!retryImportItems.length) {
+      updateRetryImportButton();
+      return;
+    }
+    await runCookieImportBatch(retryImportItems.slice(), { retryRun: true });
   }
 
   async function handleCookieFiles(fileList) {
@@ -1463,6 +1504,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   if (importCookieBtn) importCookieBtn.addEventListener("click", importCookies);
+  if (retryCookieImportBtn) retryCookieImportBtn.addEventListener("click", retryFailedCookieImports);
   // profile operation handlers are attached as window methods above.
 
   async function loadLogs() {
