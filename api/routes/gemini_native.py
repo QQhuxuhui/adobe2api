@@ -33,7 +33,9 @@ from core.video_tasks import (
 )
 
 GEMINI_NATIVE_MAX_BODY_BYTES = 64 * 1024 * 1024
-GEMINI_VIDEO_MAX_BODY_BYTES = 1024 * 1024
+# 图生视频请求体现在也可携带参考图（每张最多 20MB，base64 会膨胀 ~1.33x），
+# 因此与图片路由采用同一上限；单张/总量另有更细的校验兜底。
+GEMINI_VIDEO_MAX_BODY_BYTES = GEMINI_NATIVE_MAX_BODY_BYTES
 GEMINI_MAX_IMAGE_BYTES = 20 * 1024 * 1024
 GEMINI_MAX_TOTAL_IMAGE_BYTES = 40 * 1024 * 1024
 GEMINI_MAX_IMAGES = 6
@@ -477,6 +479,11 @@ def parse_veo_request(
     if len(images) > VEO_MAX_REFERENCE_IMAGES:
         raise _invalid(
             f"at most {VEO_MAX_REFERENCE_IMAGES} reference images are supported"
+        )
+    if sum(len(img_bytes) for img_bytes, _ in images) > GEMINI_MAX_TOTAL_IMAGE_BYTES:
+        raise _invalid(
+            f"total reference images exceed the "
+            f"{GEMINI_MAX_TOTAL_IMAGE_BYTES // (1024 * 1024)} MiB limit"
         )
 
     parameters = payload.get("parameters", {})

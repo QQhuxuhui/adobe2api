@@ -891,3 +891,17 @@ def test_parse_veo_request_rejects_non_list_reference_images():
 def test_parse_veo_request_still_rejects_other_media_fields(field):
     raw = json.dumps({"instances": [{"prompt": "p", field: {"x": 1}}]}).encode("utf-8")
     _assert_invalid(lambda: parse_veo_request(raw, _veo_spec()))
+
+
+def test_parse_veo_request_rejects_total_images_over_budget(monkeypatch):
+    # 每张图单独在 20MB 以内，但合计超过总量预算时必须拒绝，避免撑爆请求体
+    monkeypatch.setattr(
+        gemini_native.base64, "b64decode",
+        lambda data, validate=False: b"x" * (GEMINI_MAX_IMAGE_BYTES - 1),
+    )
+    big = {"bytesBase64Encoded": "AAAA", "mimeType": "image/png"}
+    _assert_invalid(
+        lambda: parse_veo_request(
+            _veo_payload({"image": big, "referenceImages": [big, big]}), _veo_spec()
+        )
+    )

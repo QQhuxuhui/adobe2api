@@ -1054,20 +1054,20 @@ def test_full_app_does_not_preload_unauthorized_sora_body(monkeypatch):
     assert consumed == []
 
 
-def test_veo_submit_rejects_body_over_one_mib_before_task_creation(tmp_path: Path):
+def test_veo_submit_accepts_body_over_one_mib(tmp_path: Path):
+    # 图生视频请求会携带参考图，请求体早已超过旧的 1MB 上限，必须能正常受理
     harness = Harness(tmp_path, enable_video_tasks=True)
-    oversized_prompt = "x" * (1024 * 1024)
+    big_prompt = "x" * (2 * 1024 * 1024)
 
     response = post(
         harness,
         "veo-3.1-generate-preview",
         "predictLongRunning",
-        veo_request(prompt=oversized_prompt),
+        veo_request(prompt=big_prompt),
     )
 
-    assert_google_error(response, 400, "INVALID_ARGUMENT")
-    assert response.json()["error"]["message"] == "Request body is too large"
-    assert harness.video_manager.specs == []
+    assert response.status_code == 200
+    assert len(harness.video_manager.specs) == 1
 
 
 def test_full_app_logs_gemini_paths_without_base64(monkeypatch):
