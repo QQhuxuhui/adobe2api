@@ -54,6 +54,8 @@ class VideoTaskSpec:
     credit_model_id: str
     result_url_prefix: str
     log_id: str
+    # 图生视频：(bytes, mime_type) 元组列表，worker 提交前先上传 Adobe 换取 blob id
+    source_images: tuple = ()
 
 
 @dataclass
@@ -621,6 +623,10 @@ def build_video_task_runner(
                     progress_callback(value)
 
             try:
+                source_image_ids = [
+                    client.upload_image(token, image_bytes, image_mime)
+                    for image_bytes, image_mime in (spec.source_images or ())
+                ]
                 generated = generate_video(
                     client=client,
                     token=token,
@@ -637,7 +643,7 @@ def build_video_task_runner(
                     resolution=spec.resolution,
                     negative_prompt=spec.negative_prompt,
                     generate_audio=True,
-                    source_image_ids=[],
+                    source_image_ids=source_image_ids,
                     entity_refs=None,
                     reference_mode="frame",
                     timeout=max(int(getattr(client, "generate_timeout", 600)), 600),

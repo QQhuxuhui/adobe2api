@@ -1,3 +1,4 @@
+import dataclasses
 import threading
 import time
 from pathlib import Path
@@ -577,3 +578,80 @@ def test_worker_does_not_retry_the_same_token_identity(tmp_path: Path):
     assert token_manager.reported_exhausted == ["token-value"]
     assert logs.payloads["log-quota"]["status_code"] == 429
     assert logs.payloads["log-quota"]["error_code"] == "quota_exceeded"
+
+
+def test_worker_uploads_source_images_and_passes_ids(tmp_path: Path):
+    """图生视频：spec 携带的原图必须先上传 Adobe 拿 id，再传给 generate_video。"""
+
+    class UploadClient(FakeWorkerClient):
+        def __init__(self) -> None:
+            self.uploads = []
+
+        def upload_image(
+            self, token, image_bytes, mime_type="image/jpeg", deadline=None
+        ):
+            self.uploads.append((token, image_bytes, mime_type))
+            return f"img-{len(self.uploads)}"
+
+    client = UploadClient()
+    captured: dict = {}
+    token_manager = FakeTokenManager()
+
+    def generate_video(**kwargs):
+        captured.update(kwargs)
+        path = tmp_path / f"{kwargs['task_id']}.mp4"
+        path.write_bytes(b"video")
+        return GeneratedVideoFile(path, "video/mp4", {"contentType": "video/mp4"})
+
+    runner = build_video_task_runner(
+        token_manager=token_manager,
+        client=client,
+        credits_tracker=FakeCreditsTracker(),
+        request_log_store=FakeRequestLogStore(),
+        generated_dir=tmp_path,
+        generate_video=generate_video,
+        on_generated_file_written=lambda path, old, new: None,
+        quota_error_cls=WorkerQuotaError,
+        auth_error_cls=WorkerAuthError,
+        upstream_temp_error_cls=WorkerTemporaryError,
+        adobe_error_cls=WorkerFailure,
+        logger=None,
+    )
+
+    spec = dataclasses.replace(
+        make_spec("video-img"),
+        source_images=((b"png-bytes", "image/png"),),
+    )
+    outcome = runner(spec, lambda value: None)
+
+    assert outcome.result_path == tmp_path / "video-img.mp4"
+    assert client.uploads == [("token-value", b"png-bytes", "image/png")]
+    assert captured["source_image_ids"] == ["img-1"]
+
+
+def test_worker_without_source_images_passes_empty_ids(tmp_path: Path):
+    captured: dict = {}
+
+    def generate_video(**kwargs):
+        captured.update(kwargs)
+        path = tmp_path / f"{kwargs['task_id']}.mp4"
+        path.write_bytes(b"video")
+        return GeneratedVideoFile(path, "video/mp4", {"contentType": "video/mp4"})
+
+    runner = build_video_task_runner(
+        token_manager=FakeTokenManager(),
+        client=FakeWorkerClient(),
+        credits_tracker=FakeCreditsTracker(),
+        request_log_store=FakeRequestLogStore(),
+        generated_dir=tmp_path,
+        generate_video=generate_video,
+        on_generated_file_written=lambda path, old, new: None,
+        quota_error_cls=WorkerQuotaError,
+        auth_error_cls=WorkerAuthError,
+        upstream_temp_error_cls=WorkerTemporaryError,
+        adobe_error_cls=WorkerFailure,
+        logger=None,
+    )
+
+    runner(make_spec("video-noimg"), lambda value: None)
+    assert captured["source_image_ids"] == []
