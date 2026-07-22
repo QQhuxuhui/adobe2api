@@ -232,6 +232,12 @@ def test_video_models_only_support_predict_long_running():
             },
             ("9:16", 6, "720p", "no captions"),
         ),
+        # new-api 的 veo 适配器总是携带 sampleCount=1（官方 API 合法参数）
+        (
+            {"sampleCount": 1, "durationSeconds": 4, "resolution": "720p"},
+            ("16:9", 4, "720p", ""),
+        ),
+        ({"sample_count": 1}, ("16:9", 8, "720p", "")),
     ],
 )
 def test_parse_veo_request_accepts_supported_parameters(parameters, expected):
@@ -271,6 +277,9 @@ def test_parse_veo_request_accepts_supported_parameters(parameters, expected):
             "instances": [{"prompt": "p"}],
             "parameters": {"personGeneration": "allow_all"},
         },
+        # 后端一次只能生成一个视频，sampleCount 只接受 1
+        {"instances": [{"prompt": "p"}], "parameters": {"sampleCount": 2}},
+        {"instances": [{"prompt": "p"}], "parameters": {"sampleCount": "1"}},
     ],
 )
 def test_parse_veo_request_rejects_unsupported_shapes_and_combinations(payload):

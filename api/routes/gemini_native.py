@@ -448,6 +448,8 @@ def parse_veo_request(
             "resolution",
             "negativePrompt",
             "negative_prompt",
+            "sampleCount",
+            "sample_count",
         }
     )
     for field, value in parameters.items():
@@ -501,6 +503,15 @@ def parse_veo_request(
     )
     if not isinstance(negative_prompt, str):
         raise _invalid("negativePrompt must be a string")
+
+    # 官方 Veo API 的合法参数（new-api 等网关会固定携带）；后端一次只产出一个视频
+    sample_count = _config_field(parameters, "sampleCount", "sample_count", 1)
+    if (
+        isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+        or sample_count != 1
+    ):
+        raise _invalid("sampleCount must be 1")
 
     person_generation = _config_field(
         parameters,
