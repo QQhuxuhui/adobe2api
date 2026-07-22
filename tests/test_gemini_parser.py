@@ -786,47 +786,79 @@ def test_deep_structure_validation_finishes_before_image_decoding(monkeypatch):
     assert decode_calls == []
 
 
-# ---- 图生视频：instances[0].image（Google 官方 Veo i2v 格式） ----
+# ---- 图生视频：单图 instances[0].image + 多参考图 referenceImages ----
 
 
-def _veo_image_payload(image):
+def _img(raw_bytes, mime="image/png", *, snake=False):
+    if snake:
+        return {"bytes_base64_encoded": base64.b64encode(raw_bytes).decode(), "mime_type": mime}
+    return {"bytesBase64Encoded": base64.b64encode(raw_bytes).decode(), "mimeType": mime}
+
+
+def _veo_payload(instance_extra):
+    instance = {"prompt": "animate this", **instance_extra}
     return json.dumps(
-        {
-            "instances": [{"prompt": "animate this", "image": image}],
-            "parameters": {"durationSeconds": 4},
-        }
+        {"instances": [instance], "parameters": {"durationSeconds": 4}}
     ).encode("utf-8")
 
 
-def test_parse_veo_request_accepts_first_frame_image():
-    import base64
-
-    raw_bytes = b"\x89PNG\r\n\x1a\nfakepng"
-    image = {
-        "bytesBase64Encoded": base64.b64encode(raw_bytes).decode(),
-        "mimeType": "image/png",
-    }
-    parsed = parse_veo_request(_veo_image_payload(image), _veo_spec())
-    assert parsed.image == (raw_bytes, "image/png")
+def test_parse_veo_request_accepts_single_image():
+    parsed = parse_veo_request(_veo_payload({"image": _img(b"png1", "image/png")}), _veo_spec())
+    assert parsed.images == ((b"png1", "image/png"),)
     assert parsed.duration == 4
 
 
-def test_parse_veo_request_image_defaults_and_snake_case():
-    import base64
-
-    raw_bytes = b"jpegdata"
-    image = {
-        "bytes_base64_encoded": base64.b64encode(raw_bytes).decode(),
-        "mime_type": "image/jpeg",
-    }
-    parsed = parse_veo_request(_veo_image_payload(image), _veo_spec())
-    assert parsed.image == (raw_bytes, "image/jpeg")
+def test_parse_veo_request_accepts_snake_case_image():
+    parsed = parse_veo_request(
+        _veo_payload({"image": _img(b"jpg", "image/jpeg", snake=True)}), _veo_spec()
+    )
+    assert parsed.images == ((b"jpg", "image/jpeg"),)
 
 
-def test_parse_veo_request_without_image_has_none():
-    raw = json.dumps({"instances": [{"prompt": "p"}]}).encode("utf-8")
-    parsed = parse_veo_request(raw, _veo_spec())
-    assert parsed.image is None
+def test_parse_veo_request_without_image_is_empty_tuple():
+    parsed = parse_veo_request(json.dumps({"instances": [{"prompt": "p"}]}).encode(), _veo_spec())
+    assert parsed.images == ()
+
+
+def test_parse_veo_request_accepts_reference_images_array():
+    parsed = parse_veo_request(
+        _veo_payload({"referenceImages": [_img(b"a", "image/png"), _img(b"b", "image/jpeg")]}),
+        _veo_spec(),
+    )
+    assert parsed.images == ((b"a", "image/png"), (b"b", "image/jpeg"))
+
+
+def test_parse_veo_request_combines_image_and_reference_images_in_order():
+    parsed = parse_veo_request(
+        _veo_payload({"image": _img(b"first"), "referenceImages": [_img(b"second"), _img(b"third")]}),
+        _veo_spec(),
+    )
+    assert parsed.images == ((b"first", "image/png"), (b"second", "image/png"), (b"third", "image/png"))
+
+
+def test_parse_veo_request_accepts_snake_case_reference_images():
+    parsed = parse_veo_request(
+        _veo_payload({"reference_images": [_img(b"x", "image/webp")]}), _veo_spec()
+    )
+    assert parsed.images == ((b"x", "image/webp"),)
+
+
+def test_parse_veo_request_rejects_more_than_three_images():
+    _assert_invalid(
+        lambda: parse_veo_request(
+            _veo_payload({"referenceImages": [_img(b"a"), _img(b"b"), _img(b"c"), _img(b"d")]}),
+            _veo_spec(),
+        )
+    )
+
+
+def test_parse_veo_request_rejects_more_than_three_combined():
+    _assert_invalid(
+        lambda: parse_veo_request(
+            _veo_payload({"image": _img(b"a"), "referenceImages": [_img(b"b"), _img(b"c"), _img(b"d")]}),
+            _veo_spec(),
+        )
+    )
 
 
 @pytest.mark.parametrize(
@@ -840,12 +872,22 @@ def test_parse_veo_request_without_image_has_none():
     ],
 )
 def test_parse_veo_request_rejects_invalid_image(image):
-    _assert_invalid(lambda: parse_veo_request(_veo_image_payload(image), _veo_spec()))
+    _assert_invalid(lambda: parse_veo_request(_veo_payload({"image": image}), _veo_spec()))
 
 
-@pytest.mark.parametrize("field", ["video", "referenceImages", "lastFrame"])
+def test_parse_veo_request_rejects_invalid_reference_image_entry():
+    _assert_invalid(
+        lambda: parse_veo_request(_veo_payload({"referenceImages": [_img(b"ok"), {}]}), _veo_spec())
+    )
+
+
+def test_parse_veo_request_rejects_non_list_reference_images():
+    _assert_invalid(
+        lambda: parse_veo_request(_veo_payload({"referenceImages": _img(b"a")}), _veo_spec())
+    )
+
+
+@pytest.mark.parametrize("field", ["video", "lastFrame"])
 def test_parse_veo_request_still_rejects_other_media_fields(field):
-    raw = json.dumps(
-        {"instances": [{"prompt": "p", field: {"x": 1}}]}
-    ).encode("utf-8")
+    raw = json.dumps({"instances": [{"prompt": "p", field: {"x": 1}}]}).encode("utf-8")
     _assert_invalid(lambda: parse_veo_request(raw, _veo_spec()))

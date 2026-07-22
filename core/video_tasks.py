@@ -645,7 +645,10 @@ def build_video_task_runner(
                     generate_audio=True,
                     source_image_ids=source_image_ids,
                     entity_refs=None,
-                    reference_mode="frame",
+                    # 标准版走 asset 模式（最多 3 张参考图）；快速版走 frame 模式（最多 2 张）
+                    reference_mode=(
+                        "image" if spec.engine == "veo31-standard" else "frame"
+                    ),
                     timeout=max(int(getattr(client, "generate_timeout", 600)), 600),
                     progress_cb=upstream_progress,
                     on_generated_file_written=on_generated_file_written,

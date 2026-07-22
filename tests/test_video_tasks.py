@@ -655,3 +655,73 @@ def test_worker_without_source_images_passes_empty_ids(tmp_path: Path):
 
     runner(make_spec("video-noimg"), lambda value: None)
     assert captured["source_image_ids"] == []
+
+
+def _upload_runner(tmp_path, captured):
+    class UploadClient(FakeWorkerClient):
+        def __init__(self) -> None:
+            self.uploads = []
+
+        def upload_image(self, token, image_bytes, mime_type="image/jpeg", deadline=None):
+            self.uploads.append((token, image_bytes, mime_type))
+            return f"img-{len(self.uploads)}"
+
+    client = UploadClient()
+
+    def generate_video(**kwargs):
+        captured.update(kwargs)
+        path = tmp_path / f"{kwargs['task_id']}.mp4"
+        path.write_bytes(b"video")
+        return GeneratedVideoFile(path, "video/mp4", {"contentType": "video/mp4"})
+
+    runner = build_video_task_runner(
+        token_manager=FakeTokenManager(),
+        client=client,
+        credits_tracker=FakeCreditsTracker(),
+        request_log_store=FakeRequestLogStore(),
+        generated_dir=tmp_path,
+        generate_video=generate_video,
+        on_generated_file_written=lambda path, old, new: None,
+        quota_error_cls=WorkerQuotaError,
+        auth_error_cls=WorkerAuthError,
+        upstream_temp_error_cls=WorkerTemporaryError,
+        adobe_error_cls=WorkerFailure,
+        logger=None,
+    )
+    return runner, client
+
+
+def test_worker_uploads_multiple_source_images_in_order(tmp_path: Path):
+    captured: dict = {}
+    runner, client = _upload_runner(tmp_path, captured)
+    spec = dataclasses.replace(
+        make_spec("video-multi"),
+        source_images=((b"a", "image/png"), (b"b", "image/jpeg"), (b"c", "image/webp")),
+    )
+    runner(spec, lambda value: None)
+    assert [u[1] for u in client.uploads] == [b"a", b"b", b"c"]
+    assert captured["source_image_ids"] == ["img-1", "img-2", "img-3"]
+
+
+def test_worker_reference_mode_is_image_for_standard_veo(tmp_path: Path):
+    captured: dict = {}
+    runner, _ = _upload_runner(tmp_path, captured)
+    spec = dataclasses.replace(
+        make_spec("video-std"),
+        engine="veo31-standard",
+        source_images=((b"a", "image/png"),),
+    )
+    runner(spec, lambda value: None)
+    assert captured["reference_mode"] == "image"
+
+
+def test_worker_reference_mode_is_frame_for_fast_veo(tmp_path: Path):
+    captured: dict = {}
+    runner, _ = _upload_runner(tmp_path, captured)
+    spec = dataclasses.replace(
+        make_spec("video-fast"),
+        engine="veo31-fast",
+        source_images=((b"a", "image/png"),),
+    )
+    runner(spec, lambda value: None)
+    assert captured["reference_mode"] == "frame"

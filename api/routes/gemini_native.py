@@ -94,8 +94,34 @@ class ParsedVeoRequest:
     duration: int
     resolution: str
     negative_prompt: str
-    # 图生视频首帧：(bytes, mime_type)，无图为 None
-    image: Optional[tuple[bytes, str]] = None
+    # 图生视频参考图：((bytes, mime_type), ...)，无图为空元组
+    images: tuple = ()
+
+
+# Veo 3.1 参考图上限（标准版 3 / 快速版 2，上游按引擎裁剪；此处只做入口总量校验）
+VEO_MAX_REFERENCE_IMAGES = 3
+
+
+def _decode_veo_image(raw_image: object, label: str) -> tuple[bytes, str]:
+    if not isinstance(raw_image, dict):
+        raise _invalid(f"{label} must be an object")
+    encoded = _config_field(
+        raw_image, "bytesBase64Encoded", "bytes_base64_encoded", None
+    )
+    if not isinstance(encoded, str) or not encoded.strip():
+        raise _invalid(f"{label}.bytesBase64Encoded must be a non-empty string")
+    if len(encoded) > GEMINI_MAX_ENCODED_IMAGE_CHARS:
+        raise _invalid(f"{label} exceeds the {GEMINI_MAX_IMAGE_MIB} MiB limit")
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        raise _invalid(f"{label}.bytesBase64Encoded is not valid base64")
+    if not image_bytes or len(image_bytes) > GEMINI_MAX_IMAGE_BYTES:
+        raise _invalid(f"{label} exceeds the {GEMINI_MAX_IMAGE_MIB} MiB limit")
+    mime_type = _config_field(raw_image, "mimeType", "mime_type", "image/png")
+    if not isinstance(mime_type, str) or not mime_type.strip():
+        raise _invalid(f"{label}.mimeType must be a string")
+    return (image_bytes, mime_type.strip())
 
 
 class GeminiNativeError(Exception):
@@ -425,47 +451,33 @@ def parse_veo_request(
     if not isinstance(prompt, str) or not prompt.strip():
         raise _invalid("instances[0].prompt must be a non-empty string")
     for field, value in instance.items():
-        if field not in {"prompt", "image"} and _nonempty_parameter(value):
+        if (
+            field not in {"prompt", "image", "referenceImages", "reference_images"}
+            and _nonempty_parameter(value)
+        ):
             raise _invalid(f"Unsupported parameter: {field}")
-    for field in (
-        "video",
-        "referenceImages",
-        "reference_images",
-        "lastFrame",
-        "last_frame",
-    ):
+    for field in ("video", "lastFrame", "last_frame"):
         if field in instance:
             raise _invalid(f"Unsupported parameter: {field}")
 
-    # 图生视频首帧图：Google 官方格式 instances[0].image = {bytesBase64Encoded, mimeType}
-    image: Optional[tuple[bytes, str]] = None
+    # 图生视频参考图：单图 instances[0].image + 多图 instances[0].referenceImages。
+    # Veo 3.1 最多支持 3 张参考图（标准版 3 / 快速版 2，具体张数由上游按引擎裁剪）。
+    images: list[tuple[bytes, str]] = []
     raw_image = instance.get("image")
     if raw_image is not None:
-        if not isinstance(raw_image, dict):
-            raise _invalid("instances[0].image must be an object")
-        encoded = _config_field(
-            raw_image, "bytesBase64Encoded", "bytes_base64_encoded", None
+        images.append(_decode_veo_image(raw_image, "instances[0].image"))
+    raw_refs = _config_field(instance, "referenceImages", "reference_images", None)
+    if raw_refs is not None:
+        if not isinstance(raw_refs, list):
+            raise _invalid("instances[0].referenceImages must be a list")
+        for idx, ref in enumerate(raw_refs):
+            images.append(
+                _decode_veo_image(ref, f"instances[0].referenceImages[{idx}]")
+            )
+    if len(images) > VEO_MAX_REFERENCE_IMAGES:
+        raise _invalid(
+            f"at most {VEO_MAX_REFERENCE_IMAGES} reference images are supported"
         )
-        if not isinstance(encoded, str) or not encoded.strip():
-            raise _invalid(
-                "instances[0].image.bytesBase64Encoded must be a non-empty string"
-            )
-        if len(encoded) > GEMINI_MAX_ENCODED_IMAGE_CHARS:
-            raise _invalid(
-                f"instances[0].image exceeds the {GEMINI_MAX_IMAGE_MIB} MiB limit"
-            )
-        try:
-            image_bytes = base64.b64decode(encoded, validate=True)
-        except (binascii.Error, ValueError):
-            raise _invalid("instances[0].image.bytesBase64Encoded is not valid base64")
-        if not image_bytes or len(image_bytes) > GEMINI_MAX_IMAGE_BYTES:
-            raise _invalid(
-                f"instances[0].image exceeds the {GEMINI_MAX_IMAGE_MIB} MiB limit"
-            )
-        mime_type = _config_field(raw_image, "mimeType", "mime_type", "image/png")
-        if not isinstance(mime_type, str) or not mime_type.strip():
-            raise _invalid("instances[0].image.mimeType must be a string")
-        image = (image_bytes, mime_type.strip())
 
     parameters = payload.get("parameters", {})
     if not isinstance(parameters, dict):
@@ -559,7 +571,7 @@ def parse_veo_request(
         duration=duration,
         resolution=resolution,
         negative_prompt=negative_prompt.strip(),
-        image=image,
+        images=tuple(images),
     )
 
 
@@ -879,9 +891,7 @@ def build_gemini_native_router(
                     ),
                     result_url_prefix=str(public_generated_url(request, "")),
                     log_id=log_id,
-                    source_images=(
-                        (parsed_video.image,) if parsed_video.image else ()
-                    ),
+                    source_images=parsed_video.images,
                 )
                 video_task_manager.submit(task_spec)
                 request.state.log_managed_externally = True
