@@ -64,6 +64,48 @@ def _nonempty_video_field(value: Any) -> bool:
     return True
 
 
+# /v1/images/edits 的 JSON body 里放输入图的几种常见写法
+EDIT_JSON_IMAGE_FIELDS = ("images", "image", "image_url", "image_urls")
+
+# 上游只支持 6 张输入图; 多收一张用于区分"正好 6 张"和"超了"
+EDIT_MAX_INPUT_IMAGES = 6
+
+
+def _collect_json_image_refs(
+    payload: dict, max_items: int = EDIT_MAX_INPUT_IMAGES + 1
+) -> list[str]:
+    """从 JSON body 收集输入图引用 (http/https URL 或 data URL)。
+
+    兼容各家客户端的写法:
+      images: [{"image_url": "..."}] | ["..."]
+      image:  "..." | ["..."] | {"url": "..."}
+      image_url: "..."
+
+    只取**第一个**有内容的字段: 有客户端会把同一张图同时塞进 image 和 images,
+    合并会重复上传、把 usage 里的 image_tokens 算多一倍。
+    """
+    for field in EDIT_JSON_IMAGE_FIELDS:
+        refs: list[str] = []
+
+        def _add(value: Any) -> None:
+            if len(refs) >= max_items:
+                return
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    refs.append(text)
+            elif isinstance(value, dict):
+                _add(value.get("image_url") or value.get("url"))
+            elif isinstance(value, list):
+                for item in value:
+                    _add(item)
+
+        _add(payload.get(field))
+        if refs:
+            return refs
+    return []
+
+
 def build_generation_router(
     *,
     store,
@@ -684,19 +726,6 @@ def build_generation_router(
     async def openai_edit(request: Request):
         require_service_api_key(request)
 
-        try:
-            form = await request.form()
-        except Exception:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": {
-                        "message": "invalid multipart/form-data body",
-                        "type": "invalid_request_error",
-                    }
-                },
-            )
-
         def _bad_request(message: str) -> JSONResponse:
             set_request_error_detail(
                 request,
@@ -715,54 +744,146 @@ def build_generation_router(
                 },
             )
 
-        prompt = str(form.get("prompt") or "").strip()
+        # 官方 SDK 走 multipart 上传文件, 但网关/脚本常直接发 JSON 带图片 URL,
+        # 两种 body 都要认 —— 只吃 multipart 会让 JSON 调用方拿到
+        # "prompt is required"(form 解析出空表单)这种驴唇不对马嘴的报错。
+        content_type = (
+            (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+        )
+        json_body: dict | None = None
+        form = None
+        if content_type == "application/json" or content_type.endswith("+json"):
+            try:
+                json_body = await request.json()
+            except Exception:
+                return _bad_request("invalid JSON body")
+            if not isinstance(json_body, dict):
+                return _bad_request("invalid JSON body")
+        else:
+            try:
+                form = await request.form()
+            except Exception:
+                return _bad_request("invalid multipart/form-data body")
+            # Content-Type 不是 form/multipart 时 Starlette 直接给空表单且不消费 body,
+            # 这里兜底按 JSON 再试一次(有客户端发 JSON 不带或带错 Content-Type)。
+            if not form:
+                try:
+                    json_body = await request.json()
+                except Exception:
+                    json_body = None
+                if isinstance(json_body, dict):
+                    form = None
+                else:
+                    json_body = None
+
+        def _field(name: str) -> Any:
+            return json_body.get(name) if json_body is not None else form.get(name)
+
+        raw_prompt = _field("prompt")
+        # multipart 的字段天然是字符串; JSON 里传成数组/对象要挡掉,
+        # 否则 str() 出来的 "['a', 'b']" 会被当成提示词发给上游烧额度。
+        if raw_prompt is not None and not isinstance(raw_prompt, (str, int, float)):
+            return _bad_request("prompt must be a string")
+        prompt = str(raw_prompt or "").strip()
         if not prompt:
             return _bad_request("prompt is required")
 
-        # OpenAI 各版 SDK 的图片字段名不统一: image / image[] / image[N]
-        image_key_re = re.compile(r"^image(\[\d*\])?$")
-        uploads = [
-            value
-            for key, value in form.multi_items()
-            if image_key_re.match(key) and hasattr(value, "read")
-        ]
-        if not uploads:
-            return _bad_request("image is required")
-        if len(uploads) > 6:
-            return _bad_request("at most 6 input images are supported")
-
         input_images: list[tuple[bytes, str]] = []
-        for upload in uploads:
-            image_bytes = await upload.read()
-            if not image_bytes:
-                return _bad_request("image file is empty")
-            if len(image_bytes) > 10 * 1024 * 1024:
-                return _bad_request("image too large, max 10MB")
-            input_images.append(
-                (image_bytes, normalize_image_mime(upload.content_type))
-            )
+        if json_body is not None:
+            image_refs = _collect_json_image_refs(json_body)
+            if not image_refs:
+                return _bad_request("image is required")
+            if len(image_refs) > EDIT_MAX_INPUT_IMAGES:
+                return _bad_request(
+                    f"at most {EDIT_MAX_INPUT_IMAGES} input images are supported"
+                )
+            # 复用 chat 路径的下载/data URL 解码/大小上限逻辑
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": ref}}
+                        for ref in image_refs
+                    ],
+                }
+            ]
+            try:
+                input_images = await run_in_threadpool(load_input_images, messages)
+            except HTTPException as exc:
+                # 图片拉不到(非 200)/超 10MB/协议不支持: 按原状态码回给客户端
+                return _openai_image_error_response(
+                    request,
+                    exc,
+                    endpoint="/v1/images/edits",
+                    model_label=str(_field("model") or ""),
+                )
+            except Exception:
+                # 超时/DNS/代理故障多半是本端出网问题: 回 503 让上游网关换号重试,
+                # 同时别把原始异常文本(含内网主机名)回给客户端。
+                logger.exception(
+                    "images.edits: input image fetch failed log_id=%s",
+                    getattr(request.state, "log_id", ""),
+                )
+                return _openai_image_error_response(
+                    request,
+                    upstream_temp_error_cls("failed to fetch input image"),
+                    endpoint="/v1/images/edits",
+                    model_label=str(_field("model") or ""),
+                )
+            if not input_images:
+                return _bad_request("image is required")
+        else:
+            # OpenAI 各版 SDK 的图片字段名不统一: image / image[] / image[N]
+            image_key_re = re.compile(r"^image(\[\d*\])?$")
+            uploads = [
+                value
+                for key, value in form.multi_items()
+                if image_key_re.match(key) and hasattr(value, "read")
+            ]
+            if not uploads:
+                return _bad_request("image is required")
+            if len(uploads) > EDIT_MAX_INPUT_IMAGES:
+                return _bad_request(
+                    f"at most {EDIT_MAX_INPUT_IMAGES} input images are supported"
+                )
 
-        if form.get("mask") is not None:
+            for upload in uploads:
+                image_bytes = await upload.read()
+                if not image_bytes:
+                    return _bad_request("image file is empty")
+                if len(image_bytes) > 10 * 1024 * 1024:
+                    return _bad_request("image too large, max 10MB")
+                input_images.append(
+                    (image_bytes, normalize_image_mime(upload.content_type))
+                )
+
+        if _field("mask") is not None:
             # Firefly 上游没有 mask 局部重绘能力: 接受该字段但整图编辑
             logger.info(
                 "images.edits: mask ignored (unsupported upstream) log_id=%s",
                 getattr(request.state, "log_id", ""),
             )
 
-        response_format = str(form.get("response_format") or "url").strip().lower()
+        # 与 /v1/images/generations 保持一致: 真实 gpt-image 默认返回 b64_json
+        # (不返回可访问 url), 客户端如 codex 会直接按 b64_json 解析;
+        # 同时避免把内网 /generated URL 透传给客户端。
+        # 显式 response_format=url 仍返回可访问链接(需正确配置 PUBLIC_BASE_URL)。
+        response_format = (
+            str(_field("response_format") or "b64_json").strip().lower()
+        )
         if response_format not in {"url", "b64_json"}:
             return _bad_request("response_format must be url or b64_json")
 
-        model_id = str(form.get("model") or "").strip() or None
+        model_id = str(_field("model") or "").strip() or None
         if model_id in video_model_catalog:
             return _bad_request("Use /v1/chat/completions for video generation")
 
         try:
             geometry = resolve_image_geometry(
                 {
-                    "size": form.get("size"),
-                    "quality": form.get("quality"),
-                    "aspect_ratio": form.get("aspect_ratio"),
+                    "size": _field("size"),
+                    "quality": _field("quality"),
+                    "aspect_ratio": _field("aspect_ratio"),
                 },
                 model_id,
                 input_images,
@@ -776,6 +897,7 @@ def build_generation_router(
                 request, exc, endpoint="/v1/images/edits", model_label=str(model_id)
             )
         # multipart body 不经过全局中间件的 JSON 字段提取,这里主动上报
+        # (JSON body 也一并上报,保证 model 用的是解析后的真实模型)
         set_request_logging_fields(request, resolved_model_id, prompt)
         set_request_credit_context(request, resolved_model_id, output_resolution)
 
