@@ -29,8 +29,57 @@ _GPT_IMAGE_OUTPUT_TOKENS = {
     "high":   {"square": 4160, "portrait": 6240, "landscape": 6208},
 }
 _RES_TO_QUALITY = {"1K": "low", "2K": "medium", "4K": "high"}
-# 每张输入图(图生图/改图)的估算 token(gpt-image 输入图约此量级)
-INPUT_IMAGE_TOKENS = 300
+# 输入图 token 按 OpenAI 官方 32px patch 公式逐张精确计算(gpt-image 系列实测一致):
+# 最长边 <1024 先按 min(2, 1024/最长边) 放大; patch 数 = ceil(w/32)*ceil(h/32);
+# 超过 1536 patch 按 sqrt(1536/patches) 等比缩小并以 0.99 步进收敛。
+# 下游(sub2api)对远程 URL 改图会采信这里的 image_tokens 明细, 不能再用写死的估算值。
+_INPUT_IMAGE_PATCH_LIMIT = 1536
+_INPUT_IMAGE_UPSCALE_TARGET = 1024
+# 图片字节读不出尺寸时的兜底(官方 1024x1024 的 patch 数, 最常见档)。
+# 正常流程走不到: 能被 Adobe 接受生成的图, PIL 均能读出尺寸。
+_INPUT_IMAGE_FALLBACK_TOKENS = 1024
+
+
+def input_image_tokens(width: int, height: int) -> int:
+    """OpenAI 官方输入图 32px patch 公式(与 gpt-image-2 官方直连/codex 实测点全部吻合)。"""
+    if width <= 0 or height <= 0:
+        return 0
+    w, h = float(width), float(height)
+    longest = max(w, h)
+    if longest < _INPUT_IMAGE_UPSCALE_TARGET:
+        factor = min(2.0, _INPUT_IMAGE_UPSCALE_TARGET / longest)
+        w *= factor
+        h *= factor
+    patches = math.ceil(w / 32) * math.ceil(h / 32)
+    if patches > _INPUT_IMAGE_PATCH_LIMIT:
+        factor = math.sqrt(_INPUT_IMAGE_PATCH_LIMIT / patches)
+        w *= factor
+        h *= factor
+        while math.ceil(w / 32) * math.ceil(h / 32) > _INPUT_IMAGE_PATCH_LIMIT:
+            w *= 0.99
+            h *= 0.99
+        patches = math.ceil(w / 32) * math.ceil(h / 32)
+    return patches
+
+
+def _input_image_tokens_from_bytes(image_bytes: bytes) -> int:
+    """从图片字节读出尺寸并套 patch 公式; 读不出时用兜底值, 不让 usage 构造失败。"""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(image_bytes)) as image:
+                width, height = int(image.width), int(image.height)
+    except (
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+        OSError,
+        TypeError,
+        UnidentifiedImageError,
+        ValueError,
+    ):
+        return _INPUT_IMAGE_FALLBACK_TOKENS
+    tokens = input_image_tokens(width, height)
+    return tokens if tokens > 0 else _INPUT_IMAGE_FALLBACK_TOKENS
 
 
 def _orientation_of(ratio: str) -> str:
@@ -62,11 +111,11 @@ def build_image_usage(
     prompt: str,
     output_resolution: str,
     ratio: str = "1:1",
-    input_images: int = 0,
+    input_images: Sequence[tuple[bytes, str]] = (),
 ) -> dict:
     """按 OpenAI gpt-image-1 口径构造 usage(token 计费用)。
     输出图像 token = 表[质量档(由分辨率映射)][朝向(由比例映射)];
-    输入 = 提示词 token(CJK 感知) + 输入图 token(图生图/改图)。
+    输入 = 提示词 token(CJK 感知) + 输入图 token(按官方 32px patch 公式逐张精确计算)。
     字段结构对齐真实 gpt-image /v1/images/generations 返回: 仅 input/output
     命名(无 chat 的 prompt/completion 冗余),input/output_tokens_details 各含
     image_tokens 与 text_tokens。下游图像计费取 output_tokens_details.image_tokens。
@@ -76,7 +125,10 @@ def build_image_usage(
     img_out = _GPT_IMAGE_OUTPUT_TOKENS[quality][orient]
 
     text_in = _count_text_tokens(prompt)
-    img_in = max(0, int(input_images or 0)) * INPUT_IMAGE_TOKENS
+    img_in = sum(
+        _input_image_tokens_from_bytes(image_bytes)
+        for image_bytes, _mime in (input_images or ())
+    )
     input_tokens = text_in + img_in
 
     return {

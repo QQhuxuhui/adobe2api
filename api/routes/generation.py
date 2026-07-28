@@ -405,7 +405,7 @@ def build_generation_router(
                     # 该接口不上传输入图(client.generate 无 source_image_ids),
                     # 输入图 token 恒为 0,不按请求里未使用的图片字段虚计费
                     "usage": build_image_usage(
-                        prompt, output_resolution, usage_ratio, 0
+                        prompt, output_resolution, usage_ratio, ()
                     ),
                 }
 
@@ -690,7 +690,7 @@ def build_generation_router(
                 parsed.prompt,
                 output_resolution,
                 geometry.usage_ratio,
-                len(source_image_ids),
+                input_images,
             )
             return build_responses_image_response(
                 response_id=f"resp_{uuid.uuid4().hex}",
@@ -952,7 +952,7 @@ def build_generation_router(
                         prompt,
                         output_resolution,
                         geometry.usage_ratio,
-                        len(source_image_ids),
+                        input_images,
                     ),
                 }
 
@@ -1491,8 +1491,9 @@ def build_generation_router(
                             "finish_reason": "stop",
                         }
                     ],
-                    # 输入图按实际上传给上游的张数计费(最后一条 user 消息、
-                    # 最多 6 张),而非请求里出现的所有图片字段
+                    # 输入图只计实际上传给上游的那些(两个分支都按序上传
+                    # input_images 前缀: 图像分支全量、视频分支截断到
+                    # max_video_inputs),而非请求里出现的所有图片字段
                     "usage": build_image_usage(
                         prompt,
                         output_resolution,
@@ -1501,7 +1502,7 @@ def build_generation_router(
                             if image_geometry is not None
                             else ratio
                         ),
-                        len(source_image_ids),
+                        input_images[: len(source_image_ids)],
                     ),
                 }
                 if bool(data.get("stream", False)):

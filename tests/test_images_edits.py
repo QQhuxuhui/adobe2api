@@ -153,8 +153,8 @@ def test_edits_happy_path_defaults_to_b64_json(tmp_path: Path):
     # (codex 等客户端硬解 b64_json, 拿到 url 会报 missing field b64_json)
     assert "url" not in body["data"][0]
     assert base64.b64decode(body["data"][0]["b64_json"]) == b"edited-image-bytes"
-    # 输入图 token 计入 usage
-    assert body["usage"]["input_tokens_details"]["image_tokens"] == 300
+    # 输入图 token 按官方 patch 公式计入 usage: 1536x1024 → 48*32 = 1536
+    assert body["usage"]["input_tokens_details"]["image_tokens"] == 1536
     assert credit_contexts == [("gpt-image-2", "2K")]
     assert logging_fields == [("gpt-image-2", "make it night")]
     assert adobe.uploads == [("token-value", image, "image/png")]
@@ -180,7 +180,8 @@ def test_edits_accepts_bracket_field_name_and_multiple_images(tmp_path: Path):
     assert response.status_code == 200, response.text
     assert adobe.generate_kwargs["source_image_ids"] == ["img-1", "img-2"]
     body = response.json()
-    assert body["usage"]["input_tokens_details"]["image_tokens"] == 600
+    # 1200x800 → ceil(1200/32)*ceil(800/32) = 38*25 = 950, 竖版对称同值, 求和 1900
+    assert body["usage"]["input_tokens_details"]["image_tokens"] == 1900
 
 
 def test_edits_free_uses_first_image_ratio_for_gpt_image(tmp_path: Path):
@@ -536,7 +537,8 @@ def test_edits_json_body_does_not_duplicate_images_across_fields(tmp_path: Path)
 
     assert response.status_code == 200, response.text
     assert adobe.generate_kwargs["source_image_ids"] == ["img-1"]
-    assert response.json()["usage"]["input_tokens_details"]["image_tokens"] == 300
+    # 只上传一次 → 只计一张: 1024x1024 → 32*32 = 1024
+    assert response.json()["usage"]["input_tokens_details"]["image_tokens"] == 1024
 
 
 def test_edits_json_body_without_content_type_header(tmp_path: Path):
