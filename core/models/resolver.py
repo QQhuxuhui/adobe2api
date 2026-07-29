@@ -16,7 +16,7 @@ from .catalog import (
     MODEL_CATALOG,
     SUPPORTED_RATIOS,
 )
-from .payloads import size_from_dimensions
+from .payloads import gpt_image_pixels_from_ratio, size_from_dimensions
 
 
 # OpenAI gpt-image-1 官方"输出图像 token"表: [质量档][朝向]。
@@ -199,6 +199,51 @@ def resolution_from_size(size: str) -> Optional[str]:
     if m <= 2048:
         return "2K"
     return "4K"
+
+
+_RESOLUTION_LADDER = ("1K", "2K", "4K")
+
+
+def _parse_size_dimensions(size: object) -> Optional[tuple[int, int]]:
+    """解析 "WxH" 形式的 size；解析不出来返回 None。"""
+    text = str(size or "").strip().lower()
+    if "x" not in text:
+        return None
+    try:
+        width, height = (int(v) for v in text.split("x")[:2])
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def prevent_gpt_image_downscale(
+    size: object, ratio: str, output_resolution: str
+) -> str:
+    """显式 size 是交付下界：若当前档位出的图比请求的还小，逐级抬档。
+
+    背景：quality 直接决定档位(low→1K)，而 size 只用来定比例。于是
+    `2048x2048 + quality=low` 会交付 1024x1024 —— 客户明确要 2K 却拿到 1K。
+    官方语义里 size 与 quality 正交(实测 2048x2048+low 返回 2048x2048)，
+    这里至少保证不缩水；反向的超额交付(1024x1024+high 给 4K)保持不变。
+    """
+    requested = _parse_size_dimensions(size)
+    if requested is None:
+        return output_resolution
+    level = str(output_resolution or "").upper()
+    if level not in _RESOLUTION_LADDER:
+        return output_resolution
+    req_w, req_h = requested
+    index = _RESOLUTION_LADDER.index(level)
+    while index < len(_RESOLUTION_LADDER) - 1:
+        pixels = gpt_image_pixels_from_ratio(ratio, _RESOLUTION_LADDER[index])
+        if pixels is None:
+            return output_resolution
+        if pixels["width"] >= req_w and pixels["height"] >= req_h:
+            break
+        index += 1
+    return _RESOLUTION_LADDER[index]
 
 
 @dataclass(frozen=True)
@@ -403,6 +448,11 @@ def resolve_image_geometry(
         resolved_ratio = ResolvedAspectRatio(nearest, nearest, None)
     else:
         resolved_ratio = ResolvedAspectRatio("1:1", "1:1", None)
+
+    if str(model_conf.get("upstream_model_id") or "").strip().lower() == "gpt-image":
+        output_resolution = prevent_gpt_image_downscale(
+            requested_size, resolved_ratio.aspect_ratio, output_resolution
+        )
 
     return ResolvedImageGeometry(
         aspect_ratio=resolved_ratio.aspect_ratio,
