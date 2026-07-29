@@ -10,6 +10,7 @@ def make_payload(
     status_code: int = 200,
     preview_kind: str = "image",
     credits_used: float | None = None,
+    model: str | None = None,
 ) -> dict:
     return {
         "id": item_id,
@@ -21,6 +22,7 @@ def make_payload(
         "operation": "images.generations",
         "preview_kind": preview_kind,
         "credits_used": credits_used,
+        "model": model,
     }
 
 
@@ -65,6 +67,49 @@ def test_stats_counts_only_the_latest_payload_for_each_log_id(tmp_path: Path):
     assert stats["failed_requests"] == 0
     assert stats["generated_images"] == 1
     assert stats["generated_videos"] == 1
+
+
+def test_list_filters_and_paginates_by_model(tmp_path: Path):
+    store = RequestLogStore(tmp_path / "request_logs.jsonl")
+    store.add_payload(make_payload("a", ts=10, model="firefly-v3"))
+    store.add_payload(make_payload("b", ts=20, model="veo-3"))
+    store.add_payload(make_payload("c", ts=30, model="Firefly-V3"))
+    store.add_payload(make_payload("d", ts=40))
+
+    rows, total = store.list(limit=20, page=1, model="firefly-v3")
+
+    assert total == 2
+    assert [row["id"] for row in rows] == ["c", "a"]
+
+    second_page, second_total = store.list(limit=1, page=2, model="firefly-v3")
+
+    assert second_total == 2
+    assert [row["id"] for row in second_page] == ["a"]
+
+    all_rows, all_total = store.list(limit=20, page=1, model="  ")
+
+    assert all_total == 4
+    assert len(all_rows) == 4
+
+
+def test_stats_and_models_respect_model_filter(tmp_path: Path):
+    store = RequestLogStore(tmp_path / "request_logs.jsonl")
+    store.add_payload(make_payload("a", ts=10, model="firefly-v3"))
+    store.add_payload(
+        make_payload("b", ts=20, model="veo-3", preview_kind="video")
+    )
+    store.add_payload(
+        make_payload("c", ts=30, model="veo-3", status_code=500)
+    )
+    store.add_payload(make_payload("d", ts=40))
+
+    stats = store.stats(model="veo-3")
+
+    assert stats["total_requests"] == 2
+    assert stats["failed_requests"] == 1
+    assert stats["generated_images"] == 0
+    assert stats["generated_videos"] == 1
+    assert store.models() == ["firefly-v3", "veo-3"]
 
 
 def test_truncation_retains_max_items_unique_logs_after_backfills(tmp_path: Path):

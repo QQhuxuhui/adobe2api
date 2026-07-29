@@ -185,11 +185,39 @@ class RequestLogStore:
         ordered = sorted(latest.values(), key=sort_key, reverse=True)
         return [item for _, item in ordered]
 
-    def list(self, limit: int = 20, page: int = 1) -> tuple[list[dict], int]:
+    @staticmethod
+    def _normalize_model(value) -> str:
+        return str(value or "").strip().lower()
+
+    @classmethod
+    def _matches_model(cls, item: dict, model: Optional[str]) -> bool:
+        target = cls._normalize_model(model)
+        if not target:
+            return True
+        return cls._normalize_model(item.get("model")) == target
+
+    def models(self) -> list[str]:
+        with self._lock:
+            rows = self._read_latest_locked()
+        seen: dict[str, str] = {}
+        for item in rows:
+            name = str(item.get("model") or "").strip()
+            if not name:
+                continue
+            seen.setdefault(name.lower(), name)
+        return sorted(seen.values(), key=lambda x: x.lower())
+
+    def list(
+        self,
+        limit: int = 20,
+        page: int = 1,
+        model: Optional[str] = None,
+    ) -> tuple[list[dict], int]:
         safe_limit = min(max(int(limit or 20), 1), 100)
         safe_page = max(int(page or 1), 1)
         with self._lock:
             rows = self._read_latest_locked()
+        rows = [item for item in rows if self._matches_model(item, model)]
         total = len(rows)
         if total <= 0:
             return [], 0
@@ -203,6 +231,7 @@ class RequestLogStore:
         self,
         start_ts: Optional[float] = None,
         end_ts: Optional[float] = None,
+        model: Optional[str] = None,
     ) -> dict:
         total_requests = 0
         failed_requests = 0
@@ -214,6 +243,8 @@ class RequestLogStore:
             rows = self._read_latest_locked()
 
         for item in rows:
+            if not self._matches_model(item, model):
+                continue
             try:
                 ts_val = float(item.get("ts") or 0)
             except Exception:
@@ -365,18 +396,28 @@ class LiveRequestStore:
         with self._lock:
             self._items.pop(iid, None)
 
-    def list(self, limit: int = 200) -> list[dict]:
+    @staticmethod
+    def _matches_model(item: dict, model: Optional[str]) -> bool:
+        target = str(model or "").strip().lower()
+        if not target:
+            return True
+        return str((item or {}).get("model") or "").strip().lower() == target
+
+    def list(self, limit: int = 200, model: Optional[str] = None) -> list[dict]:
         safe_limit = min(max(int(limit or 200), 1), 1000)
         with self._lock:
             data = list(self._items.values())
+        data = [item for item in data if self._matches_model(item, model)]
         data.sort(key=lambda x: float((x or {}).get("ts") or 0), reverse=True)
         return data[:safe_limit]
 
-    def count_in_progress(self) -> int:
+    def count_in_progress(self, model: Optional[str] = None) -> int:
         with self._lock:
             vals = list(self._items.values())
         total = 0
         for item in vals:
+            if not self._matches_model(item, model):
+                continue
             status = str((item or {}).get("task_status") or "").upper()
             if status == "IN_PROGRESS":
                 total += 1

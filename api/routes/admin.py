@@ -143,9 +143,12 @@ def build_admin_router(
         return FileResponse(static_dir / "admin.html")
 
     @router.get("/api/v1/logs")
-    def list_logs(request: Request, limit: int = 20, page: int = 1):
+    def list_logs(
+        request: Request, limit: int = 20, page: int = 1, model: str = ""
+    ):
         require_admin_auth(request)
-        logs, total = log_store.list(limit=limit, page=page)
+        model_filter = str(model or "").strip()
+        logs, total = log_store.list(limit=limit, page=page, model=model_filter)
         safe_limit = min(max(int(limit or 20), 1), 100)
         safe_page = max(int(page or 1), 1)
         total_pages = (total + safe_limit - 1) // safe_limit if total > 0 else 1
@@ -157,7 +160,13 @@ def build_admin_router(
             "limit": safe_limit,
             "total": total,
             "total_pages": total_pages,
+            "model": model_filter,
         }
+
+    @router.get("/api/v1/logs/models")
+    def list_log_models(request: Request):
+        require_admin_auth(request)
+        return {"models": log_store.models()}
 
     @router.get("/api/v1/logs/errors/{code}")
     def get_error_detail(code: str, request: Request):
@@ -168,9 +177,9 @@ def build_admin_router(
         return item
 
     @router.get("/api/v1/logs/running")
-    def list_running_logs(request: Request, limit: int = 200):
+    def list_running_logs(request: Request, limit: int = 200, model: str = ""):
         require_admin_auth(request)
-        rows = live_log_store.list(limit=limit)
+        rows = live_log_store.list(limit=limit, model=str(model or "").strip())
         items = []
         for item in rows:
             if not isinstance(item, dict):
@@ -198,12 +207,24 @@ def build_admin_router(
         return key, start_dt.timestamp(), now_ts
 
     @router.get("/api/v1/logs/stats")
-    def logs_stats(request: Request, range: str = "today"):
+    def logs_stats(request: Request, range: str = "today", model: str = ""):
         require_admin_auth(request)
         range_key, start_ts, end_ts = _resolve_logs_stats_range(range)
-        payload = log_store.stats(start_ts=start_ts, end_ts=end_ts)
-        payload["in_progress_requests"] = live_log_store.count_in_progress()
-        payload.update({"range": range_key, "start_ts": start_ts, "end_ts": end_ts})
+        model_filter = str(model or "").strip()
+        payload = log_store.stats(
+            start_ts=start_ts, end_ts=end_ts, model=model_filter
+        )
+        payload["in_progress_requests"] = live_log_store.count_in_progress(
+            model=model_filter
+        )
+        payload.update(
+            {
+                "range": range_key,
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "model": model_filter,
+            }
+        )
         return payload
 
     @router.delete("/api/v1/logs")

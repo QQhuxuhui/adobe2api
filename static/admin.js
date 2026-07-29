@@ -944,6 +944,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const refreshLogsBtn = document.getElementById("refreshLogsBtn");
   const clearLogsBtn = document.getElementById("clearLogsBtn");
   const logStatsRange = document.getElementById("logStatsRange");
+  const logModelFilter = document.getElementById("logModelFilter");
   const logStatsUpdatedAt = document.getElementById("logStatsUpdatedAt");
   const logsStatsImageCount = document.getElementById("logsStatsImageCount");
   const logsStatsVideoCount = document.getElementById("logsStatsVideoCount");
@@ -965,6 +966,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   let logsCurrentPage = 1;
   let logsTotalPages = 1;
   let logsRunningTotal = 0;
+  let logsModelFilter = "";
 
   function switchConfigPane(targetId) {
     if (!targetId) return;
@@ -1511,11 +1513,18 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (!logsTbody) return;
     try {
       const rangeValue = logStatsRange ? String(logStatsRange.value || "today") : "today";
-      const [runningResult, logsResult, statsResult] = await Promise.allSettled([
-        fetch("/api/v1/logs/running?limit=200"),
-        fetch(`/api/v1/logs?limit=${LOGS_PAGE_SIZE}&page=${logsCurrentPage}`),
-        fetch(`/api/v1/logs/stats?range=${encodeURIComponent(rangeValue)}`),
+      const modelParam = logsModelFilter ? `&model=${encodeURIComponent(logsModelFilter)}` : "";
+      const [runningResult, logsResult, statsResult, modelsResult] = await Promise.allSettled([
+        fetch(`/api/v1/logs/running?limit=200${modelParam}`),
+        fetch(`/api/v1/logs?limit=${LOGS_PAGE_SIZE}&page=${logsCurrentPage}${modelParam}`),
+        fetch(`/api/v1/logs/stats?range=${encodeURIComponent(rangeValue)}${modelParam}`),
+        fetch("/api/v1/logs/models"),
       ]);
+
+      if (modelsResult.status === "fulfilled" && modelsResult.value.ok) {
+        const modelsData = await modelsResult.value.json();
+        renderLogModelOptions(modelsData.models || []);
+      }
 
       let runningItems = [];
       if (runningResult.status === "fulfilled" && runningResult.value.ok) {
@@ -1548,6 +1557,36 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   }
 
+  function renderLogModelOptions(models) {
+    if (!logModelFilter) return;
+    const names = (Array.isArray(models) ? models : [])
+      .map((name) => String(name || "").trim())
+      .filter(Boolean);
+    // 保留当前筛选值，即使它已被日志轮转淘汰，避免选择被静默重置。
+    if (logsModelFilter && !names.some((name) => name === logsModelFilter)) {
+      names.push(logsModelFilter);
+      names.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+    }
+    const signature = names.join("\n");
+    if (logModelFilter.dataset.signature === signature) {
+      logModelFilter.value = logsModelFilter;
+      return;
+    }
+    logModelFilter.dataset.signature = signature;
+    logModelFilter.innerHTML = "";
+    const allOption = document.createElement("option");
+    allOption.value = "";
+    allOption.textContent = "全部模型";
+    logModelFilter.appendChild(allOption);
+    names.forEach((name) => {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      logModelFilter.appendChild(option);
+    });
+    logModelFilter.value = logsModelFilter;
+  }
+
   function renderLogStats(stats) {
     const imageCount = Number(stats?.generated_images || 0);
     const videoCount = Number(stats?.generated_videos || 0);
@@ -1568,7 +1607,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     const selectedLabel = logStatsRange?.selectedOptions?.[0]?.textContent || "当前范围";
     const endTs = Number(stats.end_ts || 0);
     const updatedText = endTs > 0 ? new Date(endTs * 1000).toLocaleString() : "-";
-    logStatsUpdatedAt.textContent = `${selectedLabel}统计，更新于 ${updatedText}`;
+    const modelLabel = logsModelFilter ? `，模型 ${logsModelFilter}` : "";
+    logStatsUpdatedAt.textContent = `${selectedLabel}统计${modelLabel}，更新于 ${updatedText}`;
   }
 
   function renderLogsPagination() {
@@ -1676,7 +1716,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     ];
 
     if (!allRows.length) {
-      logsTbody.innerHTML = `<tr><td colspan="9" class="empty-state">暂无请求日志</td></tr>`;
+      const emptyText = logsModelFilter
+        ? `暂无模型 ${escapeHtml(logsModelFilter)} 的请求日志`
+        : "暂无请求日志";
+      logsTbody.innerHTML = `<tr><td colspan="9" class="empty-state">${emptyText}</td></tr>`;
       return;
     }
 
@@ -1854,6 +1897,14 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
   }
 
+  if (logModelFilter) {
+    logModelFilter.addEventListener("change", () => {
+      logsModelFilter = String(logModelFilter.value || "").trim();
+      logsCurrentPage = 1;
+      loadLogs();
+    });
+  }
+
   if (logsPrevBtn) {
     logsPrevBtn.addEventListener("click", () => {
       if (logsCurrentPage <= 1) return;
@@ -1893,6 +1944,8 @@ document.addEventListener("DOMContentLoaded", async () => {
         const res = await fetch("/api/v1/logs", { method: "DELETE" });
         if (!res.ok) throw new Error("清空失败");
         logsCurrentPage = 1;
+        logsModelFilter = "";
+        if (logModelFilter) logModelFilter.value = "";
         loadLogs();
       } catch (err) {
         alert(err.message || "清空失败");
