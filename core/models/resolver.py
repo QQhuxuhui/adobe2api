@@ -107,6 +107,22 @@ def _count_text_tokens(text: str) -> int:
     return max(1, cjk + (len(s) - cjk) // 4)
 
 
+def _input_image_token_count(item: Sequence) -> int:
+    """条目为 (bytes, mime) 或 (bytes, mime, 原宽, 原高)。
+
+    带原始尺寸时按它算 —— 上传给 Firefly 的字节可能已被压缩，
+    但计费必须用客户提交的原图尺寸（与官方口径及 sub2api 侧本地计算一致）。
+    """
+    if len(item) >= 4:
+        try:
+            tokens = input_image_tokens(int(item[2]), int(item[3]))
+        except (TypeError, ValueError):
+            tokens = 0
+        if tokens > 0:
+            return tokens
+    return _input_image_tokens_from_bytes(item[0])
+
+
 def build_image_usage(
     prompt: str,
     output_resolution: str,
@@ -115,7 +131,8 @@ def build_image_usage(
 ) -> dict:
     """按 OpenAI gpt-image-1 口径构造 usage(token 计费用)。
     输出图像 token = 表[质量档(由分辨率映射)][朝向(由比例映射)];
-    输入 = 提示词 token(CJK 感知) + 输入图 token(按官方 32px patch 公式逐张精确计算)。
+    输入 = 提示词 token(CJK 感知) + 输入图 token(按官方 32px patch 公式逐张精确计算,
+    条目带原始尺寸时用原图尺寸算, 不受上传前压缩影响)。
     字段结构对齐真实 gpt-image /v1/images/generations 返回: 仅 input/output
     命名(无 chat 的 prompt/completion 冗余),input/output_tokens_details 各含
     image_tokens 与 text_tokens。下游图像计费取 output_tokens_details.image_tokens。
@@ -125,10 +142,7 @@ def build_image_usage(
     img_out = _GPT_IMAGE_OUTPUT_TOKENS[quality][orient]
 
     text_in = _count_text_tokens(prompt)
-    img_in = sum(
-        _input_image_tokens_from_bytes(image_bytes)
-        for image_bytes, _mime in (input_images or ())
-    )
+    img_in = sum(_input_image_token_count(item) for item in (input_images or ()))
     input_tokens = text_in + img_in
 
     return {

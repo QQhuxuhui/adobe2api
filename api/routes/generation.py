@@ -22,6 +22,7 @@ from api.openai_responses import (
 from api.schemas import GenerateRequest
 from core.entity_store import entity_store
 from core.image_generation import generate_image_artifact
+from core.models.input_image import InputImageError, normalize_input_image
 from core.models.resolver import build_image_usage
 from core.models.video_resolver import VideoModelRequestError, resolve_video_model
 from core.stores import RequestLogRecord
@@ -652,7 +653,7 @@ def build_generation_router(
         def _run_once(token: str):
             source_image_ids = [
                 client.upload_image(token, image_bytes, image_mime)
-                for image_bytes, image_mime in input_images
+                for image_bytes, image_mime, *_ in input_images
             ]
 
             def _image_progress_cb(update: dict):
@@ -851,11 +852,14 @@ def build_generation_router(
                 image_bytes = await upload.read()
                 if not image_bytes:
                     return _bad_request("image file is empty")
-                if len(image_bytes) > 10 * 1024 * 1024:
-                    return _bad_request("image too large, max 10MB")
-                input_images.append(
-                    (image_bytes, normalize_image_mime(upload.content_type))
-                )
+                try:
+                    upload_bytes, upload_mime, width, height = await run_in_threadpool(
+                        normalize_input_image, image_bytes, upload.content_type
+                    )
+                except InputImageError as exc:
+                    return _bad_request(str(exc))
+                # 第 3、4 位是客户提交的原始尺寸: 上传字节可能已压缩，usage 按原图算。
+                input_images.append((upload_bytes, upload_mime, width, height))
 
         if _field("mask") is not None:
             # Firefly 上游没有 mask 局部重绘能力: 接受该字段但整图编辑
@@ -909,7 +913,7 @@ def build_generation_router(
             def _run_once(token: str):
                 source_image_ids = [
                     client.upload_image(token, image_bytes, image_mime)
-                    for image_bytes, image_mime in input_images
+                    for image_bytes, image_mime, *_ in input_images
                 ]
 
                 def _image_progress_cb(update: dict):
@@ -1385,7 +1389,7 @@ def build_generation_router(
                             status_code=400,
                             detail=f"video model supports at most {max_video_inputs} input image(s)",
                         )
-                    for image_bytes, _image_mime in input_images[:max_video_inputs]:
+                    for image_bytes, _image_mime, *_ in input_images[:max_video_inputs]:
                         prepared_bytes, prepared_mime = prepare_video_source_image(
                             image_bytes,
                             ratio,
@@ -1439,7 +1443,7 @@ def build_generation_router(
                         f"```html\n<video src='{image_url}' controls></video>\n```"
                     )
                 else:
-                    for image_bytes, image_mime in input_images:
+                    for image_bytes, image_mime, *_ in input_images:
                         source_image_ids.append(
                             client.upload_image(
                                 token, image_bytes, image_mime or "image/jpeg"

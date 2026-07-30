@@ -56,6 +56,7 @@ from core.video_tasks import (
     VideoTaskStore,
     build_video_task_runner,
 )
+from core.models.input_image import InputImageError, normalize_input_image
 from core.models import (
     MODEL_CATALOG,
     SUPPORTED_RATIOS,
@@ -1304,10 +1305,16 @@ def _load_input_images(messages) -> list[tuple[bytes, str]]:
 
         if not image_bytes:
             raise HTTPException(status_code=400, detail="image_url is empty")
-        if len(image_bytes) > 10 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="image too large, max 10MB")
+        try:
+            upload_bytes, upload_mime, width, height = normalize_input_image(
+                image_bytes, mime_type
+            )
+        except InputImageError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
-        loaded.append((image_bytes, _normalize_image_mime(mime_type)))
+        # 第 3、4 位是客户提交的原始尺寸: 上传字节可能已被压缩到 Firefly 的
+        # 10MB 包络内, 但 usage 必须按原图算。
+        loaded.append((upload_bytes, upload_mime, width, height))
 
     return loaded
 

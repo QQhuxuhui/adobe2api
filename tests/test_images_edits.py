@@ -238,7 +238,9 @@ def test_edits_free_rejects_unreadable_first_image(tmp_path: Path):
     )
 
     assert response.status_code == 400
-    assert "first input image" in response.json()["error"]["message"]
+    # 归一化阶段就会解码每张图，坏图在这里被拦下（早于 free 比例解析，
+    # 文案也不再限定"第一张"）。
+    assert "cannot be decoded" in response.json()["error"]["message"]
     assert adobe.uploads == []
 
 
