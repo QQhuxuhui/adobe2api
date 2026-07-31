@@ -801,9 +801,243 @@ git commit -m "feat(route): /v1/images/generations 支持 Leonardo 模型出图"
 
 ---
 
+### Task 5: 修复 — 轮询期失败与单发失败一律不可重试（retry 安全收口）
+
+> 触发：全量 review（opus）确认的 Important 缺陷 —— `wait_for_completion` 轮询期间抛的
+> `LeonardoError`（只读查询 3 次传输重试耗尽 / GraphQL errors）未转 `LeonardoGenerationError`，
+> 在 `_map_leonardo_error` 里落进 `UpstreamTemporaryError`（可重试）→ 换号重发 `Generate`
+> → **重复扣费**。同族隐患：`_http_gql` 单发（Generate）传输失败 / HTTP 错误也映射成可重试，
+> 但服务端可能已受理（响应丢失），重发同样重复扣费。
+
+**Files:**
+- Modify: `core/leonardo_client.py`（新增 `LeonardoRetryUnsafeError`；`_http_gql` 单发失败改抛它）
+- Modify: `core/leonardo_generation.py`（`wait_for_completion` 调用包 `try/except`，任何 `LeonardoError` → `LeonardoGenerationError`）
+- Modify: `api/routes/generation.py`（`_map_leonardo_error` 识别 `LeonardoRetryUnsafeError` → `AdobeRequestError`）
+- Test: `tests/test_leonardo_client.py`、`tests/test_leonardo_generation.py`、`tests/test_leonardo_route.py`（各追加）
+
+**Interfaces:**
+- 新增 `LeonardoRetryUnsafeError(LeonardoError)`：单发（非幂等）请求失败且服务端可能已受理——**禁止自动重试**。
+- `_http_gql`：`attempts == 1` 的单发操作（`Generate`），传输异常耗尽或 HTTP 非 2xx → 抛 `LeonardoRetryUnsafeError`；`attempts > 1` 的只读查询仍抛普通 `LeonardoError`（读安全，但路由层由 Task 5 的 `generate_images` 转换兜底，不再可重试）。
+- `generate_images`：`create_generation` 成功之后、`wait_for_completion` 抛出的任何 `LeonardoError`（轮询/取图传输耗尽、GraphQL errors）→ 转 `LeonardoGenerationError`。`create_generation` 本身抛的异常原样透传（`_call` 的 GraphQL 拒绝=服务端未受理，可重试；`LeonardoRetryUnsafeError`=可能已受理，由映射层判不可重试）。
+- `_map_leonardo_error`：`LeonardoGenerationError` 或 `LeonardoRetryUnsafeError` → `AdobeRequestError`（500，非重试）。
+
+**注意（先读）**：
+- `tests/test_leonardo_client.py` 顶部已是 `import core.leonardo_client as lc` + `from core.leonardo_client import (...)`，新用例直接用 `lc.LeonardoRetryUnsafeError`，无需改 import 区。
+- `_http_gql` 修改时保持 `attempts` 逻辑不变：只改**分支类型**，不改重试次数/退避。
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_leonardo_client.py （追加到文件末尾）
+def test_http_gql_single_shot_transport_raises_retry_unsafe(monkeypatch):
+    """单发(Generate)传输失败 → LeonardoRetryUnsafeError，禁止自动重试。"""
+    calls = {"n": 0}
+    monkeypatch.setattr(lc.time, "sleep", lambda _s: None)
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["n"] += 1
+        raise lc.requests.exceptions.ConnectionError("connection lost")
+
+    monkeypatch.setattr(lc.requests, "post", fake_post)
+    payload = {
+        "operationName": "Generate",
+        "query": "mutation Generate { generate { generationId } }",
+    }
+    with pytest.raises(
+        lc.LeonardoRetryUnsafeError, match="not retried to avoid duplicate side effects"
+    ):
+        lc.LeonardoClient()._http_gql("TOK", payload)
+    assert calls["n"] == 1
+
+
+def test_http_gql_retryable_op_transport_exhaustion_is_plain_error(monkeypatch):
+    """只读查询传输耗尽 → 仍抛普通 LeonardoError（不可重试语义只在单发场景）。"""
+    calls = {"n": 0}
+    monkeypatch.setattr(lc.time, "sleep", lambda _s: None)
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["n"] += 1
+        raise lc.requests.exceptions.ConnectionError("down")
+
+    monkeypatch.setattr(lc.requests, "post", fake_post)
+    with pytest.raises(lc.LeonardoError) as excinfo:
+        lc.LeonardoClient()._http_gql("TOK", lc.TOKEN_BALANCE_QUERY)
+    assert not isinstance(excinfo.value, lc.LeonardoRetryUnsafeError)
+    assert calls["n"] == 3
+
+
+def test_http_gql_single_shot_http_error_is_retry_unsafe(monkeypatch):
+    """单发操作 HTTP 错误也可能已生效 → LeonardoRetryUnsafeError。"""
+    class _R:
+        ok = False
+        status_code = 500
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _R()
+
+    monkeypatch.setattr(lc.requests, "post", fake_post)
+    payload = {
+        "operationName": "Generate",
+        "query": "mutation Generate { generate { generationId } }",
+    }
+    with pytest.raises(lc.LeonardoRetryUnsafeError, match="graphql HTTP 500"):
+        lc.LeonardoClient()._http_gql("TOK", payload)
+```
+
+```python
+# tests/test_leonardo_generation.py （追加到文件末尾）
+def test_generate_images_converts_wait_poll_raise_to_generation_error():
+    """wait_for_completion 内轮询抛的 LeonardoError(mutation 已提交)必须转为不可重试。"""
+    from core.leonardo_generation import LeonardoGenerationError, generate_images
+
+    class _FakeClient:
+        def create_generation(self, token, prompt, model_id, aspect_ratio, quantity=1):
+            return "gen-1"
+
+        def wait_for_completion(self, token, gen_id, *, timeout, poll_interval):
+            # 轮询查询 3 次传输重试耗尽; mutation 已提交, 不得换号重发
+            raise LeonardoError(
+                "graphql GetAIGenerationFeedStatuses failed after 3 attempts: connection reset"
+            )
+
+    with pytest.raises(LeonardoGenerationError) as excinfo:
+        generate_images(_FakeClient(), "tok", prompt="p", model_id="m", timeout=5)
+    assert isinstance(excinfo.value, LeonardoError)
+
+
+def test_generate_images_passes_create_transport_unsafe_error_through():
+    """create_generation 的单发传输失败(可能已受理)原样透传 LeonardoRetryUnsafeError。"""
+    from core.leonardo_client import LeonardoRetryUnsafeError
+    from core.leonardo_generation import generate_images
+
+    class _FakeClient:
+        def create_generation(self, token, prompt, model_id, aspect_ratio, quantity=1):
+            raise LeonardoRetryUnsafeError(
+                "graphql Generate failed; request not retried to avoid duplicate side effects: connection lost"
+            )
+
+        def wait_for_completion(self, token, gen_id, *, timeout, poll_interval):
+            return {"success": True, "images": []}
+
+    with pytest.raises(LeonardoRetryUnsafeError):
+        generate_images(_FakeClient(), "tok", prompt="p", model_id="m", timeout=5)
+```
+
+```python
+# tests/test_leonardo_route.py （追加到文件末尾；文件已 import _map_leonardo_error、AdobeRequestError）
+def test_retry_unsafe_error_maps_to_non_retryable():
+    from core.leonardo_client import LeonardoRetryUnsafeError
+    mapped = _map_leonardo_error(
+        LeonardoRetryUnsafeError(
+            "graphql Generate failed; request not retried to avoid duplicate side effects: connection lost"
+        )
+    )
+    assert isinstance(mapped, AdobeRequestError)
+
+
+def test_generate_poll_error_now_maps_non_retryable_via_generation_error():
+    """轮询期错误经 generate_images 转 LeonardoGenerationError 后 → 非重试。"""
+    from core.leonardo_generation import LeonardoGenerationError
+    mapped = _map_leonardo_error(
+        LeonardoGenerationError(
+            "graphql GetAIGenerationFeedStatuses failed after 3 attempts: connection reset"
+        )
+    )
+    assert isinstance(mapped, AdobeRequestError)
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `python -m pytest tests/test_leonardo_client.py -k "retry_unsafe or plain_error" tests/test_leonardo_generation.py -k "generation_error or transport_unsafe" tests/test_leonardo_route.py -k "retry_unsafe or generation_error" -v`
+Expected: 7 FAIL —— `LeonardoRetryUnsafeError` 不存在（ImportError），`generate_images` 不转换轮询期 `LeonardoError`，`_map_leonardo_error` 不识别新类型。
+
+- [ ] **Step 3: Write minimal implementation**
+
+(a) `core/leonardo_client.py`，在 `class LeonardoError` 之后加：
+
+```python
+class LeonardoRetryUnsafeError(LeonardoError):
+    """单发(非幂等)请求失败且服务端可能已受理：禁止自动重试，避免重复扣费。"""
+```
+
+(b) `core/leonardo_client.py` 的 `_http_gql`，传输异常分支改为：
+
+```python
+            except requests.exceptions.RequestException as exc:
+                if attempt < attempts - 1:
+                    time.sleep(_RETRY_BACKOFF)
+                    continue
+                if attempts > 1:
+                    message = f"graphql {operation} failed after {attempts} attempts: {exc}"
+                    raise LeonardoError(message) from exc
+                # 单发(非幂等, 如 Generate)传输失败: 服务端可能已接受 → 禁止重试
+                message = (
+                    f"graphql {operation or 'request'} failed; request not retried "
+                    f"to avoid duplicate side effects: {exc}"
+                )
+                raise LeonardoRetryUnsafeError(message) from exc
+            if not resp.ok:
+                if attempts == 1:
+                    # 单发操作 HTTP 错误也可能已生效 → 禁止重试
+                    raise LeonardoRetryUnsafeError(f"graphql HTTP {resp.status_code}")
+                raise LeonardoError(f"graphql HTTP {resp.status_code}")
+            return resp.json()
+```
+
+(c) `core/leonardo_generation.py`，`generate_images` 的 `wait_for_completion` 调用改为：
+
+```python
+    gen_id = client.create_generation(
+        token, prompt, model_id, aspect, quantity=quantity
+    )
+    try:
+        result = client.wait_for_completion(
+            token, gen_id, timeout=timeout, poll_interval=poll_interval
+        )
+    except LeonardoError as exc:
+        # mutation 已提交: 轮询/取图期间任何失败(含传输耗尽的 LeonardoError)
+        # 都不得换号重发, 统一转 LeonardoGenerationError(不可重试)
+        raise LeonardoGenerationError(str(exc)) from exc
+    if not result.get("success"):
+        raise LeonardoGenerationError(str(result.get("error") or "generation failed"))
+```
+
+(d) `api/routes/generation.py` 的 `_map_leonardo_error`，首两个分支合并为：
+
+```python
+    from core.leonardo_client import LeonardoRetryUnsafeError
+    from core.leonardo_generation import LeonardoGenerationError
+
+    if isinstance(exc, (LeonardoGenerationError, LeonardoRetryUnsafeError)):
+        # 已提交后失败 / 单发可能已受理: 换号重试会重复扣费 → 非重试 500
+        return AdobeRequestError(str(exc))
+    message = str(exc).lower()
+    ...
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `python -m pytest tests/test_leonardo_client.py tests/test_leonardo_generation.py tests/test_leonardo_route.py -v`
+Expected: 全部 PASS（三个文件，含新增 7 + 原有）。
+
+- [ ] **Step 5: Run the full regression suite**
+
+Run: `python -m pytest -q`
+Expected: 全量 PASS（695 + 7 = ~702）。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add core/leonardo_client.py core/leonardo_generation.py api/routes/generation.py tests/test_leonardo_client.py tests/test_leonardo_generation.py tests/test_leonardo_route.py
+git commit -m "fix(leonardo): 轮询期失败与单发失败一律不可重试(防重复扣费)" \
+  -m "Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
+```
+
+---
+
 ## Self-Review
 
-- **Spec coverage**：4 个 task 覆盖完整集成链路——token 类型标注与按类型选号（含默认排除）→ 模型注册 → 已提交后失败异常细分（重试安全）→ 路由分叉与出图。Leonardo token 无 refresh profile → `handle_auth_failure` 自然 `report_invalid`，不触发 Adobe cookie 刷新。
+- **Spec coverage**：5 个 task 覆盖完整集成链路——token 类型标注与按类型选号（含默认排除）→ 模型注册 → 已提交后失败异常细分（重试安全）→ 路由分叉与出图 → 轮询期/单发失败不可重试收口（Task 5，全量 review 触发的 Important 修复）。Leonardo token 无 refresh profile → `handle_auth_failure` 自然 `report_invalid`，不触发 Adobe cookie 刷新。
 - **重试安全（与「Generate 不重试」决策一致）**：`LeonardoGenerationError`（轮询超时/FAILED）与 CDN 下载失败都映射为非重试 `AdobeRequestError` → 500，绝不换号重发；只有提交前失败（invalid JWT/HTTP 错误/只读请求传输异常）才映射为可换号重试的类型。这正是实测烧钱得出的教训。
 - **不破坏既有**：`get_available()` 默认 `"adobe"` 使所有现有 Adobe 调用语义等价（现无 type 标注的 token 全被归入 adobe）；`_run_with_token_retries` 签名零改动；`build_generation_router` 新增可选参数默认 None；MODEL_CATALOG 新增条目不影响现有解析；`openai_generate` 只加 if/else 分叉，except 块与 Adobe `run_once` 原样保留。
 - **交叉污染防护**：Adobe 所有路由（含直接调 `get_available` 的 `api/generate` runner、entity.py、video_tasks.py）默认排除 leonardo，不会拿 Leonardo Bearer 打 Adobe Firefly 浪费重试/误标 invalid。
