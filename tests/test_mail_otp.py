@@ -116,3 +116,58 @@ def test_fetch_skips_messages_at_or_before_since_ts():
 
     future = 4102444800.0  # 2100-01-01
     assert fetch_latest_canva_otp("AT", since_ts=future, http_get=fake_get) is None
+
+
+from core.mail_otp import get_otp
+
+
+def test_get_otp_rotates_token_and_polls_until_found():
+    rotated = []
+    fetch_calls = {"n": 0}
+
+    def fake_post(url, data=None, timeout=None):
+        return _FakeResp(200, {"access_token": "AT", "refresh_token": "NEW_RT"})
+
+    def fake_get(url, headers=None, timeout=None):
+        fetch_calls["n"] += 1
+        if fetch_calls["n"] < 2:
+            return _FakeResp(200, {"value": []})           # 第一次：还没到验证码
+        return _FakeResp(200, {"value": [
+            {"from": {"emailAddress": {"address": "noreply@canva.com"}},
+             "subject": "验证码是100581", "bodyPreview": "",
+             "receivedDateTime": "2026-07-30T14:47:00Z"},
+        ]})
+
+    ticks = iter([0.0, 1.0, 2.0, 3.0, 4.0])
+
+    otp, refresh = get_otp(
+        "CID", "OLD_RT",
+        on_rotate=rotated.append,
+        poll_interval=1, timeout=60,
+        http_post=fake_post, http_get=fake_get,
+        sleep=lambda _s: None,
+        now=lambda: next(ticks),
+    )
+    assert otp == "100581"
+    assert refresh == "NEW_RT"
+    assert rotated == ["NEW_RT"]        # 轮换回调被调用
+    assert fetch_calls["n"] == 2        # 轮询了两次
+
+
+def test_get_otp_raises_on_timeout():
+    def fake_post(url, data=None, timeout=None):
+        return _FakeResp(200, {"access_token": "AT", "refresh_token": "OLD_RT"})
+
+    def fake_get(url, headers=None, timeout=None):
+        return _FakeResp(200, {"value": []})
+
+    ticks = iter([0.0, 100.0, 200.0])
+
+    with pytest.raises(MailOTPError):
+        get_otp(
+            "CID", "OLD_RT",
+            poll_interval=1, timeout=30,
+            http_post=fake_post, http_get=fake_get,
+            sleep=lambda _s: None,
+            now=lambda: next(ticks),
+        )

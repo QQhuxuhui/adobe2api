@@ -1,4 +1,5 @@
 import re
+import time
 from typing import Optional, Tuple
 from datetime import datetime, timezone
 
@@ -105,3 +106,32 @@ def fetch_latest_canva_otp(
         if otp:
             return otp, (received or 0.0)
     return None
+
+
+def get_otp(
+    client_id: str,
+    refresh_token: str,
+    *,
+    since_ts: Optional[float] = None,
+    on_rotate=None,
+    poll_interval: float = 5,
+    timeout: float = 120,
+    http_post=None,
+    http_get=None,
+    sleep=time.sleep,
+    now=time.time,
+) -> Tuple[str, str]:
+    """端到端取 OTP：兑换 Graph token（轮换则回调 on_rotate）→ 轮询收件箱直到取到验证码。
+    返回 (otp, current_refresh_token)。超时抛 MailOTPError。"""
+    access, current_refresh = redeem_graph_token(client_id, refresh_token, http_post=http_post)
+    if on_rotate is not None and current_refresh != refresh_token:
+        on_rotate(current_refresh)
+
+    deadline = now() + timeout
+    while True:
+        hit = fetch_latest_canva_otp(access, since_ts=since_ts, http_get=http_get)
+        if hit:
+            return hit[0], current_refresh
+        if now() >= deadline:
+            raise MailOTPError("no Canva OTP received within timeout")
+        sleep(poll_interval)
