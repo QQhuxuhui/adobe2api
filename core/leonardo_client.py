@@ -1,7 +1,7 @@
 import base64
 import json
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class LeonardoError(Exception):
@@ -78,3 +78,63 @@ def parse_token_balance(resp: Dict[str, Any]) -> Optional[int]:
     if not rows:
         return None
     return sum_credits(rows[0])
+
+
+ASPECT_TO_SIZE = {
+    "16:9": (2752, 1536),
+    "9:16": (1536, 2752),
+    "1:1": (1536, 1536),
+    "4:3": (2048, 1536),
+}
+_STYLE_IDS = ["111dc692-d470-4eec-b791-3475abac4c46"]
+_GENERATE_QUERY = (
+    "mutation Generate($request: CreateGenerationRequest!) { "
+    "generate(request: $request) { apiCreditCost generationId __typename } }"
+)
+
+
+def aspect_to_size(aspect: str) -> Tuple[int, int]:
+    return ASPECT_TO_SIZE.get(aspect, ASPECT_TO_SIZE["1:1"])
+
+
+def build_generate_payload(
+    prompt: str,
+    model_id: str,
+    width: int,
+    height: int,
+    quantity: int = 1,
+    init_image_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {
+        "width": width,
+        "height": height,
+        "prompt": (prompt or "").strip(),
+        "quantity": max(1, min(4, int(quantity))),
+        "style_ids": list(_STYLE_IDS),
+        "prompt_enhance": "ON",
+        "dimensions": f"{width}x{height}",
+        "modelId": model_id,
+        "negative_prompt": "",
+        "guidance_scale": 7.0,
+        "num_inference_steps": 30,
+    }
+    if init_image_ids:
+        params["guidances"] = {
+            "image_reference": [
+                {"image": {"id": image_id, "type": "UPLOADED"}, "strength": "MID"}
+                for image_id in init_image_ids
+            ]
+        }
+    return {
+        "operationName": "Generate",
+        "variables": {"request": {"model": "nano-banana-2", "parameters": params, "public": True}},
+        "query": _GENERATE_QUERY,
+    }
+
+
+def parse_generation_id(resp: Dict[str, Any]) -> str:
+    gen_id = (((resp or {}).get("data") or {}).get("generate") or {}).get("generationId")
+    if gen_id:
+        return gen_id
+    errors = [e.get("message", "") for e in (resp or {}).get("errors", []) if isinstance(e, dict)]
+    raise LeonardoError(", ".join([m for m in errors if m]) or "Generate failed")

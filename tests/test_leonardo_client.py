@@ -2,6 +2,8 @@ import base64
 import json
 import time
 
+import pytest
+
 from core.leonardo_client import (
     LeonardoError,
     decode_jwt_payload,
@@ -77,3 +79,42 @@ def test_parse_token_balance_empty_returns_none():
 def test_token_balance_query_shape():
     assert TOKEN_BALANCE_QUERY["operationName"] == "GetTokenBalance"
     assert "user_details" in TOKEN_BALANCE_QUERY["query"]
+
+
+from core.leonardo_client import (
+    ASPECT_TO_SIZE, aspect_to_size, build_generate_payload, parse_generation_id,
+)
+
+
+def test_aspect_to_size_known_and_default():
+    assert aspect_to_size("16:9") == (2752, 1536)
+    assert aspect_to_size("9:16") == (1536, 2752)
+    assert aspect_to_size("weird") == (1536, 1536)  # 回退 1:1
+
+
+def test_build_generate_payload_core_fields():
+    p = build_generate_payload("  a cat  ", "MODEL-123", 1536, 1536, quantity=9)
+    assert p["operationName"] == "Generate"
+    req = p["variables"]["request"]
+    assert req["model"] == "nano-banana-2"           # 包裹层恒定
+    params = req["parameters"]
+    assert params["modelId"] == "MODEL-123"          # 动态模型
+    assert params["prompt"] == "a cat"               # trim
+    assert params["quantity"] == 4                   # 9 被夹到 [1,4]
+    assert params["dimensions"] == "1536x1536"
+    assert "guidances" not in params                 # 无参考图
+
+
+def test_build_generate_payload_with_reference_images():
+    p = build_generate_payload("x", "M", 1536, 1536, init_image_ids=["img-1"])
+    ref = p["variables"]["request"]["parameters"]["guidances"]["image_reference"]
+    assert ref == [{"image": {"id": "img-1", "type": "UPLOADED"}, "strength": "MID"}]
+
+
+def test_parse_generation_id_success():
+    assert parse_generation_id({"data": {"generate": {"generationId": "gen-9"}}}) == "gen-9"
+
+
+def test_parse_generation_id_raises_on_error():
+    with pytest.raises(LeonardoError):
+        parse_generation_id({"errors": [{"message": "quota exhausted"}]})
