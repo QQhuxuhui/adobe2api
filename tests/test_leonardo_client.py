@@ -10,6 +10,13 @@ from core.leonardo_client import (
     token_exp,
     is_fresh_token,
     is_likely_leonardo_token,
+    TOKEN_BALANCE_QUERY,
+    sum_credits,
+    parse_token_balance,
+    ASPECT_TO_SIZE,
+    aspect_to_size,
+    build_generate_payload,
+    parse_generation_id,
 )
 
 
@@ -53,9 +60,6 @@ def test_leonardo_error_is_exception():
     assert issubclass(LeonardoError, Exception)
 
 
-from core.leonardo_client import TOKEN_BALANCE_QUERY, sum_credits, parse_token_balance
-
-
 def test_sum_credits_includes_apicredit_and_stream():
     details = {"subscriptionTokens": 100, "paidTokens": 5, "rolloverTokens": 0,
                "apiCredit": 8500, "streamTokens": 3}
@@ -79,11 +83,6 @@ def test_parse_token_balance_empty_returns_none():
 def test_token_balance_query_shape():
     assert TOKEN_BALANCE_QUERY["operationName"] == "GetTokenBalance"
     assert "user_details" in TOKEN_BALANCE_QUERY["query"]
-
-
-from core.leonardo_client import (
-    ASPECT_TO_SIZE, aspect_to_size, build_generate_payload, parse_generation_id,
-)
 
 
 def test_aspect_to_size_known_and_default():
