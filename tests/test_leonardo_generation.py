@@ -71,3 +71,23 @@ def test_generate_images_raises_on_failed_result():
     client = _FakeClient(result={"success": False, "error": "generation failed"})
     with pytest.raises(LeonardoError):
         generate_images(client, "TOK", prompt="x", model_id="M1")
+
+
+def test_generate_images_raises_generation_error_on_timeout():
+    import pytest
+    from core.leonardo_client import LeonardoError
+    from core.leonardo_generation import LeonardoGenerationError, generate_images
+
+    class _FakeClient:
+        def create_generation(self, token, prompt, model_id, aspect_ratio, quantity=1):
+            return "gen-1"
+
+        def wait_for_completion(self, token, gen_id, *, timeout, poll_interval, sleep=None, now=None):
+            return {"success": False, "error": "generation timeout"}
+
+    with pytest.raises(LeonardoGenerationError) as excinfo:
+        generate_images(
+            _FakeClient(), "tok", prompt="p", model_id="m", timeout=5
+        )
+    # 与提交前失败同族，但类型可区分
+    assert isinstance(excinfo.value, LeonardoError)

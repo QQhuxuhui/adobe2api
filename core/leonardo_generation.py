@@ -3,6 +3,11 @@ from typing import Any, Dict, List, Optional
 
 from core.leonardo_client import LeonardoError
 
+
+class LeonardoGenerationError(LeonardoError):
+    """生成已提交后失败(轮询超时/上游 FAILED)。重试会重复扣费，不得自动重发。"""
+
+
 _SUPPORTED_ASPECTS = {"16:9", "9:16", "1:1", "4:3"}
 _SIZE_TO_ASPECT = {
     "1024x1024": "1:1", "512x512": "1:1", "256x256": "1:1",
@@ -54,7 +59,7 @@ def generate_images(
         token, gen_id, timeout=timeout, poll_interval=poll_interval
     )
     if not result.get("success"):
-        raise LeonardoError(str(result.get("error") or "generation failed"))
+        raise LeonardoGenerationError(str(result.get("error") or "generation failed"))
 
     urls: List[str] = result.get("images") or []
     return {
