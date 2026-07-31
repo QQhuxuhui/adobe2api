@@ -178,6 +178,13 @@ def parse_image_urls(resp: Dict[str, Any]) -> List[str]:
 
 
 GRAPHQL_URL = "https://api.leonardo.ai/v1/graphql"
+_HTTP_ATTEMPTS = 3
+_RETRY_BACKOFF = 0.5
+_RETRYABLE_OPERATIONS = frozenset({
+    "GetTokenBalance",
+    "GetAIGenerationFeedStatuses",
+    "GetAIGenerationFeed",
+})
 _BASE_HEADERS = {
     "accept": "*/*",
     "content-type": "application/json",
@@ -194,14 +201,40 @@ class LeonardoClient:
     def _http_gql(self, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         headers = dict(_BASE_HEADERS)
         headers["authorization"] = f"Bearer {token}"
-        resp = requests.post(GRAPHQL_URL, headers=headers, json=payload, timeout=60)
-        if not resp.ok:
-            raise LeonardoError(f"graphql HTTP {resp.status_code}")
-        return resp.json()
+        operation = str(payload.get("operationName") or "")
+        attempts = _HTTP_ATTEMPTS if operation in _RETRYABLE_OPERATIONS else 1
+        for attempt in range(attempts):
+            try:
+                resp = requests.post(GRAPHQL_URL, headers=headers, json=payload, timeout=60)
+            except requests.exceptions.RequestException as exc:
+                if attempt < attempts - 1:
+                    time.sleep(_RETRY_BACKOFF)
+                    continue
+                if attempts > 1:
+                    message = f"graphql {operation} failed after {attempts} attempts: {exc}"
+                else:
+                    message = (
+                        f"graphql {operation or 'request'} failed; request not retried "
+                        f"to avoid duplicate side effects: {exc}"
+                    )
+                raise LeonardoError(message) from exc
+            if not resp.ok:
+                raise LeonardoError(f"graphql HTTP {resp.status_code}")
+            return resp.json()
+        raise LeonardoError("graphql request failed")
 
     def _call(self, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         fn = self._gql_fn or self._http_gql
-        return fn(token, payload)
+        resp = fn(token, payload)
+        if isinstance(resp, dict) and resp.get("errors"):
+            messages = [
+                str(error.get("message", "")).strip()
+                for error in resp["errors"]
+                if isinstance(error, dict)
+            ]
+            detail = "; ".join(message for message in messages if message)
+            raise LeonardoError(detail or "graphql error")
+        return resp
 
     def get_credits(self, token: str) -> Optional[int]:
         return parse_token_balance(self._call(token, TOKEN_BALANCE_QUERY))
@@ -225,7 +258,7 @@ class LeonardoClient:
         deadline = now() + timeout
         while now() < deadline:
             status = self.poll_status(token, gen_id)
-            if status == "COMPLETED":
+            if status in ("COMPLETE", "COMPLETED"):
                 return {"success": True, "images": self.get_image_urls(token, gen_id)}
             if status in ("FAILED", "ERROR"):
                 return {"success": False, "error": "generation failed"}

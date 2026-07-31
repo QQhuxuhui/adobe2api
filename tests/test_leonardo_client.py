@@ -4,6 +4,7 @@ import time
 
 import pytest
 
+import core.leonardo_client as lc
 from core.leonardo_client import (
     LeonardoError,
     decode_jwt_payload,
@@ -204,3 +205,114 @@ def test_wait_for_completion_timeout():
 
 def test_graphql_url_constant():
     assert GRAPHQL_URL == "https://api.leonardo.ai/v1/graphql"
+
+
+def test_wait_for_completion_accepts_COMPLETE_status():
+    def fake_gql(token, payload):
+        op = payload["operationName"]
+        if op == "GetAIGenerationFeedStatuses":
+            return {"data": {"generations": [{"id": "g", "status": "COMPLETE"}]}}
+        if op == "GetAIGenerationFeed":
+            return {
+                "data": {
+                    "generations": [
+                        {"generated_images": [{"url": "https://cdn/x.jpg"}]}
+                    ]
+                }
+            }
+        return {}
+
+    client = LeonardoClient(gql=fake_gql)
+    ticks = iter([0.0, 1.0, 61.0])
+    result = client.wait_for_completion(
+        "TOK",
+        "g",
+        timeout=60,
+        poll_interval=1,
+        sleep=lambda _s: None,
+        now=lambda: next(ticks),
+    )
+    assert result == {"success": True, "images": ["https://cdn/x.jpg"]}
+
+
+def test_call_raises_on_graphql_errors():
+    err = {
+        "errors": [
+            {
+                "message": "Could not verify JWT: JWSError JWSInvalidSignature",
+                "extensions": {"code": "invalid-jwt"},
+            }
+        ]
+    }
+    client = LeonardoClient(gql=lambda token, payload: err)
+
+    with pytest.raises(LeonardoError, match="Could not verify JWT"):
+        client.get_credits("TOK")
+    with pytest.raises(LeonardoError, match="Could not verify JWT"):
+        client.poll_status("TOK", "g")
+
+
+def test_http_gql_retries_transient_query_then_succeeds(monkeypatch):
+    calls = {"n": 0}
+    sleeps = []
+
+    class _R:
+        ok = True
+
+        def json(self):
+            return {"data": {"user_details": [{"apiCredit": 1}]}}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise lc.requests.exceptions.ConnectionError("transient boom")
+        return _R()
+
+    monkeypatch.setattr(lc.requests, "post", fake_post)
+    monkeypatch.setattr(lc.time, "sleep", sleeps.append)
+
+    out = lc.LeonardoClient()._http_gql("TOK", lc.TOKEN_BALANCE_QUERY)
+
+    assert out == {"data": {"user_details": [{"apiCredit": 1}]}}
+    assert calls["n"] == 2
+    assert sleeps == [0.5]
+
+
+def test_http_gql_raises_after_exhausting_query_retries(monkeypatch):
+    calls = {"n": 0}
+    sleeps = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["n"] += 1
+        raise lc.requests.exceptions.ConnectionError("down")
+
+    monkeypatch.setattr(lc.requests, "post", fake_post)
+    monkeypatch.setattr(lc.time, "sleep", sleeps.append)
+
+    with pytest.raises(LeonardoError, match="after 3 attempts: down"):
+        lc.LeonardoClient()._http_gql("TOK", lc.TOKEN_BALANCE_QUERY)
+    assert calls["n"] == 3
+    assert sleeps == [0.5, 0.5]
+
+
+def test_http_gql_does_not_retry_generate_mutation(monkeypatch):
+    calls = {"n": 0}
+    sleeps = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["n"] += 1
+        raise lc.requests.exceptions.ConnectionError("connection lost")
+
+    monkeypatch.setattr(lc.requests, "post", fake_post)
+    monkeypatch.setattr(lc.time, "sleep", sleeps.append)
+    payload = {
+        "operationName": "Generate",
+        "query": "mutation Generate { generate { generationId } }",
+    }
+
+    with pytest.raises(
+        LeonardoError, match="not retried to avoid duplicate side effects"
+    ):
+        lc.LeonardoClient()._http_gql("TOK", payload)
+    assert calls["n"] == 1
+    assert sleeps == []
