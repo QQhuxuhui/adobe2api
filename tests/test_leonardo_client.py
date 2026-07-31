@@ -21,6 +21,8 @@ from core.leonardo_client import (
     build_feed_query,
     parse_generation_status,
     parse_image_urls,
+    LeonardoClient,
+    GRAPHQL_URL,
 )
 
 
@@ -147,3 +149,58 @@ def test_parse_image_urls():
 
 def test_parse_image_urls_empty():
     assert parse_image_urls({"data": {"generations": []}}) == []
+
+
+def test_create_generation_uses_gql_and_returns_id():
+    seen = {}
+
+    def fake_gql(token, payload):
+        seen["op"] = payload["operationName"]
+        return {"data": {"generate": {"generationId": "gen-42"}}}
+
+    client = LeonardoClient(gql=fake_gql)
+    gid = client.create_generation("TOK", "a cat", "M1", "1:1")
+    assert gid == "gen-42"
+    assert seen["op"] == "Generate"
+
+
+def test_get_credits():
+    client = LeonardoClient(gql=lambda t, p: {"data": {"user_details": [{"apiCredit": 8500}]}})
+    assert client.get_credits("TOK") == 8500
+
+
+def test_wait_for_completion_polls_then_succeeds():
+    seq = iter(["PENDING", "COMPLETED"])
+
+    def fake_gql(token, payload):
+        op = payload["operationName"]
+        if op == "GetAIGenerationFeedStatuses":
+            return {"data": {"generations": [{"id": "g", "status": next(seq)}]}}
+        if op == "GetAIGenerationFeed":
+            return {"data": {"generations": [{"generated_images": [{"url": "https://cdn/final.jpg"}]}]}}
+        return {}
+
+    client = LeonardoClient(gql=fake_gql)
+    ticks = iter([0.0, 1.0, 2.0, 3.0, 4.0])
+    result = client.wait_for_completion("TOK", "g", timeout=60, poll_interval=1,
+                                        sleep=lambda _s: None, now=lambda: next(ticks))
+    assert result == {"success": True, "images": ["https://cdn/final.jpg"]}
+
+
+def test_wait_for_completion_failed_status():
+    client = LeonardoClient(gql=lambda t, p: {"data": {"generations": [{"status": "FAILED"}]}})
+    result = client.wait_for_completion("TOK", "g", timeout=60, poll_interval=1,
+                                        sleep=lambda _s: None, now=lambda: 0.0)
+    assert result["success"] is False
+
+
+def test_wait_for_completion_timeout():
+    client = LeonardoClient(gql=lambda t, p: {"data": {"generations": [{"status": "PENDING"}]}})
+    ticks = iter([0.0, 100.0, 200.0])
+    result = client.wait_for_completion("TOK", "g", timeout=30, poll_interval=1,
+                                        sleep=lambda _s: None, now=lambda: next(ticks))
+    assert result["success"] is False
+
+
+def test_graphql_url_constant():
+    assert GRAPHQL_URL == "https://api.leonardo.ai/v1/graphql"

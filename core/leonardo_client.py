@@ -3,6 +3,8 @@ import json
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
+
 
 class LeonardoError(Exception):
     """leonardo_client 统一异常。"""
@@ -173,3 +175,59 @@ def parse_image_urls(resp: Dict[str, Any]) -> List[str]:
     if not gens:
         return []
     return [img.get("url") for img in gens[0].get("generated_images", []) if img.get("url")]
+
+
+GRAPHQL_URL = "https://api.leonardo.ai/v1/graphql"
+_BASE_HEADERS = {
+    "accept": "*/*",
+    "content-type": "application/json",
+    "origin": "https://app.leonardo.ai",
+    "referer": "https://app.leonardo.ai/",
+    "x-leo-schema-version": "latest",
+}
+
+
+class LeonardoClient:
+    def __init__(self, *, gql=None):
+        self._gql_fn = gql  # 可注入；None 时用真实 HTTP
+
+    def _http_gql(self, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        headers = dict(_BASE_HEADERS)
+        headers["authorization"] = f"Bearer {token}"
+        resp = requests.post(GRAPHQL_URL, headers=headers, json=payload, timeout=60)
+        if not resp.ok:
+            raise LeonardoError(f"graphql HTTP {resp.status_code}")
+        return resp.json()
+
+    def _call(self, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        fn = self._gql_fn or self._http_gql
+        return fn(token, payload)
+
+    def get_credits(self, token: str) -> Optional[int]:
+        return parse_token_balance(self._call(token, TOKEN_BALANCE_QUERY))
+
+    def create_generation(
+        self, token, prompt, model_id, aspect_ratio, quantity=1, init_image_ids=None
+    ) -> str:
+        width, height = aspect_to_size(aspect_ratio)
+        payload = build_generate_payload(prompt, model_id, width, height, quantity, init_image_ids)
+        return parse_generation_id(self._call(token, payload))
+
+    def poll_status(self, token: str, gen_id: str) -> str:
+        return parse_generation_status(self._call(token, build_status_query(gen_id)))
+
+    def get_image_urls(self, token: str, gen_id: str) -> List[str]:
+        return parse_image_urls(self._call(token, build_feed_query(gen_id)))
+
+    def wait_for_completion(
+        self, token, gen_id, *, timeout=300, poll_interval=4, sleep=time.sleep, now=time.time
+    ) -> Dict[str, Any]:
+        deadline = now() + timeout
+        while now() < deadline:
+            status = self.poll_status(token, gen_id)
+            if status == "COMPLETED":
+                return {"success": True, "images": self.get_image_urls(token, gen_id)}
+            if status in ("FAILED", "ERROR"):
+                return {"success": False, "error": "generation failed"}
+            sleep(poll_interval)
+        return {"success": False, "error": "generation timeout"}
