@@ -8,3 +8,12 @@ tokens.json
 .docker-version
 VERSION
 *.pyc
+
+# 账号凭据文件（真实 refresh token/邮箱，绝不提交）
+tests/canva_member_emails_*.txt
+# subagent-driven-development 脚手架（本地 scratch）
+.superpowers/
+# Leonardo bootstrap spike 产出（真实会话/浏览器 profile）
+leonardo_session.json
+leonardo_auth.json
+browser_profile/
