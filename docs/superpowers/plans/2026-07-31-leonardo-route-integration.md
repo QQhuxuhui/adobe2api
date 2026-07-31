@@ -609,6 +609,7 @@ from core.adobe_client import (
     QuotaExhaustedError,
     UpstreamTemporaryError,
 )
+from core.leonardo_client import LeonardoClient
 ```
 
 （`core.adobe_client` 已由 app.py 布线为 `quota_error_cls`/`auth_error_cls`/`upstream_temp_error_cls`，此处直接 import 同名类。）
