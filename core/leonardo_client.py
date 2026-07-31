@@ -10,6 +10,10 @@ class LeonardoError(Exception):
     """leonardo_client 统一异常。"""
 
 
+class LeonardoRetryUnsafeError(LeonardoError):
+    """单发(非幂等)请求失败且服务端可能已受理：禁止自动重试，避免重复扣费。"""
+
+
 def _b64url_json(segment: str) -> Dict[str, Any]:
     try:
         pad = "=" * ((4 - len(segment) % 4) % 4)
@@ -212,13 +216,17 @@ class LeonardoClient:
                     continue
                 if attempts > 1:
                     message = f"graphql {operation} failed after {attempts} attempts: {exc}"
-                else:
-                    message = (
-                        f"graphql {operation or 'request'} failed; request not retried "
-                        f"to avoid duplicate side effects: {exc}"
-                    )
-                raise LeonardoError(message) from exc
+                    raise LeonardoError(message) from exc
+                # 单发(非幂等, 如 Generate)传输失败: 服务端可能已接受 → 禁止重试
+                message = (
+                    f"graphql {operation or 'request'} failed; request not retried "
+                    f"to avoid duplicate side effects: {exc}"
+                )
+                raise LeonardoRetryUnsafeError(message) from exc
             if not resp.ok:
+                if attempts == 1:
+                    # 单发操作 HTTP 错误也可能已生效 → 禁止重试
+                    raise LeonardoRetryUnsafeError(f"graphql HTTP {resp.status_code}")
                 raise LeonardoError(f"graphql HTTP {resp.status_code}")
             return resp.json()
         raise LeonardoError("graphql request failed")

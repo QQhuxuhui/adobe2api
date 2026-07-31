@@ -126,9 +126,11 @@ def _map_leonardo_error(exc: Exception) -> Exception:
     重复扣费 → 非重试 AdobeRequestError → 500。
     LeonardoError = 提交前失败（invalid JWT/HTTP/传输），可换号重试。
     """
+    from core.leonardo_client import LeonardoRetryUnsafeError
     from core.leonardo_generation import LeonardoGenerationError
 
-    if isinstance(exc, LeonardoGenerationError):
+    if isinstance(exc, (LeonardoGenerationError, LeonardoRetryUnsafeError)):
+        # 已提交后失败 / 单发可能已受理: 换号重试会重复扣费 → 非重试 500
         return AdobeRequestError(str(exc))
     message = str(exc).lower()
     if any(kw in message for kw in ("invalid", "jwt", "unauthorized", "verify", "signature")):

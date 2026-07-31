@@ -55,9 +55,14 @@ def generate_images(
     gen_id = client.create_generation(
         token, prompt, model_id, aspect, quantity=quantity
     )
-    result = client.wait_for_completion(
-        token, gen_id, timeout=timeout, poll_interval=poll_interval
-    )
+    try:
+        result = client.wait_for_completion(
+            token, gen_id, timeout=timeout, poll_interval=poll_interval
+        )
+    except LeonardoError as exc:
+        # mutation 已提交: 轮询/取图期间任何失败(含传输耗尽的 LeonardoError)
+        # 都不得换号重发, 统一转 LeonardoGenerationError(不可重试)
+        raise LeonardoGenerationError(str(exc)) from exc
     if not result.get("success"):
         raise LeonardoGenerationError(str(result.get("error") or "generation failed"))
 

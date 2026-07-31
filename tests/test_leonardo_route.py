@@ -162,3 +162,24 @@ def test_run_once_cdn_fetch_failure_non_retryable(monkeypatch):
     # 生成已成功但下载失败 → 不可重试 → AdobeRequestError
     with pytest.raises(AdobeRequestError):
         _build_run_once()("leo-token")
+
+
+def test_retry_unsafe_error_maps_to_non_retryable():
+    from core.leonardo_client import LeonardoRetryUnsafeError
+    mapped = _map_leonardo_error(
+        LeonardoRetryUnsafeError(
+            "graphql Generate failed; request not retried to avoid duplicate side effects: connection lost"
+        )
+    )
+    assert isinstance(mapped, AdobeRequestError)
+
+
+def test_generate_poll_error_now_maps_non_retryable_via_generation_error():
+    """轮询期错误经 generate_images 转 LeonardoGenerationError 后 → 非重试。"""
+    from core.leonardo_generation import LeonardoGenerationError
+    mapped = _map_leonardo_error(
+        LeonardoGenerationError(
+            "graphql GetAIGenerationFeedStatuses failed after 3 attempts: connection reset"
+        )
+    )
+    assert isinstance(mapped, AdobeRequestError)

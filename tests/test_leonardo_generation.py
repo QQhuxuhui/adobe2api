@@ -91,3 +91,41 @@ def test_generate_images_raises_generation_error_on_timeout():
         )
     # 与提交前失败同族，但类型可区分
     assert isinstance(excinfo.value, LeonardoError)
+
+
+def test_generate_images_converts_wait_poll_raise_to_generation_error():
+    """wait_for_completion 内轮询抛的 LeonardoError(mutation 已提交)必须转为不可重试。"""
+    from core.leonardo_client import LeonardoError as LeonardoClientError
+    from core.leonardo_generation import LeonardoGenerationError, generate_images
+
+    class _FakeClient:
+        def create_generation(self, token, prompt, model_id, aspect_ratio, quantity=1):
+            return "gen-1"
+
+        def wait_for_completion(self, token, gen_id, *, timeout, poll_interval, sleep=None, now=None):
+            # 轮询查询 3 次传输重试耗尽; mutation 已提交, 不得换号重发
+            raise LeonardoClientError(
+                "graphql GetAIGenerationFeedStatuses failed after 3 attempts: connection reset"
+            )
+
+    with pytest.raises(LeonardoGenerationError) as excinfo:
+        generate_images(_FakeClient(), "tok", prompt="p", model_id="m", timeout=5)
+    assert isinstance(excinfo.value, LeonardoError)
+
+
+def test_generate_images_passes_create_transport_unsafe_error_through():
+    """create_generation 的单发传输失败(可能已受理)原样透传 LeonardoRetryUnsafeError。"""
+    from core.leonardo_client import LeonardoRetryUnsafeError
+    from core.leonardo_generation import generate_images
+
+    class _FakeClient:
+        def create_generation(self, token, prompt, model_id, aspect_ratio, quantity=1):
+            raise LeonardoRetryUnsafeError(
+                "graphql Generate failed; request not retried to avoid duplicate side effects: connection lost"
+            )
+
+        def wait_for_completion(self, token, gen_id, *, timeout, poll_interval, sleep=None, now=None):
+            return {"success": True, "images": []}
+
+    with pytest.raises(LeonardoRetryUnsafeError):
+        generate_images(_FakeClient(), "tok", prompt="p", model_id="m", timeout=5)

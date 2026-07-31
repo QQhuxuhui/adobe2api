@@ -316,3 +316,58 @@ def test_http_gql_does_not_retry_generate_mutation(monkeypatch):
         lc.LeonardoClient()._http_gql("TOK", payload)
     assert calls["n"] == 1
     assert sleeps == []
+
+
+def test_http_gql_single_shot_transport_raises_retry_unsafe(monkeypatch):
+    """单发(Generate)传输失败 → LeonardoRetryUnsafeError，禁止自动重试。"""
+    calls = {"n": 0}
+    monkeypatch.setattr(lc.time, "sleep", lambda _s: None)
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["n"] += 1
+        raise lc.requests.exceptions.ConnectionError("connection lost")
+
+    monkeypatch.setattr(lc.requests, "post", fake_post)
+    payload = {
+        "operationName": "Generate",
+        "query": "mutation Generate { generate { generationId } }",
+    }
+    with pytest.raises(
+        lc.LeonardoRetryUnsafeError, match="not retried to avoid duplicate side effects"
+    ):
+        lc.LeonardoClient()._http_gql("TOK", payload)
+    assert calls["n"] == 1
+
+
+def test_http_gql_retryable_op_transport_exhaustion_is_plain_error(monkeypatch):
+    """只读查询传输耗尽 → 仍抛普通 LeonardoError（不可重试语义只在单发场景）。"""
+    calls = {"n": 0}
+    monkeypatch.setattr(lc.time, "sleep", lambda _s: None)
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["n"] += 1
+        raise lc.requests.exceptions.ConnectionError("down")
+
+    monkeypatch.setattr(lc.requests, "post", fake_post)
+    with pytest.raises(lc.LeonardoError) as excinfo:
+        lc.LeonardoClient()._http_gql("TOK", lc.TOKEN_BALANCE_QUERY)
+    assert not isinstance(excinfo.value, lc.LeonardoRetryUnsafeError)
+    assert calls["n"] == 3
+
+
+def test_http_gql_single_shot_http_error_is_retry_unsafe(monkeypatch):
+    """单发操作 HTTP 错误也可能已生效 → LeonardoRetryUnsafeError。"""
+    class _R:
+        ok = False
+        status_code = 500
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _R()
+
+    monkeypatch.setattr(lc.requests, "post", fake_post)
+    payload = {
+        "operationName": "Generate",
+        "query": "mutation Generate { generate { generationId } }",
+    }
+    with pytest.raises(lc.LeonardoRetryUnsafeError, match="graphql HTTP 500"):
+        lc.LeonardoClient()._http_gql("TOK", payload)
