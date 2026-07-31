@@ -171,3 +171,18 @@ def test_get_otp_raises_on_timeout():
             sleep=lambda _s: None,
             now=lambda: next(ticks),
         )
+
+
+@pytest.mark.parametrize(
+    ("subject", "expected"),
+    [
+        ("你的登录码是161153", "161153"),
+        ("你的登陆码是654321", "654321"),
+    ],
+)
+def test_extract_otp_chinese_login_code(subject, expected):
+    assert extract_canva_otp(subject) == expected
+
+
+def test_extract_otp_rejects_long_digit_run():
+    assert extract_canva_otp("Canva code: 1611537") is None
