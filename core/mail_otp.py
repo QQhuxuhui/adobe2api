@@ -1,5 +1,15 @@
 import re
-from typing import Optional
+from typing import Optional, Tuple
+
+import requests
+
+TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+
+
+class MailOTPError(Exception):
+    """MailOTPReader 统一异常。"""
+
 
 _OTP_PATTERNS = [
     r"验证码[是为:：]?\s*(\d{6})",                                       # zh: 验证码是100581
@@ -19,3 +29,32 @@ def extract_canva_otp(text: str) -> Optional[str]:
         if match:
             return match.group(1)
     return None
+
+
+def redeem_graph_token(
+    client_id: str,
+    refresh_token: str,
+    *,
+    http_post=None,
+) -> Tuple[str, str]:
+    """用 refresh token 兑换 Graph access token。返回 (access_token, current_refresh_token)。
+    MSA refresh token 兑换即轮换：若响应含新 refresh token 返回新的，否则回退旧的。"""
+    http_post = http_post or requests.post
+    resp = http_post(
+        TOKEN_URL,
+        data={
+            "grant_type": "refresh_token",
+            "client_id": client_id,
+            "refresh_token": refresh_token,
+            "scope": GRAPH_SCOPE,
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise MailOTPError(f"token redeem failed: HTTP {resp.status_code} {resp.text[:200]}")
+    data = resp.json()
+    access = data.get("access_token")
+    if not access:
+        raise MailOTPError("token redeem response missing access_token")
+    new_refresh = data.get("refresh_token") or refresh_token
+    return access, new_refresh
