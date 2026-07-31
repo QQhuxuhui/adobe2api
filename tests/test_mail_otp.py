@@ -69,3 +69,50 @@ def test_redeem_raises_on_error_status():
 
     with pytest.raises(MailOTPError):
         redeem_graph_token("CID", "OLD_RT", http_post=fake_post)
+
+
+from core.mail_otp import fetch_latest_canva_otp
+
+
+def _msg(addr, subject, received, body=""):
+    return {
+        "from": {"emailAddress": {"address": addr}},
+        "subject": subject,
+        "bodyPreview": body,
+        "receivedDateTime": received,
+    }
+
+
+def test_fetch_returns_newest_canva_otp():
+    payload = {"value": [
+        _msg("noreply@canva.com", "你的Canva可画验证码是100581", "2026-07-30T14:47:00Z"),
+        _msg("news@e.adobe.com", "Welcome", "2026-07-30T13:00:00Z"),
+    ]}
+
+    def fake_get(url, headers=None, timeout=None):
+        assert headers["Authorization"] == "Bearer AT"
+        return _FakeResp(200, payload)
+
+    otp, ts = fetch_latest_canva_otp("AT", http_get=fake_get)
+    assert otp == "100581"
+    assert ts > 0
+
+
+def test_fetch_ignores_non_canva_and_returns_none():
+    payload = {"value": [_msg("news@e.adobe.com", "Verification code is 999999", "2026-07-30T14:47:00Z")]}
+
+    def fake_get(url, headers=None, timeout=None):
+        return _FakeResp(200, payload)
+
+    assert fetch_latest_canva_otp("AT", http_get=fake_get) is None
+
+
+def test_fetch_skips_messages_at_or_before_since_ts():
+    # since_ts 设为该邮件时间之后，应过滤掉它
+    payload = {"value": [_msg("noreply@canva.com", "验证码是100581", "2026-07-30T14:47:00Z")]}
+
+    def fake_get(url, headers=None, timeout=None):
+        return _FakeResp(200, payload)
+
+    future = 4102444800.0  # 2100-01-01
+    assert fetch_latest_canva_otp("AT", since_ts=future, http_get=fake_get) is None

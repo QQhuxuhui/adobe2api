@@ -1,5 +1,6 @@
 import re
 from typing import Optional, Tuple
+from datetime import datetime, timezone
 
 import requests
 
@@ -58,3 +59,49 @@ def redeem_graph_token(
         raise MailOTPError("token redeem response missing access_token")
     new_refresh = data.get("refresh_token") or refresh_token
     return access, new_refresh
+
+
+GRAPH_MESSAGES = "https://graph.microsoft.com/v1.0/me/messages"
+_MESSAGES_QUERY = (
+    "?$top=15&$select=from,subject,bodyPreview,receivedDateTime"
+    "&$orderby=receivedDateTime%20desc"
+)
+
+
+def _parse_iso_epoch(value: str) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        text = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(text).replace(tzinfo=timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
+def fetch_latest_canva_otp(
+    access_token: str,
+    *,
+    since_ts: Optional[float] = None,
+    http_get=None,
+) -> Optional[Tuple[str, float]]:
+    """读收件箱，返回最新一封 Canva 验证码邮件的 (otp, received_epoch)；无则 None。"""
+    http_get = http_get or requests.get
+    resp = http_get(
+        GRAPH_MESSAGES + _MESSAGES_QUERY,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise MailOTPError(f"graph messages failed: HTTP {resp.status_code}")
+    for msg in resp.json().get("value", []):
+        addr = (((msg.get("from") or {}).get("emailAddress") or {}).get("address") or "").lower()
+        if "canva" not in addr:
+            continue
+        received = _parse_iso_epoch(msg.get("receivedDateTime") or "")
+        if since_ts is not None and received is not None and received <= since_ts:
+            continue
+        text = (msg.get("subject") or "") + "\n" + (msg.get("bodyPreview") or "")
+        otp = extract_canva_otp(text)
+        if otp:
+            return otp, (received or 0.0)
+    return None
