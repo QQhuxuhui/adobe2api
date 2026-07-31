@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict
 
+from core.leonardo_client import is_likely_leonardo_token
+
 BASE_DIR = Path(__file__).parent.parent
 DATA_DIR = BASE_DIR / "data"
 CONFIG_DIR = BASE_DIR / "config"
@@ -76,6 +78,10 @@ class TokenManager:
                 "added_at": time.time(),
                 "error_until": 0,
             }
+            # 未显式指定 type 时按 token 形态自动判定；meta 含 type 则以其为准
+            if not meta or "type" not in meta:
+                if is_likely_leonardo_token(value):
+                    new_token["type"] = "leonardo"
             if meta:
                 new_token.update(meta)
             self.tokens.append(new_token)
@@ -239,9 +245,13 @@ class TokenManager:
             ]
 
     def _pick_active_token_locked(
-        self, strategy: str = "round_robin"
+        self, strategy: str = "round_robin", token_type: Optional[str] = None
     ) -> Optional[Dict]:
         active = [t for t in self.tokens if t.get("status") in {"active", "error"}]
+        if token_type == "leonardo":
+            active = [t for t in active if t.get("type") == "leonardo"]
+        elif token_type == "adobe":
+            active = [t for t in active if t.get("type") != "leonardo"]
         if not active:
             return None
 
@@ -255,9 +265,13 @@ class TokenManager:
             self._rr_index = (idx + 1) % len(active)
         return chosen
 
-    def get_available(self, strategy: str = "round_robin") -> Optional[str]:
+    def get_available(
+        self,
+        strategy: str = "round_robin",
+        token_type: Optional[str] = "adobe",
+    ) -> Optional[str]:
         with self._lock:
-            chosen = self._pick_active_token_locked(strategy=strategy)
+            chosen = self._pick_active_token_locked(strategy=strategy, token_type=token_type)
             return chosen["value"] if chosen is not None else None
 
     @classmethod
@@ -308,6 +322,7 @@ class TokenManager:
                     {
                         "token": value,
                         "account_id": aid,
+                        "type": str(t.get("type") or ""),
                         "account_name": str(t.get("refresh_profile_name") or ""),
                         "account_email": str(t.get("refresh_profile_email") or ""),
                     }
