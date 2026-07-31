@@ -204,6 +204,18 @@ _register_base_model(
     supported_aspect_ratios=GPT_IMAGE_FIXED_RATIOS,
 )
 
+LEONARDO_SUPPORTED_RATIOS = ("1:1", "16:9", "9:16", "4:3")
+
+_register_base_model(
+    "leonardo-nano-banana-2",
+    upstream_model="leonardo:nano-banana-2",
+    upstream_model_id="leonardo",
+    upstream_model_version="nano-banana-2",
+    label="Leonardo Nano Banana 2",
+    supports_auto_aspect_ratio=True,
+    supported_aspect_ratios=LEONARDO_SUPPORTED_RATIOS,
+)
+
 DEFAULT_MODEL_ID = "firefly-nano-banana-pro-2k-16x9"
 DEFAULT_AUTO_MODEL_ID = "firefly-nano-banana-pro"
 
