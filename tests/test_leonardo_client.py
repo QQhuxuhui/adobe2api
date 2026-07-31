@@ -17,6 +17,10 @@ from core.leonardo_client import (
     aspect_to_size,
     build_generate_payload,
     parse_generation_id,
+    build_status_query,
+    build_feed_query,
+    parse_generation_status,
+    parse_image_urls,
 )
 
 
@@ -117,3 +121,29 @@ def test_parse_generation_id_success():
 def test_parse_generation_id_raises_on_error():
     with pytest.raises(LeonardoError):
         parse_generation_id({"errors": [{"message": "quota exhausted"}]})
+
+
+def test_status_and_feed_query_shape():
+    assert build_status_query("gen-1")["operationName"] == "GetAIGenerationFeedStatuses"
+    assert build_status_query("gen-1")["variables"]["where"]["id"]["_eq"] == "gen-1"
+    assert build_feed_query("gen-1")["operationName"] == "GetAIGenerationFeed"
+
+
+def test_parse_status():
+    resp = {"data": {"generations": [{"id": "g", "status": "COMPLETE"}]}}
+    assert parse_generation_status(resp) == "COMPLETE"
+
+
+def test_parse_status_pending_when_empty():
+    assert parse_generation_status({"data": {"generations": []}}) == "PENDING"
+    assert parse_generation_status({}) == "PENDING"
+
+
+def test_parse_image_urls():
+    resp = {"data": {"generations": [{"generated_images": [
+        {"url": "https://cdn/x1.jpg"}, {"url": None}, {"url": "https://cdn/x2.jpg"}]}]}}
+    assert parse_image_urls(resp) == ["https://cdn/x1.jpg", "https://cdn/x2.jpg"]
+
+
+def test_parse_image_urls_empty():
+    assert parse_image_urls({"data": {"generations": []}}) == []

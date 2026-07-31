@@ -138,3 +138,38 @@ def parse_generation_id(resp: Dict[str, Any]) -> str:
         return gen_id
     errors = [e.get("message", "") for e in (resp or {}).get("errors", []) if isinstance(e, dict)]
     raise LeonardoError(", ".join([m for m in errors if m]) or "Generate failed")
+
+
+def build_status_query(gen_id: str) -> Dict[str, Any]:
+    return {
+        "operationName": "GetAIGenerationFeedStatuses",
+        "variables": {"where": {"id": {"_eq": gen_id}}},
+        "query": (
+            "query GetAIGenerationFeedStatuses($where: generations_bool_exp = {}) { "
+            "generations(where: $where) { id status __typename } }"
+        ),
+    }
+
+
+def build_feed_query(gen_id: str) -> Dict[str, Any]:
+    return {
+        "operationName": "GetAIGenerationFeed",
+        "variables": {"where": {"id": {"_eq": gen_id}}, "limit": 1},
+        "query": (
+            "query GetAIGenerationFeed($where: generations_bool_exp = {}, $limit: Int) { "
+            "generations(where: $where, limit: $limit) { "
+            "generated_images(order_by: [{url: desc}]) { url id __typename } __typename } }"
+        ),
+    }
+
+
+def parse_generation_status(resp: Dict[str, Any]) -> str:
+    gens = ((resp or {}).get("data") or {}).get("generations") or []
+    return gens[0].get("status", "PENDING") if gens else "PENDING"
+
+
+def parse_image_urls(resp: Dict[str, Any]) -> List[str]:
+    gens = ((resp or {}).get("data") or {}).get("generations") or []
+    if not gens:
+        return []
+    return [img.get("url") for img in gens[0].get("generated_images", []) if img.get("url")]
