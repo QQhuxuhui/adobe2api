@@ -50,3 +50,31 @@ def is_likely_leonardo_token(token: str) -> bool:
         return True
     aud = payload.get("aud")
     return isinstance(aud, str) and aud.startswith("https://cognito-idp")
+
+
+_CREDIT_FIELDS = ("subscriptionTokens", "paidTokens", "rolloverTokens", "apiCredit", "streamTokens")
+
+TOKEN_BALANCE_QUERY = {
+    "operationName": "GetTokenBalance",
+    "variables": {},
+    "query": (
+        "query GetTokenBalance { user_details { "
+        "subscriptionTokens paidTokens rolloverTokens apiCredit streamTokens __typename } }"
+    ),
+}
+
+
+def sum_credits(details: Dict[str, Any]) -> int:
+    total = 0
+    for key in _CREDIT_FIELDS:
+        value = (details or {}).get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            total += int(value)
+    return total
+
+
+def parse_token_balance(resp: Dict[str, Any]) -> Optional[int]:
+    rows = ((resp or {}).get("data") or {}).get("user_details") or []
+    if not rows:
+        return None
+    return sum_credits(rows[0])

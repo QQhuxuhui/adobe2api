@@ -49,3 +49,31 @@ def test_is_likely_leonardo_token_cognito_signals():
 
 def test_leonardo_error_is_exception():
     assert issubclass(LeonardoError, Exception)
+
+
+from core.leonardo_client import TOKEN_BALANCE_QUERY, sum_credits, parse_token_balance
+
+
+def test_sum_credits_includes_apicredit_and_stream():
+    details = {"subscriptionTokens": 100, "paidTokens": 5, "rolloverTokens": 0,
+               "apiCredit": 8500, "streamTokens": 3}
+    assert sum_credits(details) == 8608
+
+
+def test_sum_credits_ignores_missing_and_nonnumeric():
+    assert sum_credits({"subscriptionTokens": 10, "paidTokens": None, "apiCredit": "x"}) == 10
+
+
+def test_parse_token_balance_from_response():
+    resp = {"data": {"user_details": [{"subscriptionTokens": 850, "apiCredit": 0}]}}
+    assert parse_token_balance(resp) == 850
+
+
+def test_parse_token_balance_empty_returns_none():
+    assert parse_token_balance({"data": {"user_details": []}}) is None
+    assert parse_token_balance({}) is None
+
+
+def test_token_balance_query_shape():
+    assert TOKEN_BALANCE_QUERY["operationName"] == "GetTokenBalance"
+    assert "user_details" in TOKEN_BALANCE_QUERY["query"]
