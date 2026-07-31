@@ -5,13 +5,22 @@ import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
+import requests
+
+from core.adobe_client import (
+    AdobeRequestError,
+    AuthError,
+    QuotaExhaustedError,
+    UpstreamTemporaryError,
+)
+from core.leonardo_client import LeonardoClient
 from api.openai_responses import (
     ResponsesRequestError,
     build_responses_image_response,
@@ -107,6 +116,113 @@ def _collect_json_image_refs(
     return []
 
 
+DEFAULT_LEONARDO_MODEL_ID = "7418e71f-4133-4e1b-9895-bee19f48f2ce"  # Nano Banana 2
+
+
+def _map_leonardo_error(exc: Exception) -> Exception:
+    """Leonardo 异常 → Adobe 异常体系，让 _run_with_token_retries 零改动处理。
+
+    LeonardoGenerationError = 生成已提交后失败（轮询超时/上游 FAILED），换号重试会
+    重复扣费 → 非重试 AdobeRequestError → 500。
+    LeonardoError = 提交前失败（invalid JWT/HTTP/传输），可换号重试。
+    """
+    from core.leonardo_generation import LeonardoGenerationError
+
+    if isinstance(exc, LeonardoGenerationError):
+        return AdobeRequestError(str(exc))
+    message = str(exc).lower()
+    if any(kw in message for kw in ("invalid", "jwt", "unauthorized", "verify", "signature")):
+        return AuthError(str(exc))
+    if any(kw in message for kw in ("quota", "insufficient", "exhausted", "credits")):
+        return QuotaExhaustedError(str(exc))
+    return UpstreamTemporaryError(str(exc))
+
+
+def _build_leonardo_run_once(
+    *,
+    leo_client,
+    request: Request,
+    prompt: str,
+    model_id: str,
+    size: Any,
+    aspect_ratio: str,
+    n: int,
+    timeout: int,
+    response_format: str,
+    resolved_model_id: str,
+    output_resolution: str,
+    public_image_url: Callable,
+    generated_dir: Path,
+    on_generated_file_written: Optional[Callable] = None,
+    set_request_preview: Optional[Callable] = None,
+) -> Callable[[str], dict]:
+    from core.leonardo_generation import generate_images, to_aspect
+
+    final_aspect = to_aspect(size=size, aspect_ratio=aspect_ratio)
+    _cdn_headers = {"User-Agent": "adobe2api/1.0", "Accept": "image/*"}
+
+    def _run_once(token: str) -> dict:
+        from core.leonardo_client import LeonardoError
+
+        try:
+            result = generate_images(
+                client=leo_client,
+                token=token,
+                prompt=prompt,
+                model_id=model_id,
+                size=size,
+                aspect_ratio=final_aspect,
+                n=n,
+                timeout=timeout,
+            )
+        except LeonardoError as exc:
+            raise _map_leonardo_error(exc) from exc
+
+        data_items = []
+        for i, item in enumerate(result.get("data") or []):
+            url = str(item.get("url") or "").strip()
+            try:
+                img_resp = requests.get(url, timeout=30, headers=_cdn_headers)
+                img_resp.raise_for_status()
+            except Exception as fetch_exc:
+                # 生成已成功，下载失败不可重试（重试 = 再次扣费）
+                raise AdobeRequestError(
+                    f"failed to fetch generated image from CDN: {fetch_exc}"
+                ) from fetch_exc
+            if response_format == "url":
+                job_id = f"{result['provider']['generation_id']}-{i}"
+                out_path = generated_dir / f"{job_id}.jpg"
+                old_size = 0
+                try:
+                    if out_path.exists():
+                        old_size = int(out_path.stat().st_size)
+                except Exception:
+                    old_size = 0
+                out_path.write_bytes(img_resp.content)
+                new_size = int(out_path.stat().st_size) if out_path.exists() else 0
+                if on_generated_file_written:
+                    on_generated_file_written(out_path, old_size, new_size)
+                data_item = {"url": public_image_url(request, job_id)}
+            else:
+                data_item = {"b64_json": base64.b64encode(img_resp.content).decode()}
+            data_item["revised_prompt"] = prompt
+            data_items.append(data_item)
+
+        if data_items and set_request_preview is not None:
+            first = data_items[0]
+            if "url" in first:
+                set_request_preview(request, first["url"], kind="image")
+
+        return {
+            "created": int(time.time()),
+            "model": resolved_model_id,
+            "data": data_items,
+            "usage": build_image_usage(prompt, output_resolution, final_aspect, ()),
+        }
+
+    return _run_once
+
+
 def build_generation_router(
     *,
     store,
@@ -137,6 +253,7 @@ def build_generation_router(
     extract_prompt_from_messages: Callable[[Any], str],
     sse_chat_stream: Callable[[dict], Any],
     on_generated_file_written: Callable[[Path, int, int], None],
+    leonardo_client=None,
     quota_error_cls,
     auth_error_cls,
     upstream_temp_error_cls,
@@ -357,63 +474,89 @@ def build_generation_router(
         model_conf = resolve_model(resolved_model_id)
         set_request_credit_context(request, resolved_model_id, output_resolution)
 
+        is_leonardo = str(model_conf.get("upstream_model") or "").startswith("leonardo:")
+
         try:
             set_request_task_progress(
                 request, task_status="IN_PROGRESS", task_progress=0.0
             )
 
-            def _run_once(token: str):
-                def _image_progress_cb(update: dict):
-                    set_request_task_progress(
-                        request,
-                        task_status=str(update.get("task_status") or "IN_PROGRESS"),
-                        task_progress=update.get("task_progress"),
-                        upstream_job_id=update.get("upstream_job_id"),
-                        retry_after=update.get("retry_after"),
-                        error=update.get("error"),
-                    )
-
-                artifact = generate_image_artifact(
-                    client=client,
-                    token=token,
+            if is_leonardo:
+                leo_client = leonardo_client or LeonardoClient()
+                run_once = _build_leonardo_run_once(
+                    leo_client=leo_client,
+                    request=request,
                     prompt=prompt,
+                    model_id=DEFAULT_LEONARDO_MODEL_ID,
+                    size=data.get("size"),
                     aspect_ratio=ratio,
+                    n=data.get("n", 1),
+                    timeout=int(data.get("timeout") or 300),
+                    response_format=response_format,
+                    resolved_model_id=resolved_model_id,
                     output_resolution=output_resolution,
-                    model_config=model_conf,
+                    public_image_url=public_image_url,
                     generated_dir=generated_dir,
-                    source_image_ids=[],
-                    output_size=geometry.output_size,
-                    fallback_aspect_ratio=geometry.fallback_aspect_ratio,
-                    progress_cb=_image_progress_cb,
                     on_generated_file_written=on_generated_file_written,
+                    set_request_preview=set_request_preview,
                 )
-                image_url = public_image_url(request, artifact.job_id)
-                set_request_preview(request, image_url, kind="image")
-                # 对齐真实 gpt-image 返回: data[].b64_json + revised_prompt。
-                # adobe/Firefly 上游无提示词改写,revised_prompt 回显原始 prompt,
-                # 避免与真官方账号在结构上出现"有/无该字段"的差异。
-                if response_format == "url":
-                    item = {"url": image_url, "revised_prompt": prompt}
-                else:
-                    item = {
-                        "b64_json": base64.b64encode(artifact.image_bytes).decode(),
-                        "revised_prompt": prompt,
+                token_selector = lambda: token_manager.get_available(token_type="leonardo")
+            else:
+                def run_once(token: str):
+                    def _image_progress_cb(update: dict):
+                        set_request_task_progress(
+                            request,
+                            task_status=str(update.get("task_status") or "IN_PROGRESS"),
+                            task_progress=update.get("task_progress"),
+                            upstream_job_id=update.get("upstream_job_id"),
+                            retry_after=update.get("retry_after"),
+                            error=update.get("error"),
+                        )
+
+                    artifact = generate_image_artifact(
+                        client=client,
+                        token=token,
+                        prompt=prompt,
+                        aspect_ratio=ratio,
+                        output_resolution=output_resolution,
+                        model_config=model_conf,
+                        generated_dir=generated_dir,
+                        source_image_ids=[],
+                        output_size=geometry.output_size,
+                        fallback_aspect_ratio=geometry.fallback_aspect_ratio,
+                        progress_cb=_image_progress_cb,
+                        on_generated_file_written=on_generated_file_written,
+                    )
+                    image_url = public_image_url(request, artifact.job_id)
+                    set_request_preview(request, image_url, kind="image")
+                    # 对齐真实 gpt-image 返回: data[].b64_json + revised_prompt。
+                    # adobe/Firefly 上游无提示词改写,revised_prompt 回显原始 prompt,
+                    # 避免与真官方账号在结构上出现"有/无该字段"的差异。
+                    if response_format == "url":
+                        item = {"url": image_url, "revised_prompt": prompt}
+                    else:
+                        item = {
+                            "b64_json": base64.b64encode(artifact.image_bytes).decode(),
+                            "revised_prompt": prompt,
+                        }
+                    return {
+                        "created": int(time.time()),
+                        "model": resolved_model_id,
+                        "data": [item],
+                        # 该接口不上传输入图(client.generate 无 source_image_ids),
+                        # 输入图 token 恒为 0,不按请求里未使用的图片字段虚计费
+                        "usage": build_image_usage(
+                            prompt, output_resolution, usage_ratio, ()
+                        ),
                     }
-                return {
-                    "created": int(time.time()),
-                    "model": resolved_model_id,
-                    "data": [item],
-                    # 该接口不上传输入图(client.generate 无 source_image_ids),
-                    # 输入图 token 恒为 0,不按请求里未使用的图片字段虚计费
-                    "usage": build_image_usage(
-                        prompt, output_resolution, usage_ratio, ()
-                    ),
-                }
+
+                token_selector = None
 
             return run_with_token_retries(
                 request=request,
                 operation_name="images.generations",
-                run_once=_run_once,
+                run_once=run_once,
+                token_selector=token_selector,
             )
 
         except quota_error_cls:
