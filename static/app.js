@@ -1,4 +1,5 @@
 const runBtn = document.getElementById("runBtn");
+const modelEl = document.getElementById("model");
 const promptEl = document.getElementById("prompt");
 const ratioEl = document.getElementById("ratio");
 const msgEl = document.getElementById("msg");
@@ -64,6 +65,7 @@ runBtn.addEventListener("click", async () => {
 
   const prompt = promptEl.value.trim();
   const aspect_ratio = ratioEl.value;
+  const model = modelEl.value;
 
   if (!prompt) {
     setMessage("Please provide a prompt first.", true);
@@ -75,29 +77,77 @@ runBtn.addEventListener("click", async () => {
   setMessage("Submitting request...");
 
   try {
-    const res = await fetch("/api/v1/generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, aspect_ratio })
-    });
-
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.detail || `submit failed (${res.status})`);
+    // Leonardo 模型使用 OpenAI 兼容接口
+    if (model.startsWith("leonardo-")) {
+      await generateWithLeonardo(prompt, aspect_ratio, model);
+    } else {
+      // Firefly 使用旧接口
+      await generateWithFirefly(prompt, aspect_ratio);
     }
-
-    const taskId = data.task_id;
-    setMessage(`Task accepted: ${taskId.slice(0, 8)}...`);
-    timer = setInterval(() => {
-      pollTask(taskId).catch((err) => {
-        clearInterval(timer);
-        timer = null;
-        setMessage(err.message, true);
-      });
-    }, 2200);
-    await pollTask(taskId);
   } catch (err) {
     setState("failed");
     setMessage(err.message || "Request failed", true);
   }
+});
+
+// Leonardo 生成（OpenAI 兼容接口，同步返回）
+async function generateWithLeonardo(prompt, aspect_ratio, model) {
+  setState("running");
+  setProgress(50);
+  setMessage("Generating with Leonardo...");
+
+  const res = await fetch("/v1/images/generations", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer projectx_webapp"
+    },
+    body: JSON.stringify({
+      model,
+      prompt,
+      aspect_ratio,
+      n: 1,
+      response_format: "url"
+    })
+  });
+
+  const data = await res.json();
+
+  if (!res.ok) {
+    throw new Error(data.error?.message || `Generation failed (${res.status})`);
+  }
+
+  if (data.data && data.data[0] && data.data[0].url) {
+    setState("succeeded");
+    setProgress(100);
+    setMessage("Generation complete!");
+    renderImage(data.data[0].url);
+  } else {
+    throw new Error("Invalid response format");
+  }
+}
+
+// Firefly 生成（异步轮询接口）
+async function generateWithFirefly(prompt, aspect_ratio) {
+  const res = await fetch("/api/v1/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt, aspect_ratio })
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.detail || `submit failed (${res.status})`);
+  }
+
+  const taskId = data.task_id;
+  setMessage(`Task accepted: ${taskId.slice(0, 8)}...`);
+  timer = setInterval(() => {
+    pollTask(taskId).catch((err) => {
+      clearInterval(timer);
+      timer = null;
+      setMessage(err.message, true);
+    });
+  }, 2200);
+  await pollTask(taskId);
 });
