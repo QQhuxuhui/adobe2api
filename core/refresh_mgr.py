@@ -697,6 +697,33 @@ class RefreshManager:
             payload.get("user_id") or payload.get("aa_id") or payload.get("sub") or ""
         ).strip()
 
+    def _fetch_leonardo_credits(self, token_info: Dict) -> Dict:
+        """查询 Leonardo token 的 credits 余额"""
+        from core.leonardo_client import LeonardoClient
+
+        token_value = str(token_info.get("value") or "").strip()
+        if not token_value:
+            raise RuntimeError("empty leonardo token")
+
+        client = LeonardoClient()
+        try:
+            result = client.get_user_credits(token_value)
+            # 返回 Adobe 风格的 credits 格式
+            subscribed = result.get("subscriptionTokens", 0)
+            gpt = result.get("gptTokens", 0)
+            total = subscribed + gpt
+            return {
+                "used": 0,  # Leonardo 只返回剩余，无 used
+                "limit": total,
+                "remaining": total,
+            }
+        except Exception as exc:
+            # Leonardo token 失效时标记但不阻塞启动
+            raise CreditsAuthError(
+                f"token invalid or expired",
+                status_code=401,
+            ) from exc
+
     def _fetch_credits_balance(self, access_token: str, account_id: str) -> Dict:
         token = str(access_token or "").strip()
         aid = str(account_id or "").strip()
@@ -746,6 +773,17 @@ class RefreshManager:
         token_info = token_manager.get_by_id(token_id)
         if not token_info:
             raise KeyError("token not found")
+
+        # Leonardo token 使用不同的 credits API
+        token_type = token_info.get("type")
+        if token_type == "leonardo":
+            credits = self._fetch_leonardo_credits(token_info)
+            token_manager.set_credits(token_id, credits)
+            return {
+                "token_id": token_id,
+                "account_id": token_info.get("account_id"),
+                "credits": credits,
+            }
 
         token_value = str(token_info.get("value") or "").strip()
         account_id = self._extract_account_id(token_value)
