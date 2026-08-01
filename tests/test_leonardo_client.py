@@ -262,7 +262,7 @@ def test_http_gql_retries_transient_query_then_succeeds(monkeypatch):
         def json(self):
             return {"data": {"user_details": [{"apiCredit": 1}]}}
 
-    def fake_post(url, headers=None, json=None, timeout=None):
+    def fake_post(url, headers=None, json=None, timeout=None, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             raise lc.requests.exceptions.ConnectionError("transient boom")
@@ -282,7 +282,7 @@ def test_http_gql_raises_after_exhausting_query_retries(monkeypatch):
     calls = {"n": 0}
     sleeps = []
 
-    def fake_post(url, headers=None, json=None, timeout=None):
+    def fake_post(url, headers=None, json=None, timeout=None, **kwargs):
         calls["n"] += 1
         raise lc.requests.exceptions.ConnectionError("down")
 
@@ -299,7 +299,7 @@ def test_http_gql_does_not_retry_generate_mutation(monkeypatch):
     calls = {"n": 0}
     sleeps = []
 
-    def fake_post(url, headers=None, json=None, timeout=None):
+    def fake_post(url, headers=None, json=None, timeout=None, **kwargs):
         calls["n"] += 1
         raise lc.requests.exceptions.ConnectionError("connection lost")
 
@@ -323,7 +323,7 @@ def test_http_gql_single_shot_transport_raises_retry_unsafe(monkeypatch):
     calls = {"n": 0}
     monkeypatch.setattr(lc.time, "sleep", lambda _s: None)
 
-    def fake_post(url, headers=None, json=None, timeout=None):
+    def fake_post(url, headers=None, json=None, timeout=None, **kwargs):
         calls["n"] += 1
         raise lc.requests.exceptions.ConnectionError("connection lost")
 
@@ -344,7 +344,7 @@ def test_http_gql_retryable_op_transport_exhaustion_is_plain_error(monkeypatch):
     calls = {"n": 0}
     monkeypatch.setattr(lc.time, "sleep", lambda _s: None)
 
-    def fake_post(url, headers=None, json=None, timeout=None):
+    def fake_post(url, headers=None, json=None, timeout=None, **kwargs):
         calls["n"] += 1
         raise lc.requests.exceptions.ConnectionError("down")
 
@@ -361,7 +361,7 @@ def test_http_gql_single_shot_http_error_is_retry_unsafe(monkeypatch):
         ok = False
         status_code = 500
 
-    def fake_post(url, headers=None, json=None, timeout=None):
+    def fake_post(url, headers=None, json=None, timeout=None, **kwargs):
         return _R()
 
     monkeypatch.setattr(lc.requests, "post", fake_post)

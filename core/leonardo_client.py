@@ -203,13 +203,22 @@ class LeonardoClient:
         self._gql_fn = gql  # 可注入；None 时用真实 HTTP
 
     def _http_gql(self, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        import os
         headers = dict(_BASE_HEADERS)
         headers["authorization"] = f"Bearer {token}"
         operation = str(payload.get("operationName") or "")
         attempts = _HTTP_ATTEMPTS if operation in _RETRYABLE_OPERATIONS else 1
+        # 从环境变量读取代理配置
+        proxies = {}
+        http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+        https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        if http_proxy:
+            proxies["http"] = http_proxy
+        if https_proxy:
+            proxies["https"] = https_proxy
         for attempt in range(attempts):
             try:
-                resp = requests.post(GRAPHQL_URL, headers=headers, json=payload, timeout=60)
+                resp = requests.post(GRAPHQL_URL, headers=headers, json=payload, timeout=60, proxies=proxies or None)
             except requests.exceptions.RequestException as exc:
                 if attempt < attempts - 1:
                     time.sleep(_RETRY_BACKOFF)

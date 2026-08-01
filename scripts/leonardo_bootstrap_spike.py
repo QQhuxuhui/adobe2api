@@ -107,11 +107,14 @@ def run(args) -> int:
     sink = {"bearer": None, "session_cookie": None, "all_leonardo_cookies": []}
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=not args.headful,
-            channel="chrome",  # 用本机 google-chrome；失败可去掉此行改用 playwright 自带 chromium
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--lang=en-US"],
-        )
+        launch_opts = {
+            "headless": not args.headful,
+            "channel": "chrome",  # 用本机 google-chrome；失败可去掉此行改用 playwright 自带 chromium
+            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--lang=en-US"],
+        }
+        if args.proxy:
+            launch_opts["proxy"] = {"server": args.proxy}
+        browser = p.chromium.launch(**launch_opts)
         ctx = browser.new_context(locale="en-US", viewport={"width": 1280, "height": 800})
         page = ctx.new_page()
         page.on("request", lambda r: _capture_bearer(r, sink))
@@ -201,6 +204,7 @@ def main() -> int:
     ap.add_argument("--account", required=True, help="账号文件路径（邮箱|字段1|refresh_token|client_id）")
     ap.add_argument("--out", default="leonardo_session.json", help="抓到的会话输出文件")
     ap.add_argument("--headful", action="store_true", help="带浏览器界面（首次调试用）")
+    ap.add_argument("--proxy", help="HTTP/HTTPS 代理地址（如 http://127.0.0.1:10809）")
     return run(ap.parse_args())
 
 
