@@ -256,6 +256,17 @@ class LeonardoClient:
     def get_credits(self, token: str) -> Optional[int]:
         return parse_token_balance(self._call(token, TOKEN_BALANCE_QUERY))
 
+    def get_user_credits(self, token: str) -> Dict[str, int]:
+        """查询用户 credits 详情（用于 refresh_mgr）"""
+        result = self._call(token, TOKEN_BALANCE_QUERY)
+        data = result.get("data", {})
+        user_details = data.get("user_details", []) if isinstance(data, dict) else []
+        details = user_details[0] if user_details else {}
+        return {
+            "subscriptionTokens": details.get("subscriptionTokens", 0),
+            "gptTokens": details.get("apiCredit", 0),  # apiCredit 是 GPT token
+        }
+
     def create_generation(
         self, token, prompt, model_id, aspect_ratio, quantity=1, init_image_ids=None
     ) -> str:
