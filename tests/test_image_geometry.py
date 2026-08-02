@@ -90,6 +90,19 @@ def test_omitted_ratio_maps_gpt_primary_image_to_nearest_ratio():
     assert resolved.output_size is None
 
 
+def test_gpt_image_explicit_size_overrides_primary_image_ratio():
+    resolved = resolve_image_geometry(
+        {"size": "3840x2160", "quality": "low"},
+        "gpt-image-2",
+        [(png_bytes(900, 1600), "image/png")],
+    )
+
+    assert resolved.aspect_ratio == "16:9"
+    assert resolved.usage_ratio == "16:9"
+    assert resolved.output_resolution == "4K"
+    assert resolved.output_size is None
+
+
 def test_multiple_images_always_use_first_image_dimensions():
     resolved = resolve_image_geometry(
         {"aspect_ratio": "free"},

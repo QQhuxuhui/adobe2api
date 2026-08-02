@@ -421,9 +421,10 @@ def resolve_image_geometry(
     model_id: Optional[str],
     input_images: Sequence[tuple[bytes, str]] = (),
 ) -> ResolvedImageGeometry:
-    requested_ratio = str(
+    raw_requested_ratio = str(
         data.get("aspect_ratio") or data.get("aspectRatio") or ""
-    ).strip().lower() or "auto"
+    ).strip().lower()
+    requested_ratio = raw_requested_ratio or "auto"
     requested_size = data.get("size")
     if not model_id and requested_ratio in {"free", "auto"}:
         resolved_model_id = DEFAULT_AUTO_MODEL_ID
@@ -441,6 +442,17 @@ def resolve_image_geometry(
     supported_ratios = tuple(
         model_conf.get("supported_aspect_ratios") or sorted(SUPPORTED_RATIOS)
     )
+    is_gpt_image = (
+        str(model_conf.get("upstream_model_id") or "").strip().lower()
+        == "gpt-image"
+    )
+    if not raw_requested_ratio and not fixed_model_ratio and is_gpt_image:
+        dimensions = _dimensions_from_size(requested_size)
+        if dimensions is not None:
+            requested_ratio = nearest_supported_ratio(
+                dimensions[0], dimensions[1], supported_ratios
+            )
+
     supports_auto = bool(model_conf.get("supports_auto_aspect_ratio"))
     if requested_ratio in {"free", "auto"}:
         resolved_ratio = resolve_requested_aspect_ratio(
@@ -463,7 +475,7 @@ def resolve_image_geometry(
     else:
         resolved_ratio = ResolvedAspectRatio("1:1", "1:1", None)
 
-    if str(model_conf.get("upstream_model_id") or "").strip().lower() == "gpt-image":
+    if is_gpt_image:
         output_resolution = prevent_gpt_image_downscale(
             requested_size, resolved_ratio.aspect_ratio, output_resolution
         )
