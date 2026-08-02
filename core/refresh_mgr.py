@@ -708,14 +708,16 @@ class RefreshManager:
         client = LeonardoClient()
         try:
             result = client.get_user_credits(token_value)
-            # 返回 Adobe 风格的 credits 格式
+            # 字段名须与 token_manager.set_credits 消费的键一致
             subscribed = result.get("subscriptionTokens", 0)
             gpt = result.get("gptTokens", 0)
             total = subscribed + gpt
             return {
+                "total": total,
                 "used": 0,  # Leonardo 只返回剩余，无 used
-                "limit": total,
-                "remaining": total,
+                "available": total,
+                "available_until": None,
+                "updated_at": int(time.time()),
             }
         except Exception as exc:
             # Leonardo token 失效时标记但不阻塞启动
