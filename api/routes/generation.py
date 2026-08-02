@@ -140,6 +140,32 @@ def _map_leonardo_error(exc: Exception) -> Exception:
     return UpstreamTemporaryError(str(exc))
 
 
+# CDN 下载：生成图从 cdn.leonardo.ai 拉回本地。经代理下大图偏慢，
+# 30s 常不够；且下载同一 url 是幂等的（不重新生成、不扣费），失败可安全重试。
+_CDN_FETCH_TIMEOUT = 120
+_CDN_FETCH_ATTEMPTS = 3
+_CDN_FETCH_BACKOFF = 1.0
+
+
+def _fetch_cdn_image(url: str, headers: dict):
+    """下载生成图，扩展超时 + 有限重试。全部失败时抛最后一次异常。
+
+    下载是幂等的（不触发新生成、不扣费），因此与"生成提交"不同，可安全重试。
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(_CDN_FETCH_ATTEMPTS):
+        try:
+            resp = requests.get(url, timeout=_CDN_FETCH_TIMEOUT, headers=headers)
+            resp.raise_for_status()
+            return resp
+        except Exception as exc:  # noqa: BLE001 - 传输/HTTP 错误统一重试
+            last_exc = exc
+            if attempt < _CDN_FETCH_ATTEMPTS - 1:
+                time.sleep(_CDN_FETCH_BACKOFF)
+    assert last_exc is not None
+    raise last_exc
+
+
 def _build_leonardo_run_once(
     *,
     leo_client,
@@ -184,16 +210,17 @@ def _build_leonardo_run_once(
         for i, item in enumerate(result.get("data") or []):
             url = str(item.get("url") or "").strip()
             try:
-                img_resp = requests.get(url, timeout=30, headers=_cdn_headers)
-                img_resp.raise_for_status()
+                img_resp = _fetch_cdn_image(url, _cdn_headers)
             except Exception as fetch_exc:
-                # 生成已成功，下载失败不可重试（重试 = 再次扣费）
+                # 生成已成功；下载已内部重试仍失败 → 不重发生成（重发 = 再次扣费）
                 raise AdobeRequestError(
                     f"failed to fetch generated image from CDN: {fetch_exc}"
                 ) from fetch_exc
             if response_format == "url":
                 job_id = f"{result['provider']['generation_id']}-{i}"
-                out_path = generated_dir / f"{job_id}.jpg"
+                # 扩展名须与 public_image_url 约定一致（固定 .png），否则返回的
+                # url 指向 .png 而文件落成别的扩展名 → /generated 命中不到 → 404
+                out_path = generated_dir / f"{job_id}.png"
                 old_size = 0
                 try:
                     if out_path.exists():
