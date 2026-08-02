@@ -1,4 +1,6 @@
+import base64
 import json
+import re
 import threading
 import time
 import uuid
@@ -339,10 +341,80 @@ class RefreshManager:
                 return p
         return None
 
+    # 单个 JWT/JWE 主体：eyJ 开头 + 3~5 段 base64url。整串匹配（普通 cookie 含
+    # =/; 不会命中；含 token 值的 cookie 如 name=eyJ... 因不以 eyJ 起始也不命中）。
+    _JWT_BODY_RE = re.compile(r"^eyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,4}$")
+    _BEARER_RE = re.compile(r"^bearer\s+\S", re.IGNORECASE)
+
+    @staticmethod
+    def _jwt_header_has_alg(seg: str) -> bool:
+        """首段 base64url 解出的 JSON 是否是含 alg 的 JWT/JWE 头。
+
+        用于把真正的 JWT/JWE 与"恰好三段 base64url"的普通签名 cookie 值
+        （如 Flask/itsdangerous session）区分开——后者头段解出无 alg。
+        """
+        try:
+            pad = "=" * ((4 - len(seg) % 4) % 4)
+            data = json.loads(base64.urlsafe_b64decode(seg + pad).decode("utf-8"))
+        except Exception:
+            return False
+        return isinstance(data, dict) and "alg" in data
+
+    @classmethod
+    def _is_single_token(cls, text: str) -> bool:
+        """单个字符串是否是一个 token（JWT/Bearer）。
+
+        - 归一化：去两端空白（含 unicode/零宽）、成对引号、`authorization:`/`cookie:` 抓包前缀；
+        - 显式 `Bearer ` 标记 = token（不论后段是 JWT 还是不透明串）；
+        - 否则整串须是单个 JWT/JWE（eyJ 开头、3~5 段 base64url，容忍尾随 .;, 噪声），
+          且首段解出的头含 `alg`（排除普通 base64url 签名 cookie 值）。
+        """
+        s = str(text or "")
+        # 去零宽字符 + 各类空白（strip 默认不去零宽）
+        s = s.strip().strip("​‌‍﻿").strip()
+        if not s:
+            return False
+        # 去抓包/复制常见的 header 标签前缀
+        low = s.lower()
+        for prefix in ("authorization:", "cookie:"):
+            if low.startswith(prefix):
+                s = s[len(prefix):].strip()
+                break
+        # 去成对包裹引号
+        if len(s) >= 2 and s[0] in "\"'" and s[-1] == s[0]:
+            s = s[1:-1].strip()
+        # 显式 Bearer 标记：明确是 token
+        if cls._BEARER_RE.match(s):
+            return True
+        # 否则整串须是 JWT/JWE 主体（容忍尾随噪声）
+        core = s.rstrip(".;, \t")
+        if not cls._JWT_BODY_RE.match(core):
+            return False
+        return cls._jwt_header_has_alg(core.split(".", 1)[0])
+
+    @classmethod
+    def _looks_like_token(cls, text: str) -> bool:
+        """判定输入是否是 token（JWT/Bearer）而非 Cookie。
+
+        「导入 Cookie」是 Adobe 专用（cookie→IMS 刷新）；Leonardo/Adobe 的
+        Bearer 应走「添加 Token」。粘错时这里拦下，避免把 token 当 cookie
+        刷出 GuestID。整串是单个 token，或多行且每行都是 token（多个 token
+        粘进 Cookie 框）时判为 token。普通 cookie（k=v; …）与 JSON 导出不命中。
+        """
+        if cls._is_single_token(text):
+            return True
+        lines = [ln for ln in re.split(r"[\r\n]+", str(text or "")) if ln.strip()]
+        return len(lines) >= 2 and all(cls._is_single_token(ln) for ln in lines)
+
     def import_cookie(self, cookie_input, name: Optional[str] = None) -> Dict:
         cookie = self._cookie_string_from_input(cookie_input)
         if not cookie:
             raise ValueError("cookie is required")
+        if self._looks_like_token(cookie):
+            raise ValueError(
+                "这看起来是 token（Adobe/Leonardo Bearer），不是 Cookie；"
+                "请改用『添加 Token』导入"
+            )
         firefly_headers = self._firefly_headers_from_input(cookie_input)
         account = self._account_from_cookie_input(
             cookie_input

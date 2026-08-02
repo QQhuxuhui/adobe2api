@@ -358,6 +358,7 @@
       </div>
       <div class="add-form">
         <textarea id="tokenInput" placeholder="支持批量添加：一行一个 Token（例如\neyJhbGciOiJSUz...\neyJhbGciOiJSUz...）"></textarea>
+        <p class="help">Adobe 与 Leonardo(Cognito) Bearer 均粘这里，系统按 token 形态自动识别类型。Leonardo 账号请勿走「导入 Cookie」。</p>
         <div class="form-group" style="margin-top: 10px;">
           <label for="tokenFile">或上传 Token 文件（支持多选）</label>
           <input type="file" id="tokenFile" accept="text/plain,.txt,application/json,.json" multiple />
@@ -382,6 +383,7 @@
           <label for="cookieInput">导入 Cookie（支持单个或批量）</label>
           <textarea id="cookieInput" rows="7" placeholder="支持：\n1) Cookie 字符串：k1=v1; k2=v2\n2) 浏览器导出的 cookie 数组 JSON\n3) 批量：[{\"name\":\"账号A\",\"cookie\":\"k=v;...\"},{\"name\":\"账号B\",\"cookie\":[...]}]"></textarea>
           <p class="help">导入后会自动立即刷新一次。批量导入建议使用数组格式。</p>
+          <p class="help">仅用于 Adobe 账号的 Cookie→自动刷新。若你手上是一段 Bearer / JWT（Adobe 或 Leonardo），请改用「添加 Token」。</p>
         </div>
 
         <div class="form-group">
