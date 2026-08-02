@@ -613,3 +613,32 @@ def test_edits_maps_quota_error_to_429(tmp_path: Path):
 
     assert response.status_code == 429
     assert response.json()["error"]["type"] == "rate_limit_error"
+
+
+def test_edits_json_explicit_size_beats_portrait_input_image(tmp_path: Path):
+    """客诉复现: 参考图 9:16 + size 16:9 且不传 aspect_ratio, 结果按参考图出图。
+
+    走 JSON body(images[{image_url}]) 这条下游 sub2api 实际用的链路,
+    确认显式 size 一路传到上游 generate 的 aspect_ratio。
+    """
+    adobe = FakeAdobeClient()
+    recorded: list = []
+    client, _, _ = make_client(
+        tmp_path, adobe, load_input_images=recording_load_input_images(recorded)
+    )
+
+    response = client.post(
+        "/v1/images/edits",
+        json={
+            "model": "gpt-image-2",
+            "prompt": "三视图设定图",
+            "images": [{"image_url": data_url(png_bytes(900, 1600))}],
+            "n": 1,
+            "quality": "low",
+            "size": "3840x2160",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert adobe.generate_kwargs["aspect_ratio"] == "16:9"
+    assert adobe.generate_kwargs["upstream_model_id"] == "gpt-image"
