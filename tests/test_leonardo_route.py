@@ -103,6 +103,27 @@ def test_run_once_success_b64(monkeypatch):
     assert result["usage"]["total_tokens"] > 0
 
 
+def test_run_once_threads_model_slug(monkeypatch):
+    import core.leonardo_generation as lg
+
+    captured = {}
+
+    def fake_generate_images(**kw):
+        captured.update(kw)
+        return {
+            "created": int(time.time()),
+            "data": [{"url": "https://cdn.leonardo.ai/generations/x/img-0.jpg"}],
+            "provider": {"generation_id": "gen-abc", "aspect_ratio": "1:1", "model_id": "x"},
+        }
+
+    monkeypatch.setattr(lg, "generate_images", fake_generate_images)
+    monkeypatch.setattr(req_mod, "get", lambda url, timeout, headers: _fake_img_resp())
+
+    _build_run_once(model_id="UUID-42", model_slug="gpt-image-2")("leo-token")
+    assert captured["model_slug"] == "gpt-image-2"
+    assert captured["model_id"] == "UUID-42"
+
+
 def test_run_once_success_url(monkeypatch, tmp_path):
     import core.leonardo_generation as lg
 

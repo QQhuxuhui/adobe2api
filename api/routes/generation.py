@@ -172,6 +172,7 @@ def _build_leonardo_run_once(
     request: Request,
     prompt: str,
     model_id: str,
+    model_slug: str = "nano-banana-2",
     size: Any,
     aspect_ratio: str,
     n: int,
@@ -198,6 +199,7 @@ def _build_leonardo_run_once(
                 token=token,
                 prompt=prompt,
                 model_id=model_id,
+                model_slug=model_slug,
                 size=size,
                 aspect_ratio=final_aspect,
                 n=n,
@@ -512,11 +514,16 @@ def build_generation_router(
 
             if is_leonardo:
                 leo_client = leonardo_client or LeonardoClient()
+                # upstream_model = "leonardo:<slug>"（slug=request.model），
+                # upstream_model_id = Leonardo custom_models 的 modelId UUID。
+                leo_slug = str(model_conf.get("upstream_model") or "").split(":", 1)[1]
+                leo_model_id = str(model_conf.get("upstream_model_id") or "").strip() or DEFAULT_LEONARDO_MODEL_ID
                 run_once = _build_leonardo_run_once(
                     leo_client=leo_client,
                     request=request,
                     prompt=prompt,
-                    model_id=DEFAULT_LEONARDO_MODEL_ID,
+                    model_id=leo_model_id,
+                    model_slug=leo_slug or "nano-banana-2",
                     size=data.get("size"),
                     aspect_ratio=ratio,
                     n=data.get("n", 1),

@@ -110,6 +110,8 @@ def build_generate_payload(
     height: int,
     quantity: int = 1,
     init_image_ids: Optional[List[str]] = None,
+    *,
+    model_slug: str = "nano-banana-2",
 ) -> Dict[str, Any]:
     params: Dict[str, Any] = {
         "width": width,
@@ -133,7 +135,9 @@ def build_generate_payload(
         }
     return {
         "operationName": "Generate",
-        "variables": {"request": {"model": "nano-banana-2", "parameters": params, "public": True}},
+        # request.model 是服务端校验的模型 slug（= sdVersion 小写连字符化），
+        # 它决定实际出图模型并覆盖 parameters.modelId；两者需成对匹配。
+        "variables": {"request": {"model": model_slug, "parameters": params, "public": True}},
         "query": _GENERATE_QUERY,
     }
 
@@ -268,10 +272,13 @@ class LeonardoClient:
         }
 
     def create_generation(
-        self, token, prompt, model_id, aspect_ratio, quantity=1, init_image_ids=None
+        self, token, prompt, model_id, aspect_ratio, quantity=1, init_image_ids=None,
+        *, model_slug="nano-banana-2"
     ) -> str:
         width, height = aspect_to_size(aspect_ratio)
-        payload = build_generate_payload(prompt, model_id, width, height, quantity, init_image_ids)
+        payload = build_generate_payload(
+            prompt, model_id, width, height, quantity, init_image_ids, model_slug=model_slug
+        )
         return parse_generation_id(self._call(token, payload))
 
     def poll_status(self, token: str, gen_id: str) -> str:

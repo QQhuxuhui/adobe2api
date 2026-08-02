@@ -39,6 +39,7 @@ def generate_images(
     *,
     prompt: str,
     model_id: str,
+    model_slug: str = "nano-banana-2",
     size: Optional[str] = None,
     aspect_ratio: Optional[str] = None,
     n: int = 1,
@@ -53,7 +54,7 @@ def generate_images(
     quantity = clamp_quantity(n)
 
     gen_id = client.create_generation(
-        token, prompt, model_id, aspect, quantity=quantity
+        token, prompt, model_id, aspect, quantity=quantity, model_slug=model_slug
     )
     try:
         result = client.wait_for_completion(

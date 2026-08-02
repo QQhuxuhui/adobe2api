@@ -40,9 +40,11 @@ class _FakeClient:
         self._credits = credits
         self.calls = {}
 
-    def create_generation(self, token, prompt, model_id, aspect_ratio, quantity=1, init_image_ids=None):
+    def create_generation(self, token, prompt, model_id, aspect_ratio, quantity=1,
+                          init_image_ids=None, model_slug="nano-banana-2"):
         self.calls["create"] = dict(token=token, prompt=prompt, model_id=model_id,
-                                    aspect_ratio=aspect_ratio, quantity=quantity)
+                                    aspect_ratio=aspect_ratio, quantity=quantity,
+                                    model_slug=model_slug)
         return self._gen_id
 
     def wait_for_completion(self, token, gen_id, **kwargs):
@@ -62,6 +64,19 @@ def test_generate_images_happy_path():
     assert client.calls["create"]["quantity"] == 2
 
 
+def test_generate_images_threads_model_slug():
+    client = _FakeClient()
+    generate_images(client, "TOK", prompt="a cat", model_id="M1",
+                    aspect_ratio="1:1", model_slug="gpt-image-2")
+    assert client.calls["create"]["model_slug"] == "gpt-image-2"
+
+
+def test_generate_images_defaults_model_slug_nano_banana_2():
+    client = _FakeClient()
+    generate_images(client, "TOK", prompt="a cat", model_id="M1", aspect_ratio="1:1")
+    assert client.calls["create"]["model_slug"] == "nano-banana-2"
+
+
 def test_generate_images_requires_model_id():
     with pytest.raises(LeonardoError):
         generate_images(_FakeClient(), "TOK", prompt="x", model_id="")
@@ -79,7 +94,7 @@ def test_generate_images_raises_generation_error_on_timeout():
     from core.leonardo_generation import LeonardoGenerationError, generate_images
 
     class _FakeClient:
-        def create_generation(self, token, prompt, model_id, aspect_ratio, quantity=1):
+        def create_generation(self, token, prompt, model_id, aspect_ratio, quantity=1, model_slug="nano-banana-2"):
             return "gen-1"
 
         def wait_for_completion(self, token, gen_id, *, timeout, poll_interval, sleep=None, now=None):
@@ -99,7 +114,7 @@ def test_generate_images_converts_wait_poll_raise_to_generation_error():
     from core.leonardo_generation import LeonardoGenerationError, generate_images
 
     class _FakeClient:
-        def create_generation(self, token, prompt, model_id, aspect_ratio, quantity=1):
+        def create_generation(self, token, prompt, model_id, aspect_ratio, quantity=1, model_slug="nano-banana-2"):
             return "gen-1"
 
         def wait_for_completion(self, token, gen_id, *, timeout, poll_interval, sleep=None, now=None):
@@ -119,7 +134,7 @@ def test_generate_images_passes_create_transport_unsafe_error_through():
     from core.leonardo_generation import generate_images
 
     class _FakeClient:
-        def create_generation(self, token, prompt, model_id, aspect_ratio, quantity=1):
+        def create_generation(self, token, prompt, model_id, aspect_ratio, quantity=1, model_slug="nano-banana-2"):
             raise LeonardoRetryUnsafeError(
                 "graphql Generate failed; request not retried to avoid duplicate side effects: connection lost"
             )

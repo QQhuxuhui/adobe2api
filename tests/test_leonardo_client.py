@@ -111,6 +111,13 @@ def test_build_generate_payload_core_fields():
     assert "guidances" not in params                 # 无参考图
 
 
+def test_build_generate_payload_honors_model_slug():
+    p = build_generate_payload("x", "UUID-9", 1024, 1024, model_slug="gpt-image-2")
+    req = p["variables"]["request"]
+    assert req["model"] == "gpt-image-2"          # 包裹层 = 目标模型 slug
+    assert req["parameters"]["modelId"] == "UUID-9"
+
+
 def test_build_generate_payload_with_reference_images():
     p = build_generate_payload("x", "M", 1536, 1536, init_image_ids=["img-1"])
     ref = p["variables"]["request"]["parameters"]["guidances"]["image_reference"]

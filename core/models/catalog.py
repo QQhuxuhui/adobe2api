@@ -206,14 +206,36 @@ _register_base_model(
 
 LEONARDO_SUPPORTED_RATIOS = ("1:1", "16:9", "9:16", "4:3")
 
-_register_base_model(
-    "leonardo-nano-banana-2",
-    upstream_model="leonardo:nano-banana-2",
-    upstream_model_id="leonardo",
-    upstream_model_version="nano-banana-2",
-    label="Leonardo Nano Banana 2",
-    supports_auto_aspect_ratio=True,
-    supported_aspect_ratios=LEONARDO_SUPPORTED_RATIOS,
+# Leonardo 多模型：走新 Generate 管线，request.model = slug（= sdVersion 小写连字符化），
+# parameters.modelId = 下方 UUID（Leonardo custom_models 的 modelId）。slug 决定实际模型。
+# upstream_model 编码为 "leonardo:<slug>"，upstream_model_id 存 UUID，路由据此透传。
+def _register_leonardo_model(model_id: str, slug: str, uuid: str, label: str) -> None:
+    _register_base_model(
+        model_id,
+        upstream_model=f"leonardo:{slug}",
+        upstream_model_id=uuid,
+        upstream_model_version=slug,
+        label=label,
+        supports_auto_aspect_ratio=True,
+        supported_aspect_ratios=LEONARDO_SUPPORTED_RATIOS,
+    )
+
+
+_register_leonardo_model(
+    "leonardo-nano-banana-2", "nano-banana-2",
+    "7418e71f-4133-4e1b-9895-bee19f48f2ce", "Leonardo Nano Banana 2",
+)
+_register_leonardo_model(
+    "leonardo-nano-banana-pro", "gemini-image-2",
+    "7c02ef35-3a6b-4df6-b78d-873e5032c3b4", "Leonardo Nano Banana Pro",
+)
+_register_leonardo_model(
+    "leonardo-gpt-image-2", "gpt-image-2",
+    "135b2740-a20b-48c8-8f86-6f68199e06c5", "Leonardo GPT Image-2",
+)
+_register_leonardo_model(
+    "leonardo-gpt-image-1", "gpt-image-1",
+    "f75b1998-e5cb-4fdf-9eef-98e8186c2c2f", "Leonardo GPT Image-1",
 )
 
 DEFAULT_MODEL_ID = "firefly-nano-banana-pro-2k-16x9"
