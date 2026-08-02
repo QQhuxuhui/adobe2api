@@ -17,3 +17,4 @@ tests/canva_member_emails_*.txt
 leonardo_session.json
 leonardo_auth.json
 browser_profile/
+canva_login_check.png

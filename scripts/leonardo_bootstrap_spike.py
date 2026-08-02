@@ -101,22 +101,41 @@ def run(args) -> int:
 
     try:
         from playwright.sync_api import sync_playwright
+        from playwright_stealth import Stealth
     except ImportError:
-        raise SystemExit("缺 playwright：pip install playwright && playwright install chromium")
+        raise SystemExit("缺 playwright 或 playwright_stealth：pip install playwright playwright-stealth && playwright install chromium")
 
     sink = {"bearer": None, "session_cookie": None, "all_leonardo_cookies": []}
 
     with sync_playwright() as p:
         launch_opts = {
             "headless": not args.headful,
-            "channel": "chrome",  # 用本机 google-chrome；失败可去掉此行改用 playwright 自带 chromium
-            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--lang=en-US"],
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--lang=en-US",
+                "--disable-dev-shm-usage",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+            ],
         }
         if args.proxy:
             launch_opts["proxy"] = {"server": args.proxy}
         browser = p.chromium.launch(**launch_opts)
-        ctx = browser.new_context(locale="en-US", viewport={"width": 1280, "height": 800})
+        ctx = browser.new_context(
+            locale="en-US",
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        )
+        # 注入 JS 隐藏 webdriver 特征
+        ctx.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.navigator.chrome = {runtime: {}};
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+        """)
         page = ctx.new_page()
+        Stealth().apply_stealth_sync(page)  # 应用 stealth 反检测
         page.on("request", lambda r: _capture_bearer(r, sink))
 
         # ---- A. Canva 邮箱验证码登录 ----
