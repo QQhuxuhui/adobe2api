@@ -204,7 +204,12 @@ _register_base_model(
     supported_aspect_ratios=GPT_IMAGE_FIXED_RATIOS,
 )
 
-LEONARDO_SUPPORTED_RATIOS = ("1:1", "16:9", "9:16", "4:3")
+# 各 Leonardo 模型「上游实测真能出」的比例（nano-banana 系没有 4:3——发 4:3 会被
+# 上游改写成方图），据此如实声明，不宣称做不到的比例。
+def _leonardo_ratios_for(slug: str) -> tuple[str, ...]:
+    from core.leonardo_client import leonardo_supported_aspects
+
+    return tuple(leonardo_supported_aspects(slug))
 
 # Leonardo 多模型：走新 Generate 管线，request.model = slug（= sdVersion 小写连字符化），
 # parameters.modelId = 下方 UUID（Leonardo custom_models 的 modelId）。slug 决定实际模型。
@@ -217,7 +222,7 @@ def _register_leonardo_model(model_id: str, slug: str, uuid: str, label: str) ->
         upstream_model_version=slug,
         label=label,
         supports_auto_aspect_ratio=True,
-        supported_aspect_ratios=LEONARDO_SUPPORTED_RATIOS,
+        supported_aspect_ratios=_leonardo_ratios_for(slug),
     )
 
 

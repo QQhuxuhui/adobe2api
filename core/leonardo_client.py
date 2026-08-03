@@ -108,11 +108,23 @@ def parse_token_balance(resp: Dict[str, Any]) -> Optional[int]:
     return sum_credits(rows[0])
 
 
-ASPECT_TO_SIZE = {
-    "16:9": (2752, 1536),
-    "9:16": (1536, 2752),
-    "1:1": (1536, 1536),
-    "4:3": (2048, 1536),
+# 上游「实际接受」的出图尺寸，按模型族 × 比例 × 分辨率档列出（线上逐张量像素校准）。
+# 不在表内的尺寸会被上游静默改写成别的比例，或直接被拒绝，因此这里只列实测可用值：
+#   nano-banana 系：1:1 只有 1024²(1K)/2048²(2K)（发 1536² 会被降到 1024²）；
+#                   无 4:3（发 2048x1536 回 2048x2048 方图；官方档 2368x1792 被直接拒）。
+#   gpt-image 系：1:1=1536²、4:3=2048x1536、16:9/9:16 同 nano-banana，均精确接受。
+LEONARDO_SIZES: dict[str, dict[str, dict[str, Tuple[int, int]]]] = {
+    "gemini": {
+        "1:1": {"1K": (1024, 1024), "2K": (2048, 2048)},
+        "16:9": {"1K": (2752, 1536), "2K": (2752, 1536)},
+        "9:16": {"1K": (1536, 2752), "2K": (1536, 2752)},
+    },
+    "gpt": {
+        "1:1": {"1K": (1536, 1536), "2K": (1536, 1536)},
+        "16:9": {"1K": (2752, 1536), "2K": (2752, 1536)},
+        "9:16": {"1K": (1536, 2752), "2K": (1536, 2752)},
+        "4:3": {"1K": (2048, 1536), "2K": (2048, 1536)},
+    },
 }
 _STYLE_IDS = ["111dc692-d470-4eec-b791-3475abac4c46"]
 _GENERATE_QUERY = (
@@ -121,8 +133,29 @@ _GENERATE_QUERY = (
 )
 
 
-def aspect_to_size(aspect: str) -> Tuple[int, int]:
-    return ASPECT_TO_SIZE.get(aspect, ASPECT_TO_SIZE["1:1"])
+def leonardo_family(model_slug: Optional[str]) -> str:
+    """模型族：gpt-image-* 为 gpt 族，其余(nano-banana-2/gemini-image-2)为 gemini 族。"""
+    return "gpt" if str(model_slug or "").startswith("gpt-image") else "gemini"
+
+
+def leonardo_supported_aspects(model_slug: Optional[str]) -> Tuple[str, ...]:
+    """该模型上游真正能出的比例（其余一律 400，不静默改写）。"""
+    return tuple(LEONARDO_SIZES[leonardo_family(model_slug)])
+
+
+def aspect_to_size(
+    aspect: str,
+    *,
+    model_slug: Optional[str] = None,
+    output_resolution: str = "2K",
+) -> Optional[Tuple[int, int]]:
+    """(比例, 分辨率档) → 上游可用像素；不可实现返回 None（由上层转 400）。"""
+    ratios = LEONARDO_SIZES[leonardo_family(model_slug)]
+    by_res = ratios.get(str(aspect or "").strip())
+    if not by_res:
+        return None
+    res = str(output_resolution or "2K").strip().upper()
+    return by_res.get(res) or by_res.get("2K")
 
 
 def build_generate_payload(
@@ -376,9 +409,19 @@ class LeonardoClient:
         init_image_ids=None,
         *,
         model_slug="nano-banana-2",
+        output_resolution: str = "2K",
         deadline: Optional[float] = None,
     ) -> str:
-        width, height = aspect_to_size(aspect_ratio)
+        size = aspect_to_size(
+            aspect_ratio, model_slug=model_slug, output_resolution=output_resolution
+        )
+        if size is None:
+            # 兜底：路由应已 400 拦截；到这里说明比例对该模型不可实现，
+            # 绝不能退回别的尺寸（上游会静默改写成别的比例）。
+            raise LeonardoError(
+                f"aspect ratio {aspect_ratio} is not supported by model {model_slug}"
+            )
+        width, height = size
         payload = build_generate_payload(
             prompt, model_id, width, height, quantity, init_image_ids, model_slug=model_slug
         )

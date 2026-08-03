@@ -22,7 +22,11 @@ from core.adobe_client import (
     UpstreamTemporaryError,
 )
 from core.leonardo_client import LeonardoClient
-from core.leonardo_generation import pool_prefers_leonardo
+from core.leonardo_generation import (
+    leonardo_geometry_error,
+    pool_prefers_leonardo,
+    to_aspect,
+)
 from api.openai_responses import (
     ResponsesRequestError,
     build_responses_image_response,
@@ -249,6 +253,7 @@ def _build_leonardo_run_once(
                 aspect_ratio=final_aspect,
                 n=n,
                 timeout=timeout,
+                output_resolution=output_resolution,
             )
         except LeonardoError as exc:
             raise _map_leonardo_error(exc) from exc
@@ -573,6 +578,28 @@ def build_generation_router(
                     }
                 },
             )
+        if is_leonardo:
+            # 该比例上游是否真能出（如 nano-banana 系无 4:3，硬发会回方图）→ 不可实现即 400。
+            # 显式传的比例优先判：resolver 对不支持的比例是"静默吸附"，会把 4:3 换成别的，
+            # 那样客户端会拿到与请求不符的图；显式请求做不到就必须报错。
+            _leo_slug = str(model_conf.get("upstream_model") or "").split(":", 1)[1]
+            _requested_ratio = str(data.get("aspect_ratio") or "").strip()
+            _check_ratio = (
+                _requested_ratio
+                if _requested_ratio and _requested_ratio not in {"auto", "free"}
+                else to_aspect(size=data.get("size"), aspect_ratio=ratio)
+            )
+            _geo_err = leonardo_geometry_error(_leo_slug, _check_ratio)
+            if _geo_err:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": _geo_err,
+                            "type": "invalid_request_error",
+                        }
+                    },
+                )
         # 展示/计费用公开名（如 gpt-image-2），后端仍是 leonardo-gpt-image-2。
         display_model_id = public_display_id or resolved_model_id
         set_request_credit_context(request, display_model_id, output_resolution)

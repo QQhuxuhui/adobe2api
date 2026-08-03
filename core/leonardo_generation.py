@@ -76,6 +76,23 @@ def classify_leonardo_error(exc: Exception) -> str:
     return "temp"
 
 
+def leonardo_geometry_error(model_slug, aspect: str) -> Optional[str]:
+    """比例对该 Leonardo 模型是否可实现；不可实现返回给客户端的 400 文案，否则 None。
+
+    上游对不支持的比例不会报错，而是**静默改写**（如 nano-banana 系收到 4:3 会回
+    2048x2048 方图），因此必须在出图前拦下来，避免下游拿到错比例的图。
+    """
+    from core.leonardo_client import aspect_to_size, leonardo_supported_aspects
+
+    if aspect_to_size(aspect, model_slug=model_slug) is not None:
+        return None
+    allowed = ", ".join(leonardo_supported_aspects(model_slug))
+    return (
+        f"aspect ratio {aspect} is not supported by this model; "
+        f"supported ratios: {allowed}"
+    )
+
+
 def pool_prefers_leonardo(token_manager) -> bool:
     """共享公开名（gemini-3-pro-image / gpt-image-2 等）该不该用 Leonardo 后端。
 
@@ -110,6 +127,7 @@ def generate_images(
     timeout: float = 300,
     poll_interval: int = 4,
     deadline: Optional[float] = None,
+    output_resolution: str = "2K",
     now=time.time,
 ) -> Dict[str, Any]:
     if not (model_id or "").strip():
@@ -118,7 +136,11 @@ def generate_images(
     aspect = to_aspect(size=size, aspect_ratio=aspect_ratio)
     quantity = clamp_quantity(n)
 
-    create_kwargs = {"quantity": quantity, "model_slug": model_slug}
+    create_kwargs = {
+        "quantity": quantity,
+        "model_slug": model_slug,
+        "output_resolution": output_resolution,
+    }
     if deadline is not None:
         create_kwargs["deadline"] = deadline
     gen_id = client.create_generation(

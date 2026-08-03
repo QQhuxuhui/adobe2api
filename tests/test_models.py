@@ -5,6 +5,14 @@ def test_leonardo_model_in_catalog():
     assert conf["upstream_model"] == "leonardo:nano-banana-2"
     assert conf["dynamic"] is True
     assert conf["supports_auto_aspect_ratio"] is True
+    # nano-banana 系上游无 4:3（实测发 4:3 会被改写成方图）→ 不再宣称支持
+    assert set(conf["supported_aspect_ratios"]) == {"1:1", "16:9", "9:16"}
+
+
+def test_leonardo_gpt_model_keeps_4x3():
+    from core.models.catalog import MODEL_CATALOG
+    conf = MODEL_CATALOG["leonardo-gpt-image-2"]
+    # gpt-image 系实测支持 4:3(2048x1536)
     assert set(conf["supported_aspect_ratios"]) == {"1:1", "16:9", "9:16", "4:3"}
 
 

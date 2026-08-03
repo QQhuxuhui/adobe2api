@@ -27,6 +27,7 @@ from core.models.catalog import (
 )
 from core.models.resolver import resolve_requested_aspect_ratio
 from core.leonardo_generation import pool_prefers_leonardo
+from core.leonardo_client import leonardo_supported_aspects
 from core.video_tasks import (
     VideoTaskCapacityError,
     VideoTaskSpec,
@@ -89,8 +90,8 @@ class GeminiModelSpec:
         return bool(self.leonardo_slug and self.leonardo_model_id)
 
 
-# Leonardo 出图链路是纯文生图，且仅支持这 4 种比例（= core.leonardo_generation._SUPPORTED_ASPECTS）。
-LEONARDO_IMAGE_RATIOS = frozenset({"1:1", "16:9", "9:16", "4:3"})
+# Leonardo 出图链路是纯文生图；可用比例按模型族取自实测尺寸表
+# （nano-banana 系没有 4:3——硬发会被上游改写成方图，故不对外声明）。
 # 池里只有 Leonardo token 时，把这些公开名的后端换成 Leonardo。
 # 值 = (slug, custom_models UUID)，与 core.models.catalog 的 _register_leonardo_model 一致。
 LEONARDO_GEMINI_BACKEND: dict[str, tuple[str, str]] = {
@@ -117,7 +118,7 @@ def leonardo_variant(spec: "GeminiModelSpec") -> "GeminiModelSpec":
         spec,
         leonardo_slug=slug,
         leonardo_model_id=model_uuid,
-        aspect_ratios=LEONARDO_IMAGE_RATIOS,
+        aspect_ratios=frozenset(leonardo_supported_aspects(slug)),
     )
 
 
@@ -1058,6 +1059,7 @@ def build_gemini_native_router(
                             n=1,
                             timeout=leo_timeout,
                             deadline=deadline,
+                            output_resolution=parsed.image_size,
                         )
                     except LeonardoError as exc:
                         raise _map_leo_error(exc) from exc

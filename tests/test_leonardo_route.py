@@ -80,7 +80,7 @@ def test_generation_error_maps_to_non_retryable():
 # --- _build_leonardo_run_once 成功路径 ---
 
 class _FakeLeoClient:
-    def create_generation(self, token, prompt, model_id, aspect_ratio, quantity=1):
+    def create_generation(self, token, prompt, model_id, aspect_ratio, quantity=1, **kw):
         return "gen-abc"
 
 

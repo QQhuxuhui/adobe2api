@@ -69,6 +69,7 @@ class FakeLeonardoClient:
         quantity=1,
         model_slug="nano-banana-2",
         deadline=None,
+        output_resolution="2K",
     ):
         self.create_deadlines.append(deadline)
         self.create_calls.append(
@@ -79,6 +80,7 @@ class FakeLeonardoClient:
                 "aspect": aspect,
                 "quantity": quantity,
                 "model_slug": model_slug,
+                "output_resolution": output_resolution,
             }
         )
         if self._raise_on_create is not None:
@@ -351,6 +353,39 @@ def test_leo_pool_4k_request_rejected(tmp_path):
     assert resp.status_code == 400, resp.text
     assert resp.json()["error"]["status"] == "INVALID_ARGUMENT"
     assert h.leo.create_calls == []
+
+
+def test_leo_pool_4x3_rejected_not_silently_squared(tmp_path):
+    # 实测：nano-banana 系上游没有 4:3，硬发 2048x1536 会回 2048x2048 方图。
+    # 必须 400 拦下，绝不能生成一张与请求比例不符的图。
+    h = Harness(tmp_path)
+    resp = post(h, "gemini-3-pro-image", "generateContent", image_request(ratio="4:3"))
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["status"] == "INVALID_ARGUMENT"
+    assert h.leo.create_calls == []
+
+
+def test_leo_pool_lists_only_achievable_ratios(tmp_path):
+    h = Harness(tmp_path)
+    r = h.http.get("/v1beta/models", headers={"x-goog-api-key": "test-key"})
+    assert r.status_code == 200
+    by_id = {m["name"].split("/")[-1]: m for m in r.json()["models"]}
+    for name in ("gemini-3-pro-image", "gemini-3.1-flash-image"):
+        ratios = set(by_id[name].get("supportedAspectRatios") or [])
+        if ratios:  # 该字段存在时不得声明 4:3
+            assert "4:3" not in ratios, (name, ratios)
+
+
+def test_leo_pool_image_size_threaded_to_upstream(tmp_path):
+    # imageSize 之前对 Leonardo 完全无效(恒 1536² 被降到 1024²)；现在必须透传，
+    # 由尺寸表决定 1K→1024²、2K→2048²。
+    for size in ("1K", "2K"):
+        h = Harness(tmp_path)
+        resp = post(
+            h, "gemini-3-pro-image", "generateContent", image_request(size=size)
+        )
+        assert resp.status_code == 200, resp.text
+        assert h.leo.create_calls[0]["output_resolution"] == size
 
 
 def test_leo_pool_2k_request_ok(tmp_path):

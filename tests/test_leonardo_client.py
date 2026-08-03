@@ -16,7 +16,7 @@ from core.leonardo_client import (
     TOKEN_BALANCE_QUERY,
     sum_credits,
     parse_token_balance,
-    ASPECT_TO_SIZE,
+    LEONARDO_SIZES,
     aspect_to_size,
     build_generate_payload,
     parse_generation_id,
@@ -152,10 +152,13 @@ def test_token_balance_query_shape():
     assert "user_details" in TOKEN_BALANCE_QUERY["query"]
 
 
-def test_aspect_to_size_known_and_default():
-    assert aspect_to_size("16:9") == (2752, 1536)
-    assert aspect_to_size("9:16") == (1536, 2752)
-    assert aspect_to_size("weird") == (1536, 1536)  # 回退 1:1
+def test_aspect_to_size_known_and_unsupported():
+    # 尺寸按模型族取（详见 tests/test_leonardo_sizes.py）；未知比例不再静默回退 1:1，
+    # 而是返回 None 让路由 400——回退会让下游拿到与请求不符的比例。
+    assert aspect_to_size("16:9", model_slug="nano-banana-2") == (2752, 1536)
+    assert aspect_to_size("9:16", model_slug="nano-banana-2") == (1536, 2752)
+    assert aspect_to_size("weird", model_slug="nano-banana-2") is None
+    assert set(LEONARDO_SIZES) == {"gemini", "gpt"}
 
 
 def test_build_generate_payload_core_fields():

@@ -237,6 +237,49 @@ def test_gpt_image_2_4k_rejected(tmp_path, monkeypatch):
     assert "4K" in resp.json()["error"]["message"]
 
 
+def test_nano_banana_4x3_rejected_400(tmp_path, monkeypatch):
+    # nano-banana 系上游无 4:3（硬发会回方图）→ 400，且不得发起生成
+    import core.leonardo_generation as lg
+
+    monkeypatch.setattr(
+        lg, "generate_images",
+        lambda **kw: (_ for _ in ()).throw(AssertionError("must not generate")),
+    )
+    client, _, _ = _make_router(tmp_path, leonardo=True)
+    resp = client.post(
+        "/v1/images/generations",
+        json={"model": "leonardo-nano-banana-pro", "prompt": "x", "aspect_ratio": "4:3"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "4:3" in resp.json()["error"]["message"]
+
+
+def test_gpt_image_4x3_still_allowed(tmp_path, monkeypatch):
+    # gpt-image 系实测支持 4:3(2048x1536) → 不受影响，正常出图
+    _patch_generate(monkeypatch, data=[{"url": "https://cdn.leonardo.ai/x.jpg"}])
+    client, _, _ = _make_router(tmp_path, leonardo=True)
+    resp = client.post(
+        "/v1/images/generations",
+        json={"model": "gpt-image-2", "prompt": "x", "aspect_ratio": "4:3",
+              "response_format": "b64_json"},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_adobe_models_unaffected_by_leonardo_size_rules(tmp_path):
+    # 关键回归：Leonardo 尺寸规则不得波及 Adobe（线上在用）。
+    # Adobe 侧 4:3 / 4K 等能力由 catalog 决定，不经 Leonardo 尺寸表。
+    from core.models import MODEL_CATALOG
+    from core.leonardo_client import LEONARDO_SIZES  # noqa: F401  仅确认互不引用
+
+    for mid in ("firefly-gpt-image", "firefly-nano-banana-pro", "gpt-image-1"):
+        conf = MODEL_CATALOG[mid]
+        assert not str(conf["upstream_model"]).startswith("leonardo:")
+        ratios = set(conf["supported_aspect_ratios"])
+        assert "4:3" in ratios  # Adobe 仍支持 4:3
+        assert len(ratios) >= 5  # Adobe 的宽比例集未被收窄
+
+
 # --- 共享错误分类器（#1 的核心） ---
 
 def test_classify_leonardo_error():
