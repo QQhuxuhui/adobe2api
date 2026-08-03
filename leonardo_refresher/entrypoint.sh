@@ -75,9 +75,10 @@ x11vnc \
     -rfbauth "${VNC_PASSWORD_FILE}" &
 pids+=("$!")
 
-/usr/share/novnc/utils/novnc_proxy \
-    --listen 6080 \
-    --vnc localhost:5900 &
+# 直接用 websockify 提供 noVNC 静态页 + 代理到 VNC；
+# 不用 Debian 的 novnc_proxy 包装脚本（trixie 版该脚本自身有语法错误会崩）。
+# 访问入口：http://127.0.0.1:6080/vnc.html
+websockify --web=/usr/share/novnc 6080 localhost:5900 &
 pids+=("$!")
 
 python -m leonardo_refresher &

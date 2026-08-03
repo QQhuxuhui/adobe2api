@@ -91,6 +91,9 @@ def test_sidecar_image_and_vnc_auth_are_pinned_and_explicit():
     assert "-rfbauth" in entrypoint
     assert "-nopw" not in entrypoint
     assert "NOVNC_PASSWORD" in entrypoint
+    # 直接用 websockify 提供 noVNC；Debian trixie 的 novnc_proxy 包装脚本自身语法错误会崩
+    assert "websockify --web=/usr/share/novnc" in entrypoint
+    assert "utils/novnc_proxy" not in entrypoint
     assert "/tmp/.X11-unix/X${display_number}" in entrypoint
     assert 'kill -0 "${xvfb_pid}"' in entrypoint
     assert "gosu" in dockerfile

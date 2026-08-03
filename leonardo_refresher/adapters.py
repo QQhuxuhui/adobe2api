@@ -52,11 +52,15 @@ class PlaywrightSessionSource:
             return
 
         self._playwright = self._playwright_factory()
+        # 容器内关闭 Chromium 内建沙箱：Docker+非 root+用户命名空间下开启会
+        # "Chromium sandboxing failed!" 无法启动。隔离由容器兜底（seccomp
+        # profile + 非 root pwuser + 独立网络命名空间）。
+        launch_kwargs = {"headless": False, "chromium_sandbox": False}
+        if self._config.proxy:  # 空＝直连，不传 proxy（proxy={"server":""} 非法）
+            launch_kwargs["proxy"] = {"server": self._config.proxy}
         self._context = self._playwright.chromium.launch_persistent_context(
             self._config.profile_dir,
-            headless=False,
-            chromium_sandbox=True,
-            proxy={"server": self._config.proxy},
+            **launch_kwargs,
         )
         self._visible_page = (
             self._context.pages[0]

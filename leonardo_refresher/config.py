@@ -43,9 +43,6 @@ class RefresherConfig:
             "LEONARDO_REFRESH_KEY": str(
                 source.get("LEONARDO_REFRESH_KEY", "") or ""
             ).strip(),
-            "LEONARDO_PROXY": str(
-                source.get("LEONARDO_PROXY", "") or ""
-            ).strip(),
             "NOVNC_PASSWORD": str(
                 source.get("NOVNC_PASSWORD", "") or ""
             ).strip(),
@@ -53,6 +50,9 @@ class RefresherConfig:
         for name, value in required.items():
             if not value:
                 raise ValueError(f"{name} is required")
+
+        # 代理可选：留空＝直连（如出口在非受限地区）。空时 Chromium 不传 proxy。
+        proxy = str(source.get("LEONARDO_PROXY", "") or "").strip()
 
         min_interval = _read_int(source, "MIN_INTERVAL_SECONDS", 60)
         safety_margin = _read_int(source, "SAFETY_MARGIN_SECONDS", 600)
@@ -74,7 +74,7 @@ class RefresherConfig:
         return cls(
             adobe2api_base_url=base_url,
             refresh_key=required["LEONARDO_REFRESH_KEY"],
-            proxy=required["LEONARDO_PROXY"],
+            proxy=proxy,
             novnc_password=required["NOVNC_PASSWORD"],
             account_label=str(
                 source.get("LEONARDO_ACCOUNT_LABEL", "Leonardo") or "Leonardo"

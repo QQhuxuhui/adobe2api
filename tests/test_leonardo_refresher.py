@@ -38,7 +38,7 @@ def _install_required_env(monkeypatch):
 
 @pytest.mark.parametrize(
     "missing",
-    ["LEONARDO_REFRESH_KEY", "LEONARDO_PROXY", "NOVNC_PASSWORD"],
+    ["LEONARDO_REFRESH_KEY", "NOVNC_PASSWORD"],
 )
 def test_config_requires_security_and_network_settings(monkeypatch, missing):
     _install_required_env(monkeypatch)
@@ -46,6 +46,14 @@ def test_config_requires_security_and_network_settings(monkeypatch, missing):
 
     with pytest.raises(ValueError, match=missing):
         RefresherConfig.from_env()
+
+
+def test_config_allows_empty_proxy_for_direct_connection(monkeypatch):
+    # 出口非受限地区可留空代理＝直连
+    _install_required_env(monkeypatch)
+    monkeypatch.delenv("LEONARDO_PROXY", raising=False)
+    config = RefresherConfig.from_env()
+    assert config.proxy == ""
 
 
 def test_config_loads_defaults_and_normalizes_base_url(monkeypatch):
@@ -524,7 +532,7 @@ def test_browser_source_uses_persistent_profile_proxy_and_same_origin_fetch():
         {
             "profile_dir": "/profile",
             "headless": False,
-            "chromium_sandbox": True,
+            "chromium_sandbox": False,
             "proxy": {"server": "http://proxy:10809"},
         }
     ]
@@ -560,6 +568,24 @@ def test_browser_source_maps_missing_session_to_login_required(fetch_result):
         source.fetch_token()
 
     source.close()
+
+
+def test_browser_source_omits_proxy_when_empty():
+    # 直连场景：proxy 为空时 launch 不带 proxy（proxy={"server":""} 会被 Chromium 拒）
+    import leonardo_refresher.adapters as adapters_mod
+
+    context = _BrowserContext({"status": 200, "content_type": "application/json",
+                              "body": json.dumps({"session": {"accessToken": "t"}})})
+    playwright = _Playwright(context)
+    cfg = RefresherConfig(
+        adobe2api_base_url="http://adobe2api:6001", refresh_key="k", proxy="",
+        novnc_password="vnc-password", account_label="Primary",
+        refresh_interval_seconds=3000, safety_margin_seconds=600, min_interval_seconds=60,
+    )
+    source = adapters_mod.PlaywrightSessionSource(config=cfg, playwright_factory=lambda: playwright)
+    source.open()
+    source.close()
+    assert "proxy" not in playwright.chromium.calls[0]
 
 
 @pytest.mark.parametrize("status", [403, 451])
