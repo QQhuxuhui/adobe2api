@@ -622,6 +622,14 @@ Veo operation 返回的下载地址使用 `public_base_url`（或 `ADOBE_PUBLIC_
   - `generated_prune_size_mb`（默认 `200`）
 - 当总大小超过 `generated_max_size_mb` 时，服务会删除旧文件，直到至少回收 `generated_prune_size_mb`且总大小降回阈值以内
 
+## 6）Leonardo Token 自动刷新（sidecar）
+
+Leonardo 账号的出图 Bearer（Cognito id_token）约 1 小时过期，由 `leonardo-refresher`
+容器用会话 cookie 自动续期（会话约 6 周）。相关文档：
+
+- [Leonardo 部署（搬瓦工/容器）](docs/leonardo_deploy.md) — 镜像推送、`docker-compose.deploy.yml` pull 部署、healthz、端到端验证。
+- [Leonardo cookie 刷新指南](docs/leonardo-refresh-cookie.md) — 如何本地导出 cookie 并上传（每 ~6 周一次）。
+
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=leik1000/adobe2api&type=Date)](https://star-history.com/#leik1000/adobe2api&Date)
