@@ -13,6 +13,7 @@ from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 import requests
+from curl_cffi.requests import Session as CurlSession
 
 from core.adobe_client import (
     AdobeRequestError,
@@ -149,6 +150,12 @@ _CDN_FETCH_ATTEMPTS = 3
 _CDN_FETCH_BACKOFF = 1.0
 
 
+def _curl_total_get(url: str, *, timeout: float, headers: dict):
+    """libcurl 的非流式 timeout 是整个传输的墙钟上限。"""
+    with CurlSession(trust_env=True) as session:
+        return session.get(url, timeout=timeout, headers=headers)
+
+
 def _fetch_cdn_image(url: str, headers: dict, *, max_seconds: Optional[float] = None):
     """下载生成图，扩展超时 + 有限重试。全部失败时抛最后一次异常。
 
@@ -162,21 +169,31 @@ def _fetch_cdn_image(url: str, headers: dict, *, max_seconds: Optional[float] = 
             budget = max_seconds - (time.monotonic() - start)
             if budget <= 0:
                 break
-            timeout = max(1.0, min(float(_CDN_FETCH_TIMEOUT), budget))
+            timeout = min(float(_CDN_FETCH_TIMEOUT), budget)
         else:
             timeout = _CDN_FETCH_TIMEOUT
         try:
-            resp = requests.get(url, timeout=timeout, headers=headers)
+            if max_seconds is None:
+                resp = requests.get(url, timeout=timeout, headers=headers)
+            else:
+                resp = _curl_total_get(url, timeout=timeout, headers=headers)
             resp.raise_for_status()
+            if max_seconds is not None and (
+                time.monotonic() - start
+            ) > max_seconds:
+                raise AdobeRequestError("CDN fetch budget exhausted")
             return resp
         except Exception as exc:  # noqa: BLE001 - 传输/HTTP 错误统一重试
             last_exc = exc
             if attempt < _CDN_FETCH_ATTEMPTS - 1:
-                if max_seconds is not None and (
-                    time.monotonic() - start
-                ) >= max_seconds:
-                    break
-                time.sleep(_CDN_FETCH_BACKOFF)
+                sleep_for = _CDN_FETCH_BACKOFF
+                if max_seconds is not None:
+                    remaining = max_seconds - (time.monotonic() - start)
+                    if remaining <= 0:
+                        break
+                    sleep_for = min(sleep_for, remaining)
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
     if last_exc is not None:
         raise last_exc
     raise AdobeRequestError("CDN fetch budget exhausted before any attempt")

@@ -9,6 +9,18 @@ class LeonardoGenerationError(LeonardoError):
 
 
 _SUPPORTED_ASPECTS = {"16:9", "9:16", "1:1", "4:3"}
+_GRAPHQL_AUTH_REJECTION_CODES = {
+    "invalid-jwt",
+    "unauthenticated",
+    "unauthorized",
+    "forbidden",
+}
+_GRAPHQL_QUOTA_REJECTION_CODES = {
+    "insufficient-balance",
+    "insufficient-credits",
+    "quota-exhausted",
+    "resource-exhausted",
+}
 _SIZE_TO_ASPECT = {
     "1024x1024": "1:1", "512x512": "1:1", "256x256": "1:1",
     "1792x1024": "16:9", "1536x1024": "16:9",
@@ -32,9 +44,15 @@ def classify_leonardo_error(exc: Exception) -> str:
     "auth"（JWT/鉴权失效 → 标失效并切号）、"quota"（额度耗尽 → 标耗尽并切号）、
     "temp"（HTTP/传输等临时故障 → 可重试）。
     """
-    from core.leonardo_client import LeonardoRetryUnsafeError
+    from core.leonardo_client import LeonardoGraphQLError, LeonardoRetryUnsafeError
 
     if isinstance(exc, (LeonardoGenerationError, LeonardoRetryUnsafeError)):
+        return "unsafe"
+    if isinstance(exc, LeonardoGraphQLError) and exc.operation == "Generate":
+        if exc.codes & _GRAPHQL_AUTH_REJECTION_CODES:
+            return "auth"
+        if exc.codes & _GRAPHQL_QUOTA_REJECTION_CODES:
+            return "quota"
         return "unsafe"
     message = str(exc).lower()
     # HTTP 状态优先(网关拒绝，语义明确)
@@ -89,8 +107,9 @@ def generate_images(
     size: Optional[str] = None,
     aspect_ratio: Optional[str] = None,
     n: int = 1,
-    timeout: int = 300,
+    timeout: float = 300,
     poll_interval: int = 4,
+    deadline: Optional[float] = None,
     now=time.time,
 ) -> Dict[str, Any]:
     if not (model_id or "").strip():
@@ -99,13 +118,17 @@ def generate_images(
     aspect = to_aspect(size=size, aspect_ratio=aspect_ratio)
     quantity = clamp_quantity(n)
 
+    create_kwargs = {"quantity": quantity, "model_slug": model_slug}
+    if deadline is not None:
+        create_kwargs["deadline"] = deadline
     gen_id = client.create_generation(
-        token, prompt, model_id, aspect, quantity=quantity, model_slug=model_slug
+        token, prompt, model_id, aspect, **create_kwargs
     )
     try:
-        result = client.wait_for_completion(
-            token, gen_id, timeout=timeout, poll_interval=poll_interval
-        )
+        wait_kwargs = {"timeout": timeout, "poll_interval": poll_interval}
+        if deadline is not None:
+            wait_kwargs["deadline"] = deadline
+        result = client.wait_for_completion(token, gen_id, **wait_kwargs)
     except LeonardoError as exc:
         # mutation 已提交: 轮询/取图期间任何失败(含传输耗尽的 LeonardoError)
         # 都不得换号重发, 统一转 LeonardoGenerationError(不可重试)

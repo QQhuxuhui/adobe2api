@@ -1,5 +1,7 @@
 import base64
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,6 +22,35 @@ from api.routes.generation import (
     _map_leonardo_error,
 )
 import api.routes.generation as gen_mod
+
+
+def _start_trickle_image_server(payload: bytes):
+    class _Server(ThreadingHTTPServer):
+        daemon_threads = True
+
+    class _Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            for byte in payload:
+                try:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                time.sleep(0.02)
+
+    server = _Server(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, f"http://127.0.0.1:{server.server_port}/image.jpg"
 
 
 # --- 异常映射 ---
@@ -272,7 +303,7 @@ def test_fetch_cdn_image_caps_timeout_to_budget(monkeypatch):
         seen["timeout"] = timeout
         return _fake_img_resp()
 
-    monkeypatch.setattr(req_mod, "get", capture_get)
+    monkeypatch.setattr(gen_mod, "_curl_total_get", capture_get)
     _fetch_cdn_image("https://cdn.leonardo.ai/x.jpg", {}, max_seconds=5)
     assert seen["timeout"] <= 5
 
@@ -287,13 +318,54 @@ def test_fetch_cdn_image_stops_retrying_when_budget_gone(monkeypatch):
         clock["t"] += 10.0  # 每次调用消耗 10s
         raise req_mod.exceptions.ConnectionError("cdn down")
 
-    monkeypatch.setattr(req_mod, "get", always_fail)
+    monkeypatch.setattr(gen_mod, "_curl_total_get", always_fail)
     monkeypatch.setattr(gen_mod.time, "sleep", lambda s: None)
     monkeypatch.setattr(gen_mod.time, "monotonic", lambda: clock["t"])
     with pytest.raises(req_mod.exceptions.ConnectionError):
         _fetch_cdn_image("https://cdn.leonardo.ai/x.jpg", {}, max_seconds=5)
     # 5s 预算：第 1 次(消耗到 t+10)后预算已负 → 不再第 2、3 次
     assert calls["n"] == 1
+
+
+def test_fetch_cdn_image_small_budget_caps_request_and_backoff(monkeypatch):
+    clock = {"t": 1000.0}
+    timeouts = []
+
+    def fail_after_tenth_second(url, timeout, headers):
+        timeouts.append(timeout)
+        clock["t"] += 0.1
+        raise req_mod.exceptions.ConnectionError("cdn down")
+
+    def fake_sleep(seconds):
+        clock["t"] += seconds
+
+    monkeypatch.setattr(gen_mod, "_curl_total_get", fail_after_tenth_second)
+    monkeypatch.setattr(gen_mod.time, "sleep", fake_sleep)
+    monkeypatch.setattr(gen_mod.time, "monotonic", lambda: clock["t"])
+
+    with pytest.raises(req_mod.exceptions.ConnectionError):
+        _fetch_cdn_image(
+            "https://cdn.leonardo.ai/x.jpg", {}, max_seconds=0.2
+        )
+
+    assert timeouts == [pytest.approx(0.2)]
+    assert clock["t"] - 1000.0 <= 0.2 + 1e-9
+
+
+def test_fetch_cdn_image_budget_is_total_timeout_for_trickling_response():
+    server, thread, url = _start_trickle_image_server(b"x" * 30)
+    started = time.monotonic()
+    elapsed = None
+    try:
+        with pytest.raises(Exception, match="timed out"):
+            _fetch_cdn_image(url, {}, max_seconds=0.15)
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+    assert elapsed is not None and elapsed < 0.4
 
 
 def test_retry_unsafe_error_maps_to_non_retryable():

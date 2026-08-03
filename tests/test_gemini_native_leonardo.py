@@ -56,11 +56,21 @@ class FakeLeonardoClient:
         self.images = images if images is not None else ["https://cdn.leonardo.ai/out.png"]
         self.create_calls: list[dict] = []
         self.wait_timeouts: list[int] = []
+        self.create_deadlines: list[float | None] = []
+        self.wait_deadlines: list[float | None] = []
         self._raise_on_create = raise_on_create
 
     def create_generation(
-        self, token, prompt, model_id, aspect, quantity=1, model_slug="nano-banana-2"
+        self,
+        token,
+        prompt,
+        model_id,
+        aspect,
+        quantity=1,
+        model_slug="nano-banana-2",
+        deadline=None,
     ):
+        self.create_deadlines.append(deadline)
         self.create_calls.append(
             {
                 "token": token,
@@ -75,8 +85,11 @@ class FakeLeonardoClient:
             raise self._raise_on_create
         return "gen-123"
 
-    def wait_for_completion(self, token, gen_id, timeout=300, poll_interval=4):
+    def wait_for_completion(
+        self, token, gen_id, timeout=300, poll_interval=4, deadline=None
+    ):
         self.wait_timeouts.append(timeout)
+        self.wait_deadlines.append(deadline)
         return {"success": True, "images": self.images}
 
 
@@ -123,9 +136,11 @@ class Harness:
         self.accounted: list[tuple[Path, int, int]] = []
         self.credit_contexts: list[tuple] = []
         self.fetched: list[str] = []
+        self.cdn_budgets: list[float | None] = []
 
-        def fake_fetch(url, headers=None):
+        def fake_fetch(url, headers=None, max_seconds=None):
             self.fetched.append(url)
+            self.cdn_budgets.append(max_seconds)
             return _Resp(cdn_bytes)
 
         def retry_runner(*, run_once, token_selector=None, **kwargs):
@@ -356,3 +371,36 @@ def test_leo_pool_generate_timeout_bounded_by_deadline(tmp_path):
     assert resp.status_code == 200, resp.text
     # deadline 30s < 固定 300s → 传给 Leonardo 的超时被钳到 ~30s
     assert h.leo.wait_timeouts and h.leo.wait_timeouts[0] <= 30
+
+
+def test_leo_pool_threads_absolute_deadline_to_client(tmp_path):
+    h = Harness(tmp_path, deadline=30)
+
+    resp = post(h, "gemini-3-pro-image", "generateContent", image_request())
+
+    assert resp.status_code == 200, resp.text
+    assert h.leo.create_deadlines[0] is not None
+    assert h.leo.create_deadlines[0] == h.leo.wait_deadlines[0]
+    assert h.cdn_budgets[0] is not None
+    assert 0 < h.cdn_budgets[0] <= 30
+
+
+def test_leo_pool_does_not_fetch_cdn_after_deadline(tmp_path, monkeypatch):
+    import api.routes.gemini_native as native_mod
+
+    clock = {"t": 100.0}
+    monkeypatch.setattr(native_mod.time, "monotonic", lambda: clock["t"])
+    h = Harness(tmp_path, deadline=1)
+
+    def finish_after_deadline(
+        token, gen_id, timeout=300, poll_interval=4, deadline=None
+    ):
+        clock["t"] = 102.0
+        return {"success": True, "images": h.leo.images}
+
+    h.leo.wait_for_completion = finish_after_deadline
+
+    resp = post(h, "gemini-3-pro-image", "generateContent", image_request())
+
+    assert resp.status_code == 500, resp.text
+    assert h.fetched == []

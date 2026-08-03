@@ -761,7 +761,7 @@ def build_gemini_native_router(
 
     def _fetch_cdn_image(url: str, headers: dict, max_seconds=None):
         if fetch_cdn_image is not None:
-            return fetch_cdn_image(url, headers)  # 注入的 fake 不接 max_seconds
+            return fetch_cdn_image(url, headers, max_seconds=max_seconds)
         from api.routes.generation import _fetch_cdn_image as _real_fetch
 
         return _real_fetch(url, headers, max_seconds=max_seconds)
@@ -1038,7 +1038,13 @@ def build_gemini_native_router(
 
                     # 每次尝试按当前剩余 deadline 重算超时：切号重试不复用旧预算，
                     # 避免第 N 个 token 仍拿满预算而整体远超 deadline。
-                    remaining = max(1, int(deadline - time.monotonic()))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise upstream_temp_error_cls(
+                            "Gemini native request deadline exceeded",
+                            status_code=503,
+                            error_type="timeout",
+                        )
                     leo_timeout = min(LEONARDO_GENERATE_TIMEOUT, remaining)
 
                     try:
@@ -1051,6 +1057,7 @@ def build_gemini_native_router(
                             aspect_ratio=leo_aspect,
                             n=1,
                             timeout=leo_timeout,
+                            deadline=deadline,
                         )
                     except LeonardoError as exc:
                         raise _map_leo_error(exc) from exc
@@ -1061,7 +1068,11 @@ def build_gemini_native_router(
                         raise adobe_error_cls("Leonardo returned no image URL")
                     # 生成已成功；CDN 下载失败(内部已重试)不得重发生成(重发=再次扣费)。
                     # 下载也按剩余 deadline 收窄，避免单请求整体阻塞远超 deadline。
-                    cdn_budget = max(1, int(deadline - time.monotonic()))
+                    cdn_budget = deadline - time.monotonic()
+                    if cdn_budget <= 0:
+                        raise adobe_error_cls(
+                            "Gemini native request deadline exceeded after generation"
+                        )
                     resp = _fetch_cdn_image(
                         url,
                         {"User-Agent": "adobe2api/1.0", "Accept": "image/*"},

@@ -77,6 +77,45 @@ def test_generate_images_defaults_model_slug_nano_banana_2():
     assert client.calls["create"]["model_slug"] == "nano-banana-2"
 
 
+def test_generate_images_threads_absolute_deadline_to_client():
+    class _DeadlineClient:
+        def __init__(self):
+            self.create_deadline = None
+            self.wait_deadline = None
+
+        def create_generation(
+            self,
+            token,
+            prompt,
+            model_id,
+            aspect_ratio,
+            quantity=1,
+            model_slug="nano-banana-2",
+            deadline=None,
+        ):
+            self.create_deadline = deadline
+            return "gen-1"
+
+        def wait_for_completion(
+            self, token, gen_id, *, timeout, poll_interval, deadline=None
+        ):
+            self.wait_deadline = deadline
+            return {"success": True, "images": ["https://cdn/image.jpg"]}
+
+    client = _DeadlineClient()
+    result = generate_images(
+        client,
+        "TOK",
+        prompt="a cat",
+        model_id="M1",
+        deadline=123.5,
+    )
+
+    assert result["provider"]["generation_id"] == "gen-1"
+    assert client.create_deadline == 123.5
+    assert client.wait_deadline == 123.5
+
+
 def test_generate_images_requires_model_id():
     with pytest.raises(LeonardoError):
         generate_images(_FakeClient(), "TOK", prompt="x", model_id="")

@@ -1,6 +1,8 @@
 import base64
 import json
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -49,11 +51,47 @@ class _RecordingHttpSession:
 
 def _install_http_session(monkeypatch, post):
     session = _RecordingHttpSession(post)
+
+    def session_factory(**kwargs):
+        session.trust_env = kwargs.get("trust_env", True)
+        return session
+
     monkeypatch.setattr(lc.requests, "Session", lambda: session)
-    # The direct patch keeps the pre-change implementation on a controlled
-    # transport during the RED phase; the new implementation uses Session.
-    monkeypatch.setattr(lc.requests, "post", post)
+    monkeypatch.setattr(lc, "CurlSession", session_factory)
     return session
+
+
+def _start_trickle_server(method: str, payload: bytes):
+    class _Server(ThreadingHTTPServer):
+        daemon_threads = True
+
+    class _Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def _respond(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            for byte in payload:
+                try:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                time.sleep(0.02)
+
+        do_GET = _respond
+        do_POST = _respond
+
+    server = _Server(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/graphql"
+    return server, thread, url
 
 
 def test_decode_and_exp():
@@ -192,6 +230,88 @@ def test_create_generation_uses_gql_and_returns_id():
     gid = client.create_generation("TOK", "a cat", "M1", "1:1")
     assert gid == "gen-42"
     assert seen["op"] == "Generate"
+
+
+def test_create_generation_preserves_id_from_partial_graphql_response():
+    response = {
+        "data": {
+            "generate": {
+                "generationId": "gen-already-created",
+                "apiCreditCost": 1,
+                "__typename": "GenerationResponse",
+            }
+        },
+        "errors": [{"message": "internal resolver error"}],
+    }
+    client = LeonardoClient(gql=lambda token, payload: response)
+
+    assert (
+        client.create_generation("TOK", "a cat", "M1", "1:1")
+        == "gen-already-created"
+    )
+
+
+def test_generate_graphql_error_without_id_is_retry_unsafe():
+    from core.leonardo_generation import classify_leonardo_error
+
+    response = {"data": {"generate": None}, "errors": [{"message": "internal resolver error"}]}
+    client = LeonardoClient(gql=lambda token, payload: response)
+
+    with pytest.raises(LeonardoError) as excinfo:
+        client.create_generation("TOK", "a cat", "M1", "1:1")
+
+    assert classify_leonardo_error(excinfo.value) == "unsafe"
+
+
+def test_generate_response_without_id_is_retry_unsafe():
+    from core.leonardo_generation import classify_leonardo_error
+
+    client = LeonardoClient(gql=lambda token, payload: {"data": {"generate": {}}})
+
+    with pytest.raises(LeonardoError) as excinfo:
+        client.create_generation("TOK", "a cat", "M1", "1:1")
+
+    assert classify_leonardo_error(excinfo.value) == "unsafe"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "credits service temporarily unavailable",
+        "quota service temporarily unavailable",
+        "JWT verification service temporarily unavailable",
+    ],
+)
+def test_ambiguous_generate_graphql_error_keywords_remain_retry_unsafe(message):
+    from core.leonardo_generation import classify_leonardo_error
+
+    response = {"errors": [{"message": message}]}
+    client = LeonardoClient(gql=lambda token, payload: response)
+
+    with pytest.raises(LeonardoError) as excinfo:
+        client.create_generation("TOK", "a cat", "M1", "1:1")
+
+    assert classify_leonardo_error(excinfo.value) == "unsafe"
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [("invalid-jwt", "auth"), ("insufficient-credits", "quota")],
+)
+def test_generate_graphql_definitive_rejection_codes_are_retryable(code, expected):
+    from core.leonardo_generation import classify_leonardo_error
+
+    response = {
+        "errors": [
+            {"message": "request rejected", "extensions": {"code": code}}
+        ]
+    }
+    client = LeonardoClient(gql=lambda token, payload: response)
+
+    with pytest.raises(LeonardoError) as excinfo:
+        client.create_generation("TOK", "a cat", "M1", "1:1")
+
+    assert classify_leonardo_error(excinfo.value) == expected
 
 
 def test_get_credits():
@@ -377,6 +497,56 @@ def test_http_gql_raises_after_exhausting_query_retries(monkeypatch):
         lc.LeonardoClient()._http_gql("TOK", lc.TOKEN_BALANCE_QUERY)
     assert calls["n"] == 3
     assert sleeps == [0.5, 0.5]
+
+
+def test_http_gql_query_retries_stop_at_absolute_deadline(monkeypatch):
+    clock = {"t": 100.0}
+    timeouts = []
+    sleeps = []
+
+    def fake_post(url, headers=None, json=None, timeout=None, **kwargs):
+        timeouts.append(timeout)
+        clock["t"] += timeout
+        raise lc.requests.exceptions.ReadTimeout("slow poll")
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock["t"] += seconds
+
+    _install_http_session(monkeypatch, fake_post)
+    monkeypatch.setattr(lc.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(lc.time, "sleep", fake_sleep)
+
+    with pytest.raises(LeonardoError, match="deadline"):
+        lc.LeonardoClient()._http_gql(
+            "TOK", build_status_query("gen-1"), deadline=130.0
+        )
+
+    assert timeouts == [pytest.approx(30.0)]
+    assert sleeps == []
+    assert clock["t"] == pytest.approx(130.0)
+
+
+def test_http_gql_deadline_is_total_timeout_for_trickling_response(monkeypatch):
+    payload = b'{"data":{"generations":[]}}'
+    server, thread, url = _start_trickle_server("POST", payload)
+    monkeypatch.setattr(lc, "GRAPHQL_URL", url)
+    started = time.monotonic()
+    elapsed = None
+    try:
+        with pytest.raises(LeonardoError, match="deadline"):
+            lc.LeonardoClient()._http_gql(
+                "TOK",
+                build_status_query("gen-1"),
+                deadline=started + 0.15,
+            )
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+    assert elapsed is not None and elapsed < 0.4
 
 
 def test_http_gql_does_not_retry_generate_mutation(monkeypatch):

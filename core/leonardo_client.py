@@ -5,6 +5,8 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from curl_cffi.requests import Session as CurlSession
+from curl_cffi.requests.exceptions import RequestException as CurlRequestException
 
 
 class LeonardoError(Exception):
@@ -13,6 +15,25 @@ class LeonardoError(Exception):
 
 class LeonardoRetryUnsafeError(LeonardoError):
     """单发(非幂等)请求失败且服务端可能已受理：禁止自动重试，避免重复扣费。"""
+
+
+class LeonardoGraphQLError(LeonardoError):
+    """GraphQL 业务错误；保留操作名以区分只读查询和非幂等 mutation。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        operation: str = "",
+        codes: Optional[List[str]] = None,
+    ):
+        super().__init__(message)
+        self.operation = str(operation or "")
+        self.codes = frozenset(
+            str(code or "").strip().lower().replace("_", "-")
+            for code in (codes or [])
+            if str(code or "").strip()
+        )
 
 
 def _b64url_json(segment: str) -> Dict[str, Any]:
@@ -207,28 +228,60 @@ class LeonardoClient:
     def __init__(self, *, gql=None):
         self._gql_fn = gql  # 可注入；None 时用真实 HTTP
 
-    def _http_gql(self, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    @staticmethod
+    def _timeout_for_deadline(timeout: float, deadline: Optional[float]) -> float:
+        fixed_timeout = max(0.001, float(timeout))
+        if deadline is None:
+            return fixed_timeout
+        remaining = float(deadline) - time.monotonic()
+        if remaining <= 0:
+            raise LeonardoError("Leonardo request deadline exceeded")
+        return min(fixed_timeout, remaining)
+
+    def _http_gql(
+        self,
+        token: str,
+        payload: Dict[str, Any],
+        *,
+        deadline: Optional[float] = None,
+    ) -> Dict[str, Any]:
         headers = dict(_BASE_HEADERS)
         headers["authorization"] = f"Bearer {token}"
         operation = str(payload.get("operationName") or "")
         attempts = _HTTP_ATTEMPTS if operation in _RETRYABLE_OPERATIONS else 1
         proxy = str(os.environ.get("LEONARDO_PROXY") or "").strip()
         proxies = {"http": proxy, "https": proxy} if proxy else None
-        session = requests.Session()
-        session.trust_env = False
+        if deadline is None:
+            session = requests.Session()
+            session.trust_env = False
+        else:
+            session = CurlSession(trust_env=False)
         try:
             for attempt in range(attempts):
                 try:
+                    request_timeout = self._timeout_for_deadline(60, deadline)
                     resp = session.post(
                         GRAPHQL_URL,
                         headers=headers,
                         json=payload,
-                        timeout=60,
+                        timeout=request_timeout,
                         proxies=proxies,
                     )
-                except requests.exceptions.RequestException as exc:
+                except (
+                    requests.exceptions.RequestException,
+                    CurlRequestException,
+                ) as exc:
                     if attempt < attempts - 1:
-                        time.sleep(_RETRY_BACKOFF)
+                        sleep_for = _RETRY_BACKOFF
+                        if deadline is not None:
+                            remaining = float(deadline) - time.monotonic()
+                            if remaining <= 0:
+                                raise LeonardoError(
+                                    "Leonardo request deadline exceeded"
+                                ) from exc
+                            sleep_for = min(sleep_for, remaining)
+                        if sleep_for > 0:
+                            time.sleep(sleep_for)
                         continue
                     if attempts > 1:
                         message = (
@@ -258,17 +311,45 @@ class LeonardoClient:
         finally:
             session.close()
 
-    def _call(self, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        fn = self._gql_fn or self._http_gql
-        resp = fn(token, payload)
+    def _call(
+        self,
+        token: str,
+        payload: Dict[str, Any],
+        *,
+        deadline: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        if self._gql_fn is not None:
+            resp = self._gql_fn(token, payload)
+        else:
+            resp = self._http_gql(token, payload, deadline=deadline)
         if isinstance(resp, dict) and resp.get("errors"):
+            operation = str(payload.get("operationName") or "")
+            if operation == "Generate":
+                data = resp.get("data")
+                generate = data.get("generate") if isinstance(data, dict) else None
+                generation_id = (
+                    generate.get("generationId")
+                    if isinstance(generate, dict)
+                    else None
+                )
+                if generation_id:
+                    return resp
             messages = [
                 str(error.get("message", "")).strip()
                 for error in resp["errors"]
                 if isinstance(error, dict)
             ]
+            codes = []
+            for error in resp["errors"]:
+                if not isinstance(error, dict):
+                    continue
+                extensions = error.get("extensions")
+                if isinstance(extensions, dict) and extensions.get("code"):
+                    codes.append(str(extensions["code"]))
             detail = "; ".join(message for message in messages if message)
-            raise LeonardoError(detail or "graphql error")
+            raise LeonardoGraphQLError(
+                detail or "graphql error", operation=operation, codes=codes
+            )
         return resp
 
     def get_credits(self, token: str) -> Optional[int]:
@@ -286,30 +367,74 @@ class LeonardoClient:
         }
 
     def create_generation(
-        self, token, prompt, model_id, aspect_ratio, quantity=1, init_image_ids=None,
-        *, model_slug="nano-banana-2"
+        self,
+        token,
+        prompt,
+        model_id,
+        aspect_ratio,
+        quantity=1,
+        init_image_ids=None,
+        *,
+        model_slug="nano-banana-2",
+        deadline: Optional[float] = None,
     ) -> str:
         width, height = aspect_to_size(aspect_ratio)
         payload = build_generate_payload(
             prompt, model_id, width, height, quantity, init_image_ids, model_slug=model_slug
         )
-        return parse_generation_id(self._call(token, payload))
+        response = self._call(token, payload, deadline=deadline)
+        try:
+            return parse_generation_id(response)
+        except LeonardoError as exc:
+            raise LeonardoGraphQLError(
+                str(exc), operation="Generate"
+            ) from exc
 
-    def poll_status(self, token: str, gen_id: str) -> str:
-        return parse_generation_status(self._call(token, build_status_query(gen_id)))
+    def poll_status(
+        self, token: str, gen_id: str, *, deadline: Optional[float] = None
+    ) -> str:
+        return parse_generation_status(
+            self._call(token, build_status_query(gen_id), deadline=deadline)
+        )
 
-    def get_image_urls(self, token: str, gen_id: str) -> List[str]:
-        return parse_image_urls(self._call(token, build_feed_query(gen_id)))
+    def get_image_urls(
+        self, token: str, gen_id: str, *, deadline: Optional[float] = None
+    ) -> List[str]:
+        return parse_image_urls(
+            self._call(token, build_feed_query(gen_id), deadline=deadline)
+        )
 
     def wait_for_completion(
-        self, token, gen_id, *, timeout=300, poll_interval=4, sleep=time.sleep, now=time.time
+        self,
+        token,
+        gen_id,
+        *,
+        timeout=300,
+        poll_interval=4,
+        sleep=time.sleep,
+        now=time.time,
+        deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
-        deadline = now() + timeout
-        while now() < deadline:
-            status = self.poll_status(token, gen_id)
+        local_deadline = now() + timeout
+        while now() < local_deadline:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            status = self.poll_status(token, gen_id, deadline=deadline)
             if status in ("COMPLETE", "COMPLETED"):
-                return {"success": True, "images": self.get_image_urls(token, gen_id)}
+                return {
+                    "success": True,
+                    "images": self.get_image_urls(
+                        token, gen_id, deadline=deadline
+                    ),
+                }
             if status in ("FAILED", "ERROR"):
                 return {"success": False, "error": "generation failed"}
-            sleep(poll_interval)
+            sleep_for = poll_interval
+            if deadline is not None:
+                remaining = float(deadline) - time.monotonic()
+                if remaining <= 0:
+                    break
+                sleep_for = min(sleep_for, remaining)
+            if sleep_for > 0:
+                sleep(sleep_for)
         return {"success": False, "error": "generation timeout"}
