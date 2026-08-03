@@ -136,10 +136,13 @@ def generate_images(
     aspect = to_aspect(size=size, aspect_ratio=aspect_ratio)
     quantity = clamp_quantity(n)
 
+    # 上游 Generate 直接回报本次积分成本（apiCreditCost），比余额差分精确
+    cost_holder: Dict[str, Any] = {}
     create_kwargs = {
         "quantity": quantity,
         "model_slug": model_slug,
         "output_resolution": output_resolution,
+        "on_cost": lambda value: cost_holder.__setitem__("credit_cost", value),
     }
     if deadline is not None:
         create_kwargs["deadline"] = deadline
@@ -166,5 +169,6 @@ def generate_images(
             "generation_id": gen_id,
             "aspect_ratio": aspect,
             "model_id": model_id,
+            "credit_cost": cost_holder.get("credit_cost"),
         },
     }

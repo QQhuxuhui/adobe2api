@@ -215,6 +215,18 @@ def _leonardo_public_backend(model_id, enabled: bool):
     return LEONARDO_PUBLIC_ALIASES.get(str(model_id or "").strip())
 
 
+def _record_leonardo_credit_cost(request, result) -> None:
+    """把上游回报的本次积分成本写进请求日志（精确值，来源标 upstream）。"""
+    cost = ((result or {}).get("provider") or {}).get("credit_cost")
+    if cost is None:
+        return
+    try:
+        request.state.log_credits_used = float(cost)
+        request.state.log_credits_source = "upstream"
+    except Exception:  # noqa: BLE001 - 记账失败不得影响出图
+        pass
+
+
 def _build_leonardo_run_once(
     *,
     leo_client,
@@ -257,6 +269,8 @@ def _build_leonardo_run_once(
             )
         except LeonardoError as exc:
             raise _map_leonardo_error(exc) from exc
+
+        _record_leonardo_credit_cost(request, result)
 
         data_items = []
         for i, item in enumerate(result.get("data") or []):

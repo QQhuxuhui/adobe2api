@@ -127,10 +127,11 @@ def test_leonardo_error_is_exception():
     assert issubclass(LeonardoError, Exception)
 
 
-def test_sum_credits_includes_apicredit_and_stream():
+def test_sum_credits_counts_only_generation_usable():
+    # apiCredit/streamTokens 是官方 API 通道，出图扣不到 → 不计入可用额度
     details = {"subscriptionTokens": 100, "paidTokens": 5, "rolloverTokens": 0,
                "apiCredit": 8500, "streamTokens": 3}
-    assert sum_credits(details) == 8608
+    assert sum_credits(details) == 105
 
 
 def test_sum_credits_ignores_missing_and_nonnumeric():
@@ -317,9 +318,14 @@ def test_generate_graphql_definitive_rejection_codes_are_retryable(code, expecte
     assert classify_leonardo_error(excinfo.value) == expected
 
 
-def test_get_credits():
+def test_get_credits_reports_generation_usable_only():
+    # 只有 apiCredit 时出图可用额度为 0（该通道出图扣不到）
     client = LeonardoClient(gql=lambda t, p: {"data": {"user_details": [{"apiCredit": 8500}]}})
-    assert client.get_credits("TOK") == 8500
+    assert client.get_credits("TOK") == 0
+    client2 = LeonardoClient(
+        gql=lambda t, p: {"data": {"user_details": [{"subscriptionTokens": 850, "apiCredit": 8500}]}}
+    )
+    assert client2.get_credits("TOK") == 850
 
 
 def test_wait_for_completion_polls_then_succeeds():

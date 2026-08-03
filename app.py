@@ -665,6 +665,14 @@ def _append_attempt_log(
                 ),
                 token_source=str(token_meta.get("token_source") or "") or None,
                 token_attempt=int(attempt),
+                # 上游回报的本次精确积分成本（Leonardo 的 apiCreditCost）；
+                # Adobe 侧仍由 credits_tracker 事后按余额差分回填。
+                credits_used=getattr(request.state, "log_credits_used", None),
+                credits_source=(
+                    getattr(request.state, "log_credits_source", None)
+                    if getattr(request.state, "log_credits_used", None) is not None
+                    else None
+                ),
             )
         )
         records = getattr(request.state, "log_attempt_records", None)
@@ -867,6 +875,15 @@ async def request_logger(request: Request, call_next):
                             token_account_email=token_account_email,
                             token_source=token_source,
                             token_attempt=token_attempt,
+                            credits_used=getattr(
+                                request.state, "log_credits_used", None
+                            ),
+                            credits_source=(
+                                getattr(request.state, "log_credits_source", None)
+                                if getattr(request.state, "log_credits_used", None)
+                                is not None
+                                else None
+                            ),
                         )
                     ),
                 )

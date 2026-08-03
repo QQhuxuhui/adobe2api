@@ -58,7 +58,12 @@ def test_generate_images_happy_path():
                           size="1792x1024", n=2, now=lambda: 1700000000)
     assert out["created"] == 1700000000
     assert out["data"] == [{"url": "https://cdn/x.jpg"}, {"url": "https://cdn/y.jpg"}]
-    assert out["provider"] == {"generation_id": "gen-9", "aspect_ratio": "16:9", "model_id": "M1"}
+    assert out["provider"] == {
+        "generation_id": "gen-9",
+        "aspect_ratio": "16:9",
+        "model_id": "M1",
+        "credit_cost": None,  # 该 fake 不回报 apiCreditCost
+    }
     # 归一化正确传给 client
     assert client.calls["create"]["aspect_ratio"] == "16:9"
     assert client.calls["create"]["quantity"] == 2

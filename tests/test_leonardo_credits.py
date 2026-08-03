@@ -41,7 +41,8 @@ def test_fetch_leonardo_credits_uses_set_credits_field_names(monkeypatch):
     manager = make_refresh_manager()
     patch_leonardo_client(
         monkeypatch,
-        FakeLeonardoClient({"subscriptionTokens": 120, "gptTokens": 30}),
+        FakeLeonardoClient({"available": 150, "subscription_tokens": 120,
+                            "api_credit": 99999}),
     )
 
     credits = manager._fetch_leonardo_credits({"value": "leo-token"})
@@ -80,7 +81,8 @@ def test_refresh_credits_persists_leonardo_balance(monkeypatch, tmp_path):
     monkeypatch.setattr(refresh_mgr_module, "token_manager", store)
     patch_leonardo_client(
         monkeypatch,
-        FakeLeonardoClient({"subscriptionTokens": 120, "gptTokens": 30}),
+        FakeLeonardoClient({"available": 150, "subscription_tokens": 120,
+                            "api_credit": 99999}),
     )
     manager = make_refresh_manager()
 

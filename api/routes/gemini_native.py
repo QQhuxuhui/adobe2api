@@ -28,6 +28,7 @@ from core.models.catalog import (
 from core.models.resolver import resolve_requested_aspect_ratio
 from core.leonardo_generation import pool_prefers_leonardo
 from core.leonardo_client import leonardo_supported_aspects
+from api.routes.generation import _record_leonardo_credit_cost
 from core.video_tasks import (
     VideoTaskCapacityError,
     VideoTaskSpec,
@@ -1063,6 +1064,8 @@ def build_gemini_native_router(
                         )
                     except LeonardoError as exc:
                         raise _map_leo_error(exc) from exc
+
+                    _record_leonardo_credit_cost(request, result)
 
                     items = result.get("data") or []
                     url = str((items[0] if items else {}).get("url") or "").strip()

@@ -780,16 +780,27 @@ class RefreshManager:
         client = LeonardoClient()
         try:
             result = client.get_user_credits(token_value)
+            # 只报「出图可用」额度：apiCredit/streamTokens 属官方 API 通道，出图扣不到，
+            # 并入会让页面显示 20 万而实际一张都出不了（每张约 250）。
+            available = int(result.get("available") or 0)
             # 字段名须与 token_manager.set_credits 消费的键一致
-            subscribed = result.get("subscriptionTokens", 0)
-            gpt = result.get("gptTokens", 0)
-            total = subscribed + gpt
             return {
-                "total": total,
+                "total": available,
                 "used": 0,  # Leonardo 只返回剩余，无 used
-                "available": total,
+                "available": available,
                 "available_until": None,
                 "updated_at": int(time.time()),
+                # 明细（另一通道单列，供页面区分展示）
+                "detail": {
+                    k: result.get(k)
+                    for k in (
+                        "subscription_tokens",
+                        "paid_tokens",
+                        "rollover_tokens",
+                        "api_credit",
+                        "stream_tokens",
+                    )
+                },
             }
         except Exception as exc:
             # Leonardo token 失效时标记但不阻塞启动

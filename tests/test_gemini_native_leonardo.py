@@ -52,7 +52,9 @@ class FakeAdobeClient:
 
 
 class FakeLeonardoClient:
-    def __init__(self, images: list[str] | None = None, raise_on_create=None):
+    def __init__(self, images: list[str] | None = None, raise_on_create=None,
+                 credit_cost=250):
+        self.credit_cost = credit_cost
         self.images = images if images is not None else ["https://cdn.leonardo.ai/out.png"]
         self.create_calls: list[dict] = []
         self.wait_timeouts: list[int] = []
@@ -70,7 +72,10 @@ class FakeLeonardoClient:
         model_slug="nano-banana-2",
         deadline=None,
         output_resolution="2K",
+        on_cost=None,
     ):
+        if on_cost is not None and self.credit_cost is not None:
+            on_cost(self.credit_cost)
         self.create_deadlines.append(deadline)
         self.create_calls.append(
             {
@@ -127,17 +132,28 @@ class Harness:
         leonardo_images: list[str] | None = None,
         raise_on_create=None,
         deadline=500,
+        credit_cost=250,
     ):
         self.config = FakeConfig(deadline=deadline)
         self.adobe = FakeAdobeClient()
         self.leo = FakeLeonardoClient(
-            images=leonardo_images, raise_on_create=raise_on_create
+            images=leonardo_images, raise_on_create=raise_on_create,
+            credit_cost=credit_cost,
         )
         self.tokens = FakeTokenManager(leonardo=leonardo)
         self.previews: list[tuple[str, str]] = []
         self.accounted: list[tuple[Path, int, int]] = []
         self.credit_contexts: list[tuple] = []
+        self.credit_logs: list[tuple] = []
         self.fetched: list[str] = []
+
+        def capture_preview(request, url, kind="image"):
+            self.previews.append((url, kind))
+            used = getattr(request.state, "log_credits_used", None)
+            if used is not None:
+                self.credit_logs.append(
+                    (used, getattr(request.state, "log_credits_source", None))
+                )
         self.cdn_budgets: list[float | None] = []
 
         def fake_fetch(url, headers=None, max_seconds=None):
@@ -163,9 +179,7 @@ class Harness:
                 set_request_credit_context=lambda request, model, res: self.credit_contexts.append(
                     (model, res)
                 ),
-                set_request_preview=lambda request, url, kind="image": self.previews.append(
-                    (url, kind)
-                ),
+                set_request_preview=capture_preview,
                 public_image_url=lambda request, job_id: f"/generated/{job_id}.png",
                 on_generated_file_written=lambda p, old, new: self.accounted.append(
                     (p, old, new)
@@ -386,6 +400,21 @@ def test_leo_pool_image_size_threaded_to_upstream(tmp_path):
         )
         assert resp.status_code == 200, resp.text
         assert h.leo.create_calls[0]["output_resolution"] == size
+
+
+def test_leo_pool_records_exact_credit_cost(tmp_path):
+    # 上游 Generate 回报的 apiCreditCost 必须落到请求日志（精确值，来源 upstream）
+    h = Harness(tmp_path)
+    resp = post(h, "gemini-3-pro-image", "generateContent", image_request())
+    assert resp.status_code == 200, resp.text
+    assert h.credit_logs and h.credit_logs[-1] == (250.0, "upstream")
+
+
+def test_leo_pool_no_credit_cost_when_upstream_silent(tmp_path):
+    h = Harness(tmp_path, credit_cost=None)
+    resp = post(h, "gemini-3-pro-image", "generateContent", image_request())
+    assert resp.status_code == 200, resp.text
+    assert h.credit_logs == []
 
 
 def test_leo_pool_2k_request_ok(tmp_path):

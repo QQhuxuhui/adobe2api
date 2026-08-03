@@ -80,7 +80,13 @@ def is_likely_leonardo_token(token: str) -> bool:
     return isinstance(aud, str) and aud.startswith("https://cognito-idp")
 
 
-_CREDIT_FIELDS = ("subscriptionTokens", "paidTokens", "rolloverTokens", "apiCredit", "streamTokens")
+# 只有这三项能用于「网页会话出图」；apiCredit / streamTokens 属官方 API 通道，
+# 出图扣不到它们。实测：账号 subscriptionTokens 只剩 41 时仍能显示 apiCredit=100000，
+# 若把 5 项相加会显示 20 万可用，而实际一张图都出不了（每张约 250）。
+_GENERATION_CREDIT_FIELDS = ("subscriptionTokens", "paidTokens", "rolloverTokens")
+# 另计通道（仅展示，不计入出图可用额度）
+_OTHER_CREDIT_FIELDS = ("apiCredit", "streamTokens")
+_CREDIT_FIELDS = _GENERATION_CREDIT_FIELDS + _OTHER_CREDIT_FIELDS
 
 TOKEN_BALANCE_QUERY = {
     "operationName": "GetTokenBalance",
@@ -92,13 +98,28 @@ TOKEN_BALANCE_QUERY = {
 }
 
 
+def _credit_value(details: Dict[str, Any], key: str) -> int:
+    value = (details or {}).get(key)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    return 0
+
+
 def sum_credits(details: Dict[str, Any]) -> int:
-    total = 0
-    for key in _CREDIT_FIELDS:
-        value = (details or {}).get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            total += int(value)
-    return total
+    """**出图可用**额度（不含 apiCredit/streamTokens 这类出图扣不到的通道）。"""
+    return sum(_credit_value(details, key) for key in _GENERATION_CREDIT_FIELDS)
+
+
+def credit_breakdown(details: Dict[str, Any]) -> Dict[str, int]:
+    """额度明细：available=出图可用；其余通道单列，便于页面区分展示。"""
+    return {
+        "available": sum_credits(details),
+        "subscription_tokens": _credit_value(details, "subscriptionTokens"),
+        "paid_tokens": _credit_value(details, "paidTokens"),
+        "rollover_tokens": _credit_value(details, "rolloverTokens"),
+        "api_credit": _credit_value(details, "apiCredit"),
+        "stream_tokens": _credit_value(details, "streamTokens"),
+    }
 
 
 def parse_token_balance(resp: Dict[str, Any]) -> Optional[int]:
@@ -203,6 +224,14 @@ def parse_generation_id(resp: Dict[str, Any]) -> str:
         return gen_id
     errors = [e.get("message", "") for e in (resp or {}).get("errors", []) if isinstance(e, dict)]
     raise LeonardoError(", ".join([m for m in errors if m]) or "Generate failed")
+
+
+def parse_generation_cost(resp: Dict[str, Any]) -> Optional[int]:
+    """Generate mutation 回报的本次生成实际积分成本（apiCreditCost），拿不到则 None。"""
+    cost = (((resp or {}).get("data") or {}).get("generate") or {}).get("apiCreditCost")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        return int(cost)
+    return None
 
 
 def build_status_query(gen_id: str) -> Dict[str, Any]:
@@ -394,10 +423,9 @@ class LeonardoClient:
         data = result.get("data", {})
         user_details = data.get("user_details", []) if isinstance(data, dict) else []
         details = user_details[0] if user_details else {}
-        return {
-            "subscriptionTokens": details.get("subscriptionTokens", 0),
-            "gptTokens": details.get("apiCredit", 0),  # apiCredit 是 GPT token
-        }
+        # available = 出图可用额度；apiCredit/streamTokens 是另一通道，出图扣不到，
+        # 单列出来供页面区分展示，绝不能并入 available（否则余额显示会严重虚高）。
+        return credit_breakdown(details)
 
     def create_generation(
         self,
@@ -411,6 +439,7 @@ class LeonardoClient:
         model_slug="nano-banana-2",
         output_resolution: str = "2K",
         deadline: Optional[float] = None,
+        on_cost=None,
     ) -> str:
         size = aspect_to_size(
             aspect_ratio, model_slug=model_slug, output_resolution=output_resolution
@@ -427,11 +456,17 @@ class LeonardoClient:
         )
         response = self._call(token, payload, deadline=deadline)
         try:
-            return parse_generation_id(response)
+            gen_id = parse_generation_id(response)
         except LeonardoError as exc:
             raise LeonardoGraphQLError(
                 str(exc), operation="Generate"
             ) from exc
+        if on_cost is not None:
+            # 上游回报的本次实际积分成本（精确值，优于余额差分估算）
+            cost = parse_generation_cost(response)
+            if cost is not None:
+                on_cost(cost)
+        return gen_id
 
     def poll_status(
         self, token: str, gen_id: str, *, deadline: Optional[float] = None

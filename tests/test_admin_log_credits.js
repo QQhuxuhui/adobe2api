@@ -33,6 +33,18 @@ test("credit formatter renders measured, estimated, and unknown states", () => {
   assert.equal(formatLogCredits(5, "unexpected").text, "-");
 });
 
+test("upstream-reported credits render as exact values", () => {
+  const { formatLogCredits } = require("../static/admin_log_credits.js");
+  // Leonardo 的 Generate 直接回报 apiCreditCost：精确值，不加 ~ 前缀
+  assert.deepEqual(formatLogCredits(250, "upstream"), {
+    text: "250",
+    title: "上游回报(精确)",
+    estimated: false,
+  });
+  assert.equal(formatLogCredits(250.5, "upstream").text, "250.5");
+  assert.equal(formatLogCredits(null, "upstream").text, "-");
+});
+
 test("logs table declares the credit column and nine-column empty states", () => {
   const html = fs.readFileSync(path.join(repoRoot, "static", "admin.html"), "utf8");
   const source = fs.readFileSync(path.join(repoRoot, "static", "admin.js"), "utf8");

@@ -317,15 +317,34 @@ class CreditsTracker:
         except queue.Full:
             self._backfill_estimate(task)
 
+    @staticmethod
+    def _merge_credits(
+        payload: dict,
+        credits_used: float | None,
+        credits_source: str | None,
+    ) -> dict:
+        """写入本次测得的积分消耗；但**不覆盖**上游回报的精确值。
+
+        Leonardo 的 Generate 直接回报 apiCreditCost（精确单张成本），
+        余额差分/估值不得把它盖掉。
+        """
+        merged = dict(payload)
+        if (
+            str(merged.get("credits_source") or "") == "upstream"
+            and merged.get("credits_used") is not None
+        ):
+            return merged
+        merged["credits_used"] = credits_used
+        merged["credits_source"] = credits_source if credits_used is not None else None
+        return merged
+
     def _backfill(
         self,
         task: _MeasurementTask,
         credits_used: float | None,
         credits_source: str | None,
     ) -> None:
-        payload = dict(task.payload)
-        payload["credits_used"] = credits_used
-        payload["credits_source"] = credits_source if credits_used is not None else None
+        payload = self._merge_credits(task.payload, credits_used, credits_source)
         try:
             conditional_upsert = getattr(
                 self._log_store,
