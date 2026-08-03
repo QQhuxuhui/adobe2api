@@ -23,6 +23,10 @@ class LeonardoTokenUpsertRequest(BaseModel):
     label: Optional[str] = Field(default=None, max_length=200)
 
 
+class LeonardoCookieUploadRequest(BaseModel):
+    cookie: str = Field(min_length=1, max_length=32768)
+
+
 class ExportSelectionRequest(BaseModel):
     ids: Optional[List[str]] = None
 

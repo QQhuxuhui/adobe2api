@@ -1,7 +1,22 @@
 # Leonardo Token 自动刷新 sidecar（A‴）设计
 
 日期：2026-08-02
-状态：设计已补充（v3，纳入两轮代码评审），待写实现计划
+状态：v4 — 实机部署后转向 **cookie-upload 模式**（headless，去 noVNC）
+
+> ## ⚠️ v4 重大变更（2026-08-03，实机验证驱动）
+> 原设计靠"容器内 noVNC 手动登录 Leonardo"。实机部署发现：搬瓦工机房 IP + Playwright
+> 自动化指纹导致 **Canva/Cloudflare Turnstile 人工也过不去**。而实测坐实一条更优路径：
+> **cookie 换到任意真实浏览器(含异地/headless)照样能 get-session 出 token，不绑 IP**
+> （之前 curl_cffi 裸 HTTP 重放失败是"裸 HTTP vs 真实浏览器"的差别，非 IP 绑定）。
+> 会话存活约 6 周。故改为：
+> - **本地登录**(住宅 IP、真实浏览器，Turnstile 秒过) → 复制 cookie → 上传。
+> - adobe2api 新增 `POST/GET /api/v1/tokens/leonardo/cookie`(LEONARDO_REFRESH_KEY 鉴权，
+>   存 `config/leonardo_cookie.json` + sha256 指纹)。
+> - refresher 改 **headless**：拉 cookie → `add_cookies` 注入 → get-session → 推池；
+>   指纹变则重注入重导航。无 cookie=`login_required`/`cookie_required`。
+> - 去掉 noVNC/Xvfb/x11vnc(entrypoint 只跑 python，镜像瘦身)，反检测保留
+>   (webdriver 抹除 + AutomationControlled 关闭 + Windows UA)。
+> 下面 v1-v3 的 noVNC 登录描述已作废，仅保留架构/失败态/upsert/代理等仍适用部分。
 
 ## 目标
 

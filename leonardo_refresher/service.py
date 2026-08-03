@@ -18,6 +18,11 @@ class LoginRequiredError(Exception):
     pass
 
 
+class CookieRequiredError(LoginRequiredError):
+    """尚未上传 Leonardo cookie（或已清空）。与掉登录同类(需人工上传),
+    但 error_kind 用 cookie_required 区分"从未上传" vs "cookie 过期"。"""
+
+
 class RefreshFetchError(Exception):
     def __init__(self, kind: str):
         self.kind = str(kind or "fetch_error")
@@ -131,6 +136,13 @@ class RefresherService:
     def run_once(self) -> int:
         try:
             token = self.source.fetch_token()
+        except CookieRequiredError:
+            self.state.mark_failure(
+                state="login_required",
+                session_state="login_required",
+                error_kind="cookie_required",
+            )
+            return self.config.min_interval_seconds
         except LoginRequiredError:
             self.state.mark_failure(
                 state="login_required",

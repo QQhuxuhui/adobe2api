@@ -1,12 +1,51 @@
+import hashlib
 import hmac
+import json
 import math
 import os
+import re
 import time
 
 from fastapi import APIRouter, HTTPException, Request
 
-from api.schemas import LeonardoTokenUpsertRequest
+import core.token_mgr as token_mgr_module
+from api.schemas import LeonardoCookieUploadRequest, LeonardoTokenUpsertRequest
 from core.leonardo_client import decode_jwt_payload, token_exp
+
+
+_BETTER_AUTH_COOKIES = (
+    "__Secure-better-auth.session_token",
+    "__Secure-better-auth.session_data.0",
+    "__Secure-better-auth.session_data.1",
+)
+
+
+def _require_refresh_key(request: Request) -> None:
+    required = str(os.getenv("LEONARDO_REFRESH_KEY", "") or "").strip()
+    if not required:
+        raise HTTPException(status_code=503, detail="Leonardo refresher disabled")
+    provided = request.headers.get("X-Leonardo-Refresh-Key", "")
+    if not hmac.compare_digest(provided, required):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _cookie_path():
+    return token_mgr_module.CONFIG_DIR / "leonardo_cookie.json"
+
+
+def extract_better_auth_cookies(raw: str) -> str:
+    """从整条 cookie 头抽取 better-auth 会话 cookie，拼成 name=value; 串。
+
+    至少要含 session_token；否则视为无效上传。
+    """
+    parts = []
+    for name in _BETTER_AUTH_COOKIES:
+        m = re.search(re.escape(name) + r"=([^;]+)", raw or "")
+        if m:
+            parts.append(f"{name}={m.group(1).strip()}")
+    if not any(p.startswith("__Secure-better-auth.session_token=") for p in parts):
+        raise ValueError("missing better-auth session_token")
+    return "; ".join(parts)
 
 
 DEFAULT_ISSUER = (
@@ -61,21 +100,53 @@ def validate_leonardo_id_token(token: str, *, now: int) -> dict:
 def build_leonardo_token_router(*, token_manager) -> APIRouter:
     router = APIRouter()
 
+    @router.post("/api/v1/tokens/leonardo/cookie")
+    def upload_leonardo_cookie(
+        req: LeonardoCookieUploadRequest,
+        request: Request,
+    ):
+        _require_refresh_key(request)
+        try:
+            cookie = extract_better_auth_cookies(req.cookie)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="cookie must contain better-auth session cookies",
+            )
+        fingerprint = hashlib.sha256(cookie.encode("utf-8")).hexdigest()
+        updated_at = int(time.time())
+        path = _cookie_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {"cookie": cookie, "fingerprint": fingerprint, "updated_at": updated_at}
+            ),
+            encoding="utf-8",
+        )
+        return {"fingerprint": fingerprint, "updated_at": updated_at}
+
+    @router.get("/api/v1/tokens/leonardo/cookie")
+    def get_leonardo_cookie(request: Request):
+        _require_refresh_key(request)
+        path = _cookie_path()
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="no cookie uploaded")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            raise HTTPException(status_code=404, detail="no cookie uploaded")
+        return {
+            "cookie": data.get("cookie", ""),
+            "fingerprint": data.get("fingerprint", ""),
+            "updated_at": data.get("updated_at"),
+        }
+
     @router.post("/api/v1/tokens/leonardo")
     def upsert_leonardo_token(
         req: LeonardoTokenUpsertRequest,
         request: Request,
     ):
-        required = str(os.getenv("LEONARDO_REFRESH_KEY", "") or "").strip()
-        if not required:
-            raise HTTPException(
-                status_code=503,
-                detail="Leonardo refresher disabled",
-            )
-
-        provided = request.headers.get("X-Leonardo-Refresh-Key", "")
-        if not hmac.compare_digest(provided, required):
-            raise HTTPException(status_code=401, detail="Unauthorized")
+        _require_refresh_key(request)
 
         try:
             claims = validate_leonardo_id_token(req.token, now=int(time.time()))

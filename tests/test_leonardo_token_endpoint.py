@@ -220,3 +220,65 @@ def test_endpoint_uses_configurable_issuer_and_audience(
     )
 
     assert response.status_code == 200
+
+
+# ---------------- Leonardo cookie 上传/拉取端点 ----------------
+
+_SAMPLE_COOKIE = (
+    "anonymous-id=abc; "
+    "__Secure-better-auth.session_token=tok123.sig456; "
+    "__Secure-better-auth.session_data.0=DATA0PART; "
+    "__Secure-better-auth.session_data.1=DATA1PART; "
+    "_ga=GA1.1.x"
+)
+
+
+def test_cookie_endpoint_disabled_without_key(client, monkeypatch):
+    monkeypatch.delenv("LEONARDO_REFRESH_KEY", raising=False)
+    r = client.post("/api/v1/tokens/leonardo/cookie", json={"cookie": _SAMPLE_COOKIE})
+    assert r.status_code == 503
+
+
+def test_cookie_endpoint_rejects_wrong_key(client, monkeypatch):
+    monkeypatch.setenv("LEONARDO_REFRESH_KEY", "correct-key")
+    r = client.post(
+        "/api/v1/tokens/leonardo/cookie",
+        headers={"X-Leonardo-Refresh-Key": "nope"},
+        json={"cookie": _SAMPLE_COOKIE},
+    )
+    assert r.status_code == 401
+
+
+def test_cookie_upload_extracts_better_auth_and_roundtrips(client, authorized_headers):
+    up = client.post(
+        "/api/v1/tokens/leonardo/cookie",
+        headers=authorized_headers,
+        json={"cookie": _SAMPLE_COOKIE},
+    )
+    assert up.status_code == 200
+    fp = up.json()["fingerprint"]
+    assert fp
+
+    got = client.get("/api/v1/tokens/leonardo/cookie", headers=authorized_headers)
+    assert got.status_code == 200
+    assert got.json()["fingerprint"] == fp
+    cookie = got.json()["cookie"]
+    # 只保留 better-auth 三条，剔除无关 cookie
+    assert "__Secure-better-auth.session_token=tok123.sig456" in cookie
+    assert "__Secure-better-auth.session_data.0=DATA0PART" in cookie
+    assert "__Secure-better-auth.session_data.1=DATA1PART" in cookie
+    assert "anonymous-id" not in cookie and "_ga" not in cookie
+
+
+def test_cookie_upload_rejects_without_session_token(client, authorized_headers):
+    r = client.post(
+        "/api/v1/tokens/leonardo/cookie",
+        headers=authorized_headers,
+        json={"cookie": "anonymous-id=abc; _ga=GA1.1.x"},
+    )
+    assert r.status_code == 400
+
+
+def test_cookie_get_returns_404_when_none(client, authorized_headers):
+    r = client.get("/api/v1/tokens/leonardo/cookie", headers=authorized_headers)
+    assert r.status_code == 404

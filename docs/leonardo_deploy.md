@@ -43,18 +43,23 @@ curl -s http://127.0.0.1:6001/login -o /dev/null -w '%{http_code}\n'   # adobe2a
 
 > 本地开发/自建构建仍可用 `docker-compose.yml`（`build:` 版）：`docker compose --profile leonardo up -d --build`。
 
-## 首次远程登录（noVNC）
+## 首次上传 cookie（headless，无 noVNC）
 
-noVNC 只绑 `127.0.0.1:6080`，用 SSH 隧道从本机访问：
+登录**在本地**做（住宅 IP + 真实浏览器，Turnstile 秒过），再把 cookie 上传：
+
+1. 本地浏览器登录 `app.leonardo.ai`。
+2. DevTools → Network → 任意 `app.leonardo.ai` 请求 → 复制整条 `cookie:` 请求头
+   （至少含 `__Secure-better-auth.session_token` + `session_data.0/.1`）。
+3. 一条 curl 上传（`<KEY>` = `.env` 的 `LEONARDO_REFRESH_KEY`）：
 
 ```bash
-# 本机执行
-ssh -L 6080:127.0.0.1:6080 <user>@<搬瓦工IP>
-# 然后浏览器打开 http://127.0.0.1:6080 → 输入 NOVNC_PASSWORD
-#   → 在里面的 Chrome 手动完成 app.leonardo.ai 登录（Turnstile + Canva OTP）
+curl -X POST http://<搬瓦工IP>:6001/api/v1/tokens/leonardo/cookie \
+  -H "X-Leonardo-Refresh-Key: <KEY>" -H "Content-Type: application/json" \
+  -d "{\"cookie\":\"<粘贴整条 cookie>\"}"
 ```
 
-登录成功后：`/healthz` 变 `state=healthy`，refresher 每 ~50 分钟自动刷新并推送；会话可用 ~6 周，到期再远程登一次。
+上传后 ~60 秒内 refresher 自动：拉 cookie → headless 加载 → get-session 取新鲜
+id_token → 推 adobe2api 池。`/healthz` 变 `state=healthy`。会话约 6 周，到期本地重导一次即可。
 
 ## 验证出图
 
@@ -66,8 +71,8 @@ curl -s http://127.0.0.1:6001/v1/images/generations \
 ```
 
 ## 运维
-- 刷新器状态：`GET :8080/healthz`（`state`/`session_state`/`last_success_at`/`current_token_exp`/`consecutive_failures`/`last_error_kind`）。
-- 登录过期 → healthz 仍 200 但 `state=login_required` → 重连 noVNC 重登。
+- 刷新器状态：`GET :8080/healthz`（headless 已发布到 `127.0.0.1:8080`）：`state`/`session_state`/`last_success_at`/`current_token_exp`/`consecutive_failures`/`last_error_kind`。
+- `state=login_required` + `last_error_kind=cookie_required`（从未上传）或 `login_required`（cookie 过期）→ 本地重新登录导出 cookie，重跑上传 curl。
 - `browser_unavailable` 是唯一 503 态（浏览器控制失联，连续 3 次进程退出→容器重启）。
-- profile 存独立 named volume `leo-profile`，容器重启免重登。
-- 镜像推私有 registry：adobe2api 用 `build-and-push.sh`，refresher 用 `build-and-push-leonardo.sh`；搬瓦工统一 `docker-compose.deploy.yml` pull 部署。refresher 2.7GB，首次跨境 pull 稍慢但只一次。
+- profile / 已上传 cookie 分别存 named volume `leo-profile` / `config/leonardo_cookie.json`，容器重启免重传。
+- 镜像推私有 registry：adobe2api 用 `build-and-push.sh`，refresher 用 `build-and-push-leonardo.sh`；搬瓦工统一 `docker-compose.deploy.yml` pull 部署。

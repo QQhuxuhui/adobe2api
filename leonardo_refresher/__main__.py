@@ -6,6 +6,7 @@ import time
 from typing import Callable, Optional
 
 from leonardo_refresher.adapters import (
+    Adobe2ApiCookieProvider,
     Adobe2ApiTokenSink,
     PlaywrightSessionSource,
 )
@@ -20,7 +21,13 @@ logger = logging.getLogger("leonardo_refresher")
 def run(
     *,
     config: Optional[RefresherConfig] = None,
-    source_factory: Callable = lambda cfg: PlaywrightSessionSource(config=cfg),
+    source_factory: Callable = lambda cfg: PlaywrightSessionSource(
+        config=cfg,
+        cookie_provider=Adobe2ApiCookieProvider(
+            base_url=cfg.adobe2api_base_url,
+            refresh_key=cfg.refresh_key,
+        ),
+    ),
     sink_factory: Callable = lambda base_url, refresh_key: Adobe2ApiTokenSink(
         base_url=base_url,
         refresh_key=refresh_key,

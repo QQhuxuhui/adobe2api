@@ -38,7 +38,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "127.0.0.1:${LEONARDO_NOVNC_PORT:-6080}:6080"
+      # headless：无 noVNC；仅把 healthz 暴露到本机便于运维
+      - "127.0.0.1:${LEONARDO_HEALTH_PORT:-8080}:8080"
     environment:
       - TZ=Asia/Shanghai
       - ADOBE2API_BASE_URL=http://adobe2api:6001
@@ -48,7 +49,6 @@ services:
       - REFRESH_INTERVAL_SECONDS=${REFRESH_INTERVAL_SECONDS:-3000}
       - SAFETY_MARGIN_SECONDS=${LEONARDO_TOKEN_MIN_TTL_SECONDS:-600}
       - MIN_INTERVAL_SECONDS=${MIN_INTERVAL_SECONDS:-60}
-      - NOVNC_PASSWORD=${NOVNC_PASSWORD:-}
       - PROFILE_DIR=/profile
       - HEALTH_HOST=0.0.0.0
       - HEALTH_PORT=8080

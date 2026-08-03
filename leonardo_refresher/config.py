@@ -19,8 +19,8 @@ def _read_int(
 class RefresherConfig:
     adobe2api_base_url: str
     refresh_key: str = field(repr=False)
-    proxy: str
-    novnc_password: str = field(repr=False)
+    proxy: str = ""
+    novnc_password: str = field(default="", repr=False)  # 已弃用(headless,无 noVNC)
     account_label: str = "Leonardo"
     refresh_interval_seconds: int = 3000
     safety_margin_seconds: int = 600
@@ -42,9 +42,6 @@ class RefresherConfig:
             "ADOBE2API_BASE_URL": base_url,
             "LEONARDO_REFRESH_KEY": str(
                 source.get("LEONARDO_REFRESH_KEY", "") or ""
-            ).strip(),
-            "NOVNC_PASSWORD": str(
-                source.get("NOVNC_PASSWORD", "") or ""
             ).strip(),
         }
         for name, value in required.items():
@@ -75,7 +72,7 @@ class RefresherConfig:
             adobe2api_base_url=base_url,
             refresh_key=required["LEONARDO_REFRESH_KEY"],
             proxy=proxy,
-            novnc_password=required["NOVNC_PASSWORD"],
+            novnc_password=str(source.get("NOVNC_PASSWORD", "") or "").strip(),
             account_label=str(
                 source.get("LEONARDO_ACCOUNT_LABEL", "Leonardo") or "Leonardo"
             ).strip()

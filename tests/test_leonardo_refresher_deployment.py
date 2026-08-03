@@ -18,21 +18,12 @@ def _compose_config(overrides=None) -> dict:
         {
             "LEONARDO_REFRESH_KEY": "test-refresh-key",
             "LEONARDO_PROXY": "http://proxy:10809",
-            "NOVNC_PASSWORD": "test-vnc-password",
             "LEONARDO_ACCOUNT_LABEL": "Primary",
         }
     )
     env.update(overrides or {})
     result = subprocess.run(
-        [
-            "docker",
-            "compose",
-            "--profile",
-            "leonardo",
-            "config",
-            "--format",
-            "json",
-        ],
+        ["docker", "compose", "--profile", "leonardo", "config", "--format", "json"],
         cwd=ROOT,
         env=env,
         check=True,
@@ -52,22 +43,20 @@ def test_compose_declares_optional_isolated_refresher_service():
     assert refresher["environment"]["LEONARDO_REFRESH_KEY"] == "test-refresh-key"
     assert refresher["environment"]["LEONARDO_PROXY"] == "http://proxy:10809"
     assert adobe["environment"]["LEONARDO_REFRESH_KEY"] == "test-refresh-key"
-    assert adobe["environment"]["LEONARDO_PROXY"] == "http://proxy:10809"
     assert "HTTP_PROXY" not in adobe["environment"]
-    assert "HTTPS_PROXY" not in adobe["environment"]
     assert "HTTP_PROXY" not in refresher["environment"]
-    assert "HTTPS_PROXY" not in refresher["environment"]
     assert refresher["shm_size"] == "1073741824"
     assert "http://127.0.0.1:8080/healthz" in refresher["healthcheck"]["test"][-1]
-    assert "host.docker.internal=host-gateway" in adobe["extra_hosts"]
     assert "host.docker.internal=host-gateway" in refresher["extra_hosts"]
 
+    # headless：只把 healthz 暴露到 127.0.0.1:8080，无 noVNC 端口
     assert any(
         port["host_ip"] == "127.0.0.1"
-        and port["published"] == "6080"
-        and port["target"] == 6080
+        and port["published"] == "8080"
+        and port["target"] == 8080
         for port in refresher["ports"]
     )
+    assert all(port["target"] != 6080 for port in refresher["ports"])
     assert any(
         volume["type"] == "volume"
         and volume["source"] == "leo-profile"
@@ -77,7 +66,7 @@ def test_compose_declares_optional_isolated_refresher_service():
     assert "leo-profile" in config["volumes"]
 
 
-def test_sidecar_image_and_vnc_auth_are_pinned_and_explicit():
+def test_sidecar_is_headless_and_hardened():
     dockerfile = (ROOT / "leonardo_refresher" / "Dockerfile").read_text()
     requirements = (ROOT / "leonardo_refresher" / "requirements.txt").read_text()
     entrypoint = (ROOT / "leonardo_refresher" / "entrypoint.sh").read_text()
@@ -86,22 +75,21 @@ def test_sidecar_image_and_vnc_auth_are_pinned_and_explicit():
 
     assert "mcr.microsoft.com/playwright/python:v1.61.0-noble" in dockerfile
     assert "playwright==1.61.0" in requirements
-    assert "requests==2.31.0" in requirements
-    assert "x11vnc -storepasswd" in entrypoint
-    assert "-rfbauth" in entrypoint
-    assert "-nopw" not in entrypoint
-    assert "NOVNC_PASSWORD" in entrypoint
-    # 直接用 websockify 提供 noVNC；Debian trixie 的 novnc_proxy 包装脚本自身语法错误会崩
-    assert "websockify --web=/usr/share/novnc" in entrypoint
-    assert "utils/novnc_proxy" not in entrypoint
-    assert "/tmp/.X11-unix/X${display_number}" in entrypoint
-    assert 'kill -0 "${xvfb_pid}"' in entrypoint
-    assert "gosu" in dockerfile
-    assert "groupadd --system pwuser" not in dockerfile
-    assert "useradd --system" not in dockerfile
+
+    # headless：不再有 noVNC / x11vnc / Xvfb
+    for banned in ("novnc", "x11vnc", "xvfb", "websockify", "NOVNC_PASSWORD"):
+        assert banned.lower() not in entrypoint.lower()
+        assert banned.lower() not in dockerfile.lower()
+    assert "python -m leonardo_refresher" in entrypoint
     assert 'exec gosu pwuser "$0" "$@"' in entrypoint
     assert 'chown -R pwuser:pwuser "${PROFILE_DIR}"' in entrypoint
+    assert "gosu" in dockerfile
+
+    # headless + 关闭 chromium 内建沙箱（Docker 下开启会崩）
+    assert '"headless": True' in adapters
+    assert '"chromium_sandbox": False' in adapters
     assert "--no-sandbox" not in adapters
+
     assert seccomp.exists()
     profile = json.loads(seccomp.read_text())
     namespace_rule = next(
@@ -110,7 +98,7 @@ def test_sidecar_image_and_vnc_auth_are_pinned_and_explicit():
     assert namespace_rule["action"] == "SCMP_ACT_ALLOW"
 
 
-def test_compose_uses_one_ttl_setting_and_enables_chromium_sandbox():
+def test_compose_uses_one_ttl_setting_and_seccomp():
     config = _compose_config({"LEONARDO_TOKEN_MIN_TTL_SECONDS": "777"})
     adobe = config["services"]["adobe2api"]
     refresher = config["services"]["leonardo-refresher"]

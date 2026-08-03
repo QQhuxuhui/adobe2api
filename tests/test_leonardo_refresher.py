@@ -6,7 +6,11 @@ from urllib.request import urlopen
 import pytest
 import requests
 
-from leonardo_refresher.adapters import Adobe2ApiTokenSink, PlaywrightSessionSource
+from leonardo_refresher.adapters import (
+    Adobe2ApiCookieProvider,
+    Adobe2ApiTokenSink,
+    PlaywrightSessionSource,
+)
 from leonardo_refresher.__main__ import run
 from leonardo_refresher.config import RefresherConfig
 from leonardo_refresher.health import start_health_server
@@ -38,7 +42,7 @@ def _install_required_env(monkeypatch):
 
 @pytest.mark.parametrize(
     "missing",
-    ["LEONARDO_REFRESH_KEY", "NOVNC_PASSWORD"],
+    ["LEONARDO_REFRESH_KEY"],
 )
 def test_config_requires_security_and_network_settings(monkeypatch, missing):
     _install_required_env(monkeypatch)
@@ -398,6 +402,68 @@ class _PushSession:
         self.closed = True
 
 
+class _GetResponse:
+    def __init__(self, *, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+
+class _GetSession:
+    def __init__(self, *, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.trust_env = True
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append({"url": url, **kwargs})
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+    def close(self):
+        pass
+
+
+def test_cookie_provider_returns_cookie_and_fingerprint():
+    session = _GetSession(
+        response=_GetResponse(payload={"cookie": "__Secure-better-auth.session_token=t", "fingerprint": "fp9"})
+    )
+    provider = Adobe2ApiCookieProvider(
+        base_url="http://adobe2api:6001", refresh_key="k",
+        session_factory=lambda: session,
+    )
+    assert provider.fetch() == ("__Secure-better-auth.session_token=t", "fp9")
+    assert session.trust_env is False
+    assert session.calls[0]["headers"]["X-Leonardo-Refresh-Key"] == "k"
+    assert session.calls[0]["url"].endswith("/api/v1/tokens/leonardo/cookie")
+
+
+def test_cookie_provider_returns_none_when_not_uploaded():
+    session = _GetSession(response=_GetResponse(status_code=404))
+    provider = Adobe2ApiCookieProvider(
+        base_url="http://adobe2api:6001", refresh_key="k",
+        session_factory=lambda: session,
+    )
+    assert provider.fetch() is None
+
+
+def test_cookie_provider_network_error_is_retryable():
+    session = _GetSession(error=requests.ConnectionError("boom"))
+    provider = Adobe2ApiCookieProvider(
+        base_url="http://adobe2api:6001", refresh_key="k",
+        session_factory=lambda: session,
+    )
+    with pytest.raises(RefreshFetchError) as exc_info:
+        provider.fetch()
+    assert exc_info.value.kind == "network"
+
+
 def test_token_sink_ignores_environment_proxy_and_sends_scoped_key():
     session = _PushSession(response=_PushResponse(payload={"status": "created"}))
     sink = Adobe2ApiTokenSink(
@@ -458,7 +524,6 @@ class _BrowserPage:
         self.fetch_result = fetch_result
         self.goto_calls = []
         self.evaluate_calls = []
-        self.brought_to_front = False
 
     def goto(self, url, **kwargs):
         self.goto_calls.append({"url": url, **kwargs})
@@ -469,19 +534,27 @@ class _BrowserPage:
             raise self.fetch_result
         return self.fetch_result
 
-    def bring_to_front(self):
-        self.brought_to_front = True
-
 
 class _BrowserContext:
     def __init__(self, fetch_result):
-        self.visible_page = _BrowserPage()
-        self.controller_page = _BrowserPage(fetch_result=fetch_result)
-        self.pages = [self.visible_page]
+        self.page = _BrowserPage(fetch_result=fetch_result)
+        self.pages = [self.page]
+        self.init_scripts = []
+        self.added_cookies = []
+        self.clear_calls = 0
         self.closed = False
 
+    def add_init_script(self, script):
+        self.init_scripts.append(script)
+
+    def clear_cookies(self):
+        self.clear_calls += 1
+
+    def add_cookies(self, cookies):
+        self.added_cookies.append(cookies)
+
     def new_page(self):
-        return self.controller_page
+        return self.page
 
     def close(self):
         self.closed = True
@@ -506,17 +579,31 @@ class _Playwright:
         self.stopped = True
 
 
-def _browser_source(fetch_result):
+class _FakeCookieProvider:
+    def __init__(self, *, cookie="__Secure-better-auth.session_token=tok.sig",
+                 fingerprint="fp1", none=False):
+        self._cookie = cookie
+        self._fingerprint = fingerprint
+        self._none = none
+        self.calls = 0
+
+    def fetch(self):
+        self.calls += 1
+        return None if self._none else (self._cookie, self._fingerprint)
+
+
+def _browser_source(fetch_result, *, provider=None):
     context = _BrowserContext(fetch_result)
     playwright = _Playwright(context)
     source = PlaywrightSessionSource(
         config=_config(),
+        cookie_provider=provider or _FakeCookieProvider(),
         playwright_factory=lambda: playwright,
     )
     return source, playwright, context
 
 
-def test_browser_source_uses_persistent_profile_proxy_and_same_origin_fetch():
+def test_browser_source_headless_loads_cookies_and_fetches():
     response = {
         "status": 200,
         "content_type": "application/json",
@@ -528,24 +615,65 @@ def test_browser_source_uses_persistent_profile_proxy_and_same_origin_fetch():
     token = source.fetch_token()
     source.close()
 
-    assert playwright.chromium.calls == [
-        {
-            "profile_dir": "/profile",
-            "headless": False,
-            "chromium_sandbox": False,
-            "proxy": {"server": "http://proxy:10809"},
-        }
-    ]
-    assert context.visible_page.goto_calls[0]["url"] == "https://app.leonardo.ai/"
-    assert context.controller_page.goto_calls[0]["url"] == "https://app.leonardo.ai/"
-    assert context.visible_page.brought_to_front is True
+    call = playwright.chromium.calls[0]
+    assert call["profile_dir"] == "/profile"
+    assert call["headless"] is True
+    assert call["chromium_sandbox"] is False
+    assert "--disable-blink-features=AutomationControlled" in call["args"]
+    assert call["ignore_default_args"] == ["--enable-automation"]
+    assert "Windows NT 10.0" in call["user_agent"]
+    assert call["proxy"] == {"server": "http://proxy:10809"}
+    assert any("webdriver" in s for s in context.init_scripts)
+    # cookie 被解析并注入
+    assert context.clear_calls == 1
+    names = [c["name"] for c in context.added_cookies[0]]
+    assert "__Secure-better-auth.session_token" in names
+    assert context.page.goto_calls[0]["url"] == "https://app.leonardo.ai/"
     assert token == "fresh-jwt"
-    expression = context.controller_page.evaluate_calls[0]
-    assert "fetch('/api/auth/get-session'" in expression
-    assert "credentials: 'include'" in expression
-    assert "cache: 'no-store'" in expression
+    assert "fetch('/api/auth/get-session'" in context.page.evaluate_calls[0]
     assert context.closed is True
     assert playwright.stopped is True
+
+
+def test_browser_source_no_cookie_uploaded_raises_cookie_required():
+    from leonardo_refresher.service import CookieRequiredError
+
+    source, _, _ = _browser_source(
+        {"status": 200, "content_type": "application/json", "body": "{}"},
+        provider=_FakeCookieProvider(none=True),
+    )
+    source.open()
+    with pytest.raises(CookieRequiredError):
+        source.fetch_token()
+    source.close()
+
+
+def test_browser_source_reapplies_cookies_on_fingerprint_change():
+    response = {
+        "status": 200,
+        "content_type": "application/json",
+        "body": json.dumps({"session": {"accessToken": "t"}}),
+    }
+
+    class _RotatingProvider:
+        def __init__(self):
+            self.calls = 0
+
+        def fetch(self):
+            self.calls += 1
+            return (
+                "__Secure-better-auth.session_token=v%d" % self.calls,
+                "fp%d" % self.calls,
+            )
+
+    source, playwright, context = _browser_source(response, provider=_RotatingProvider())
+    source.open()
+    source.fetch_token()
+    source.fetch_token()
+    source.close()
+
+    assert context.clear_calls == 2               # 两次指纹不同都重注入
+    assert len(context.page.goto_calls) == 2       # 每次变更都重新导航
 
 
 @pytest.mark.parametrize(
@@ -571,18 +699,20 @@ def test_browser_source_maps_missing_session_to_login_required(fetch_result):
 
 
 def test_browser_source_omits_proxy_when_empty():
-    # 直连场景：proxy 为空时 launch 不带 proxy（proxy={"server":""} 会被 Chromium 拒）
-    import leonardo_refresher.adapters as adapters_mod
-
-    context = _BrowserContext({"status": 200, "content_type": "application/json",
-                              "body": json.dumps({"session": {"accessToken": "t"}})})
+    context = _BrowserContext(
+        {"status": 200, "content_type": "application/json",
+         "body": json.dumps({"session": {"accessToken": "t"}})}
+    )
     playwright = _Playwright(context)
     cfg = RefresherConfig(
         adobe2api_base_url="http://adobe2api:6001", refresh_key="k", proxy="",
-        novnc_password="vnc-password", account_label="Primary",
-        refresh_interval_seconds=3000, safety_margin_seconds=600, min_interval_seconds=60,
+        account_label="Primary", refresh_interval_seconds=3000,
+        safety_margin_seconds=600, min_interval_seconds=60,
     )
-    source = adapters_mod.PlaywrightSessionSource(config=cfg, playwright_factory=lambda: playwright)
+    source = PlaywrightSessionSource(
+        config=cfg, cookie_provider=_FakeCookieProvider(),
+        playwright_factory=lambda: playwright,
+    )
     source.open()
     source.close()
     assert "proxy" not in playwright.chromium.calls[0]
@@ -603,7 +733,6 @@ def test_browser_source_maps_geo_status(status):
 
 @pytest.mark.parametrize("status", [500, 502, 503, 504])
 def test_browser_source_maps_5xx_html_gateway_to_retryable(status):
-    # CF/nginx 网关错误页是 HTML；不得误判成掉登录，应走可重试 http_{status}
     response = {
         "status": status,
         "content_type": "text/html",
@@ -642,34 +771,18 @@ def test_browser_source_sanitizes_browser_transport_error():
     source.close()
 
 
-def test_browser_source_relaunches_closed_context_and_recovers():
-    recovered_response = {
-        "status": 200,
-        "content_type": "application/json",
-        "body": json.dumps({"session": {"accessToken": "recovered-jwt"}}),
-    }
-    crashed_context = _BrowserContext(
+def test_browser_source_control_error_resets_and_raises():
+    source, playwright, context = _browser_source(
         RuntimeError("Target page, context or browser has been closed")
     )
-    recovered_context = _BrowserContext(recovered_response)
-    crashed_playwright = _Playwright(crashed_context)
-    recovered_playwright = _Playwright(recovered_context)
-    playwrights = iter([crashed_playwright, recovered_playwright])
-    source = PlaywrightSessionSource(
-        config=_config(),
-        playwright_factory=lambda: next(playwrights),
-    )
-
     source.open()
-    token = source.fetch_token()
-    source.close()
 
-    assert token == "recovered-jwt"
-    assert crashed_context.closed is True
-    assert crashed_playwright.stopped is True
-    assert len(recovered_playwright.chromium.calls) == 1
-    assert recovered_context.closed is True
-    assert recovered_playwright.stopped is True
+    with pytest.raises(RefreshFetchError) as exc_info:
+        source.fetch_token()
+
+    assert exc_info.value.kind == "browser_control"
+    assert context.closed is True                 # 控制通道错误重置浏览器
+    assert playwright.stopped is True
 
 
 class _StopAfterFirstWait:

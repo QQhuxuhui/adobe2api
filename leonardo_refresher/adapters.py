@@ -1,10 +1,11 @@
 import json
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import requests
 
 from leonardo_refresher.config import RefresherConfig
 from leonardo_refresher.service import (
+    CookieRequiredError,
     LoginRequiredError,
     RefreshFetchError,
     TokenPushError,
@@ -26,6 +27,24 @@ async () => {
 }
 """
 
+# 反检测：Canva/Cloudflare Turnstile 靠 navigator.webdriver / --enable-automation
+# 判机器人。此处仅用于承载已在本地(住宅 IP、真实浏览器)登录得到的 cookie，
+# headless 下调 get-session 续期，不做交互登录；反检测降低续期请求被风控概率。
+_ANTIDETECT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+_ANTIDETECT_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-dev-shm-usage",
+]
+_ANTIDETECT_JS = (
+    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+    "window.navigator.chrome={runtime:{}};"
+    "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
+    "Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});"
+)
+
 
 def _start_playwright():
     from playwright.sync_api import sync_playwright
@@ -33,74 +52,136 @@ def _start_playwright():
     return sync_playwright().start()
 
 
+class Adobe2ApiCookieProvider:
+    """从 adobe2api 拉取已上传的 Leonardo cookie（refresh key 鉴权）。
+
+    返回 (cookie_str, fingerprint)；尚未上传返回 None；网络/HTTP 错误抛
+    RefreshFetchError 交由上层归入 refresh_retrying。
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        refresh_key: str,
+        session_factory: Callable[[], requests.Session] = requests.Session,
+    ):
+        self._base_url = str(base_url or "").strip().rstrip("/")
+        self._refresh_key = str(refresh_key or "")
+        self._session = session_factory()
+        self._session.trust_env = False
+
+    def fetch(self) -> Optional[Tuple[str, str]]:
+        try:
+            resp = self._session.get(
+                f"{self._base_url}/api/v1/tokens/leonardo/cookie",
+                headers={"X-Leonardo-Refresh-Key": self._refresh_key},
+                timeout=15,
+            )
+        except requests.RequestException as exc:
+            raise RefreshFetchError("network") from exc
+        if resp.status_code == 404:
+            return None
+        if resp.status_code >= 400:
+            raise RefreshFetchError(f"cookie_http_{resp.status_code}")
+        try:
+            data = resp.json()
+        except (TypeError, ValueError) as exc:
+            raise RefreshFetchError("invalid_response") from exc
+        cookie = str((data or {}).get("cookie") or "").strip()
+        fingerprint = str((data or {}).get("fingerprint") or "").strip()
+        if not cookie or not fingerprint:
+            return None
+        return cookie, fingerprint
+
+    def close(self) -> None:
+        self._session.close()
+
+
 class PlaywrightSessionSource:
     def __init__(
         self,
         *,
         config: RefresherConfig,
+        cookie_provider,
         playwright_factory: Callable = _start_playwright,
     ):
         self._config = config
+        self._cookie_provider = cookie_provider
         self._playwright_factory = playwright_factory
         self._playwright = None
         self._context = None
-        self._visible_page = None
-        self._controller_page = None
+        self._page = None
+        self._loaded_fingerprint = None
 
     def open(self) -> None:
         if self._context is not None:
             return
-
         self._playwright = self._playwright_factory()
-        # 容器内关闭 Chromium 内建沙箱：Docker+非 root+用户命名空间下开启会
-        # "Chromium sandboxing failed!" 无法启动。隔离由容器兜底（seccomp
-        # profile + 非 root pwuser + 独立网络命名空间）。
-        launch_kwargs = {"headless": False, "chromium_sandbox": False}
-        if self._config.proxy:  # 空＝直连，不传 proxy（proxy={"server":""} 非法）
+        # headless：不做交互登录（登录在本地完成、cookie 上传），容器内无 GUI。
+        # chromium_sandbox=False：Docker+非 root 下开内建沙箱会 "sandboxing failed"。
+        launch_kwargs = {
+            "headless": True,
+            "chromium_sandbox": False,
+            "args": list(_ANTIDETECT_ARGS),
+            "ignore_default_args": ["--enable-automation"],
+            "user_agent": _ANTIDETECT_UA,
+            "locale": "en-US",
+            "viewport": {"width": 1280, "height": 800},
+        }
+        if self._config.proxy:  # 空＝直连（proxy={"server":""} 非法）
             launch_kwargs["proxy"] = {"server": self._config.proxy}
         self._context = self._playwright.chromium.launch_persistent_context(
             self._config.profile_dir,
             **launch_kwargs,
         )
-        self._visible_page = (
+        self._context.add_init_script(_ANTIDETECT_JS)
+        self._page = (
             self._context.pages[0]
             if self._context.pages
             else self._context.new_page()
         )
-        self._visible_page.goto(
-            LEONARDO_HOME_URL,
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
-        self._controller_page = self._context.new_page()
-        self._controller_page.goto(
-            LEONARDO_HOME_URL,
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
-        self._visible_page.bring_to_front()
+
+    def _apply_cookies(self, cookie_str: str) -> None:
+        cookies = []
+        for pair in str(cookie_str or "").split(";"):
+            pair = pair.strip()
+            if "=" in pair:
+                name, value = pair.split("=", 1)
+                cookies.append(
+                    {"name": name.strip(), "value": value.strip(), "url": LEONARDO_HOME_URL}
+                )
+        self._context.clear_cookies()
+        if cookies:
+            self._context.add_cookies(cookies)
 
     def fetch_token(self) -> str:
-        if self._controller_page is None:
+        if self._context is None:
             try:
                 self.open()
             except Exception as exc:
                 self._reset_browser()
                 raise RefreshFetchError("browser_control") from exc
+
+        provided = self._cookie_provider.fetch()
+        if not provided:
+            raise CookieRequiredError()
+        cookie_str, fingerprint = provided
+
         try:
-            result = self._controller_page.evaluate(_SESSION_FETCH_SCRIPT)
+            if fingerprint != self._loaded_fingerprint:
+                self._apply_cookies(cookie_str)
+                self._page.goto(
+                    LEONARDO_HOME_URL, wait_until="domcontentloaded", timeout=60000
+                )
+                self._loaded_fingerprint = fingerprint
+            result = self._page.evaluate(_SESSION_FETCH_SCRIPT)
         except Exception as exc:
             if self._is_browser_control_error(exc):
                 self._reset_browser()
-                try:
-                    self.open()
-                    result = self._controller_page.evaluate(_SESSION_FETCH_SCRIPT)
-                except Exception as recovery_exc:
-                    self._reset_browser()
-                    raise RefreshFetchError("browser_control") from recovery_exc
-            else:
-                kind = "proxy" if "proxy" in str(exc).lower() else "network"
-                raise RefreshFetchError(kind) from exc
+                raise RefreshFetchError("browser_control") from exc
+            kind = "proxy" if "proxy" in str(exc).lower() else "network"
+            raise RefreshFetchError(kind) from exc
 
         if not isinstance(result, dict):
             raise RefreshFetchError("invalid_response")
@@ -115,8 +196,7 @@ class PlaywrightSessionSource:
             raise RefreshFetchError("geo_embargo")
         if status == 401:
             raise LoginRequiredError()
-        # 先判 >=400（如 CF/nginx 的 5xx HTML 网关页），再把 200 的 HTML 视为登录页；
-        # 否则 5xx+text/html 会被误判成掉登录 → 误报"需重登"。
+        # 先判 >=400（CF/nginx 5xx HTML 网关页），再把 200 的 HTML 视为登录页。
         if status >= 400:
             raise RefreshFetchError(f"http_{status}")
         if "text/html" in content_type:
@@ -155,8 +235,8 @@ class PlaywrightSessionSource:
         playwright = self._playwright
         self._context = None
         self._playwright = None
-        self._visible_page = None
-        self._controller_page = None
+        self._page = None
+        self._loaded_fingerprint = None
         if context is not None:
             try:
                 context.close()
