@@ -25,6 +25,25 @@ def to_aspect(size: Optional[str] = None, aspect_ratio: Optional[str] = None) ->
     return mapped or "1:1"
 
 
+def classify_leonardo_error(exc: Exception) -> str:
+    """把 Leonardo 异常分类，供各入口映射到自己的错误体系。
+
+    返回："unsafe"（已提交后失败/单发可能已受理，换号重试会重复扣费 → 不可重试 500）、
+    "auth"（JWT/鉴权失效 → 标失效并切号）、"quota"（额度耗尽 → 标耗尽并切号）、
+    "temp"（HTTP/传输等临时故障 → 可重试）。
+    """
+    from core.leonardo_client import LeonardoRetryUnsafeError
+
+    if isinstance(exc, (LeonardoGenerationError, LeonardoRetryUnsafeError)):
+        return "unsafe"
+    message = str(exc).lower()
+    if any(kw in message for kw in ("invalid", "jwt", "unauthorized", "verify", "signature")):
+        return "auth"
+    if any(kw in message for kw in ("quota", "insufficient", "exhausted", "credits")):
+        return "quota"
+    return "temp"
+
+
 def pool_prefers_leonardo(token_manager) -> bool:
     """共享公开名（gemini-3-pro-image / gpt-image-2 等）该不该用 Leonardo 后端。
 

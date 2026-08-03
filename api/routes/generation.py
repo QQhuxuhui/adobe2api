@@ -127,18 +127,15 @@ def _map_leonardo_error(exc: Exception) -> Exception:
     重复扣费 → 非重试 AdobeRequestError → 500。
     LeonardoError = 提交前失败（invalid JWT/HTTP/传输），可换号重试。
     """
-    from core.leonardo_client import LeonardoRetryUnsafeError
-    from core.leonardo_generation import LeonardoGenerationError
+    from core.leonardo_generation import classify_leonardo_error
 
-    if isinstance(exc, (LeonardoGenerationError, LeonardoRetryUnsafeError)):
-        # 已提交后失败 / 单发可能已受理: 换号重试会重复扣费 → 非重试 500
-        return AdobeRequestError(str(exc))
-    message = str(exc).lower()
-    if any(kw in message for kw in ("invalid", "jwt", "unauthorized", "verify", "signature")):
-        return AuthError(str(exc))
-    if any(kw in message for kw in ("quota", "insufficient", "exhausted", "credits")):
-        return QuotaExhaustedError(str(exc))
-    return UpstreamTemporaryError(str(exc))
+    cls = {
+        "unsafe": AdobeRequestError,  # 已提交后失败/单发可能已受理 → 非重试 500
+        "auth": AuthError,
+        "quota": QuotaExhaustedError,
+        "temp": UpstreamTemporaryError,
+    }[classify_leonardo_error(exc)]
+    return cls(str(exc))
 
 
 # CDN 下载：生成图从 cdn.leonardo.ai 拉回本地。经代理下大图偏慢，
@@ -251,6 +248,11 @@ def _build_leonardo_run_once(
                 data_item = {"b64_json": base64.b64encode(img_resp.content).decode()}
             data_item["revised_prompt"] = prompt
             data_items.append(data_item)
+
+        if not data_items:
+            # 生成"成功"却无有效图 URL：不得当成功返回空 data[]（还会把 token 标成功）。
+            # 已提交后失败 → 非重试（换号重发会重复扣费）。
+            raise AdobeRequestError("Leonardo returned no image URL")
 
         if data_items and set_request_preview is not None:
             first = data_items[0]
@@ -523,11 +525,14 @@ def build_generation_router(
         output_resolution = geometry.output_resolution
         resolved_model_id = geometry.model_id
         model_conf = resolve_model(resolved_model_id)
+
+        is_leonardo = str(model_conf.get("upstream_model") or "").startswith("leonardo:")
+        # Leonardo 实际输出尺寸由比例定死(~1536–2752)，拿不到真 4K → 计费档位钳到 2K。
+        if is_leonardo and output_resolution == "4K":
+            output_resolution = "2K"
         # 展示/计费用公开名（如 gpt-image-2），后端仍是 leonardo-gpt-image-2。
         display_model_id = public_display_id or resolved_model_id
         set_request_credit_context(request, display_model_id, output_resolution)
-
-        is_leonardo = str(model_conf.get("upstream_model") or "").startswith("leonardo:")
 
         try:
             set_request_task_progress(

@@ -180,3 +180,65 @@ def test_gpt_image_2_stays_adobe_when_disabled(tmp_path, monkeypatch):
     assert not str(resolve_model("gpt-image-2")["upstream_model"]).startswith("leonardo:")
     # 未选 leonardo 类型 token（走默认 Adobe token 选择）
     assert "leonardo" not in tokens.selected
+
+
+def _patch_generate(monkeypatch, data):
+    import core.leonardo_generation as lg
+
+    def fake(**kw):
+        return {
+            "created": 0,
+            "data": data,
+            "provider": {"generation_id": "gen-x", "aspect_ratio": "1:1", "model_id": "x"},
+        }
+
+    class _R:
+        content = b"leo-bytes"
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(lg, "generate_images", fake)
+    monkeypatch.setattr(req_mod, "get", lambda url, timeout, headers: _R())
+
+
+def test_gpt_image_2_empty_result_is_not_success(tmp_path, monkeypatch):
+    # #4：生成"成功"却无图 URL，不得返回 200 + data:[]
+    _patch_generate(monkeypatch, data=[])
+    client, _, _ = _make_router(tmp_path, leonardo=True)
+    resp = client.post(
+        "/v1/images/generations",
+        json={"model": "gpt-image-2", "prompt": "x", "response_format": "b64_json"},
+    )
+    assert resp.status_code != 200
+    assert "data" not in resp.json() or resp.json().get("data") != []
+
+
+def test_gpt_image_2_4k_billed_as_2k(tmp_path, monkeypatch):
+    # #3：Leonardo 拿不到真 4K → 计费档位钳到 2K
+    _patch_generate(monkeypatch, data=[{"url": "https://cdn.leonardo.ai/x.jpg"}])
+    client, credit_contexts, _ = _make_router(tmp_path, leonardo=True)
+    resp = client.post(
+        "/v1/images/generations",
+        json={"model": "gpt-image-2", "prompt": "x", "quality": "high"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert credit_contexts == [("gpt-image-2", "2K")]
+
+
+# --- 共享错误分类器（#1 的核心） ---
+
+def test_classify_leonardo_error():
+    from core.leonardo_client import LeonardoError, LeonardoRetryUnsafeError
+    from core.leonardo_generation import (
+        LeonardoGenerationError,
+        classify_leonardo_error,
+    )
+
+    assert classify_leonardo_error(LeonardoError("Could not verify JWT")) == "auth"
+    assert classify_leonardo_error(LeonardoError("unauthorized")) == "auth"
+    assert classify_leonardo_error(LeonardoError("insufficient balance")) == "quota"
+    assert classify_leonardo_error(LeonardoError("graphql HTTP 500")) == "temp"
+    assert classify_leonardo_error(LeonardoGenerationError("timeout")) == "unsafe"
+    assert classify_leonardo_error(LeonardoRetryUnsafeError("maybe accepted")) == "unsafe"

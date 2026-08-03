@@ -27,8 +27,8 @@ FLASH_UUID = "7418e71f-4133-4e1b-9895-bee19f48f2ce"
 
 
 class FakeConfig:
-    def __init__(self, *, api_key: str = "test-key"):
-        self.values = {"api_key": api_key, "gemini_native_deadline_seconds": 500}
+    def __init__(self, *, api_key: str = "test-key", deadline=500):
+        self.values = {"api_key": api_key, "gemini_native_deadline_seconds": deadline}
 
     def get(self, key: str, default=None):
         return self.values.get(key, default)
@@ -52,9 +52,11 @@ class FakeAdobeClient:
 
 
 class FakeLeonardoClient:
-    def __init__(self, images: list[str] | None = None):
+    def __init__(self, images: list[str] | None = None, raise_on_create=None):
         self.images = images if images is not None else ["https://cdn.leonardo.ai/out.png"]
         self.create_calls: list[dict] = []
+        self.wait_timeouts: list[int] = []
+        self._raise_on_create = raise_on_create
 
     def create_generation(
         self, token, prompt, model_id, aspect, quantity=1, model_slug="nano-banana-2"
@@ -69,9 +71,12 @@ class FakeLeonardoClient:
                 "model_slug": model_slug,
             }
         )
+        if self._raise_on_create is not None:
+            raise self._raise_on_create
         return "gen-123"
 
     def wait_for_completion(self, token, gen_id, timeout=300, poll_interval=4):
+        self.wait_timeouts.append(timeout)
         return {"success": True, "images": self.images}
 
 
@@ -105,10 +110,14 @@ class Harness:
         leonardo: bool = True,
         cdn_bytes: bytes = b"leo-image-bytes",
         leonardo_images: list[str] | None = None,
+        raise_on_create=None,
+        deadline=500,
     ):
-        self.config = FakeConfig()
+        self.config = FakeConfig(deadline=deadline)
         self.adobe = FakeAdobeClient()
-        self.leo = FakeLeonardoClient(images=leonardo_images)
+        self.leo = FakeLeonardoClient(
+            images=leonardo_images, raise_on_create=raise_on_create
+        )
         self.tokens = FakeTokenManager(leonardo=leonardo)
         self.previews: list[tuple[str, str]] = []
         self.accounted: list[tuple[Path, int, int]] = []
@@ -271,3 +280,69 @@ def test_adobe_pool_pro_stays_on_adobe(tmp_path):
     # 关：仍走 Adobe，不碰 Leonardo
     assert len(h.adobe.generate_calls) == 1
     assert h.leo.create_calls == []
+
+
+# --- #1 错误分类映射：不再一刀切 500 ---
+
+def _leo_err(msg):
+    from core.leonardo_client import LeonardoError
+
+    return LeonardoError(msg)
+
+
+def test_leo_pool_invalid_token_maps_to_401(tmp_path):
+    h = Harness(tmp_path, raise_on_create=_leo_err("Could not verify JWT: invalid"))
+    resp = post(h, "gemini-3-pro-image", "generateContent", image_request())
+    assert resp.status_code == 401, resp.text
+    assert resp.json()["error"]["status"] == "UNAUTHENTICATED"
+
+
+def test_leo_pool_quota_maps_to_429(tmp_path):
+    h = Harness(tmp_path, raise_on_create=_leo_err("insufficient balance"))
+    resp = post(h, "gemini-3-pro-image", "generateContent", image_request())
+    assert resp.status_code == 429, resp.text
+
+
+def test_leo_pool_transport_maps_to_503(tmp_path):
+    h = Harness(tmp_path, raise_on_create=_leo_err("graphql HTTP 500"))
+    resp = post(h, "gemini-3-pro-image", "generateContent", image_request())
+    assert resp.status_code == 503, resp.text
+
+
+# --- #5 mime 按实际字节声明 ---
+
+def test_leo_pool_jpeg_declared_as_jpeg(tmp_path):
+    h = Harness(tmp_path, cdn_bytes=b"\xff\xd8\xff\xe0JFIF-bytes")
+    resp = post(h, "gemini-3-pro-image", "generateContent", image_request())
+    assert resp.status_code == 200, resp.text
+    part = resp.json()["candidates"][0]["content"]["parts"][0]
+    assert part["inlineData"]["mimeType"] == "image/jpeg"
+
+
+def test_leo_pool_png_declared_as_png(tmp_path):
+    h = Harness(tmp_path, cdn_bytes=b"\x89PNG\r\n\x1a\nrest")
+    resp = post(h, "gemini-3-pro-image", "generateContent", image_request())
+    part = resp.json()["candidates"][0]["content"]["parts"][0]
+    assert part["inlineData"]["mimeType"] == "image/png"
+
+
+# --- #3 Leonardo 计费档位钳到 2K ---
+
+def test_leo_pool_4k_request_billed_as_2k(tmp_path):
+    h = Harness(tmp_path)
+    resp = post(
+        h, "gemini-3-pro-image", "generateContent", image_request(size="4K")
+    )
+    assert resp.status_code == 200, resp.text
+    # credit context 记的是 2K，不是请求的 4K
+    assert h.credit_contexts == [("gemini-3-pro-image", "2K")]
+
+
+# --- #6 生成超时受 deadline 约束 ---
+
+def test_leo_pool_generate_timeout_bounded_by_deadline(tmp_path):
+    h = Harness(tmp_path, deadline=30)
+    resp = post(h, "gemini-3-pro-image", "generateContent", image_request())
+    assert resp.status_code == 200, resp.text
+    # deadline 30s < 固定 300s → 传给 Leonardo 的超时被钳到 ~30s
+    assert h.leo.wait_timeouts and h.leo.wait_timeouts[0] <= 30

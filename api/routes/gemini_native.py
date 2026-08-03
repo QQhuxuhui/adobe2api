@@ -655,6 +655,19 @@ def video_proxy_uri(uri: str) -> str:
     )
 
 
+def sniff_image_mime(image_bytes: bytes) -> str:
+    """按 magic bytes 判图片类型。Adobe 出 PNG、Leonardo CDN 多为 JPEG；
+    响应声明须与实际字节一致，否则严格客户端解码失败。未知回退 image/png。"""
+    head = image_bytes[:12]
+    if head[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
+
+
 def build_image_response(
     spec: GeminiModelSpec,
     parsed: ParsedGeminiRequest,
@@ -665,7 +678,7 @@ def build_image_response(
             "parts": [
                 {
                     "inlineData": {
-                        "mimeType": "image/png",
+                        "mimeType": sniff_image_mime(image_bytes),
                         "data": base64.b64encode(image_bytes).decode("ascii"),
                     }
                 }
@@ -971,6 +984,10 @@ def build_gemini_native_router(
                     "name": f"models/{spec.model_id}/operations/{operation_id}"
                 }
             parsed = parse_gemini_request(raw_body, spec)
+            # Leonardo 实际输出尺寸由比例定死(~1536–2752)，与请求 1K/2K/4K 无关；
+            # 4K 请求实拿不到 4K → 计费/usage 档位钳到 2K，避免按 4K 超收费。
+            if spec.is_leonardo and parsed.image_size == "4K":
+                parsed = replace(parsed, image_size="2K")
             set_request_logging_fields(request, spec.model_id, parsed.prompt)
 
             if action != "countTokens" and spec.family != "text":
@@ -998,8 +1015,22 @@ def build_gemini_native_router(
 
                     leo_client = LeonardoClient()
 
+                # Leonardo 无 deadline 参数：用剩余 deadline 钳生成超时，别让单次
+                # 阻塞盖过 gemini_native_deadline_seconds。
+                remaining = int(deadline - time.monotonic())
+                leo_timeout = max(1, min(LEONARDO_GENERATE_TIMEOUT, remaining))
+                _leo_error_cls = {
+                    "unsafe": adobe_error_cls,
+                    "auth": auth_error_cls,
+                    "quota": quota_error_cls,
+                    "temp": upstream_temp_error_cls,
+                }
+
                 def run_once(token: str) -> dict:
-                    from core.leonardo_generation import generate_images
+                    from core.leonardo_generation import (
+                        classify_leonardo_error,
+                        generate_images,
+                    )
                     from core.leonardo_client import LeonardoError
 
                     try:
@@ -1011,10 +1042,14 @@ def build_gemini_native_router(
                             model_slug=str(spec.leonardo_slug),
                             aspect_ratio=leo_aspect,
                             n=1,
-                            timeout=LEONARDO_GENERATE_TIMEOUT,
+                            timeout=leo_timeout,
                         )
                     except LeonardoError as exc:
-                        raise adobe_error_cls(str(exc)) from exc
+                        # 分类映射：auth→标失效切号 / quota→标耗尽切号 / temp→可重试 /
+                        # unsafe→非重试。一刀切 500 会阻止失效标记与自动切换。
+                        raise _leo_error_cls[classify_leonardo_error(exc)](
+                            str(exc)
+                        ) from exc
 
                     items = result.get("data") or []
                     url = str((items[0] if items else {}).get("url") or "").strip()
