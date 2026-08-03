@@ -243,8 +243,12 @@ class LeonardoClient:
                     )
                     raise LeonardoRetryUnsafeError(message) from exc
                 if not resp.ok:
+                    # 401/403/429 是网关层鉴权/限流拒绝：请求未被处理(未生效/未扣费)，
+                    # 可安全切号并标记 token 失效/耗尽——不能当作"可能已生效"而禁止重试。
+                    if resp.status_code in (401, 403, 429):
+                        raise LeonardoError(f"graphql HTTP {resp.status_code}")
                     if attempts == 1:
-                        # 单发操作 HTTP 错误也可能已生效 → 禁止重试
+                        # 其余单发 HTTP 错误(如 5xx)可能已生效 → 禁止重试(避免重复扣费)
                         raise LeonardoRetryUnsafeError(
                             f"graphql HTTP {resp.status_code}"
                         )

@@ -119,6 +119,25 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+def _sniff_generated_media_type(path: Path) -> Optional[str]:
+    """按 magic bytes 判 Content-Type：落盘统一 .png，但 Leonardo CDN 图多为 JPEG，
+    仅靠扩展名会声明错 Content-Type。未知(如视频)返回 None，交回按扩展名推断。"""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(12)
+    except OSError:
+        return None
+    if head[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return None
+
+
 @app.get("/generated/{filename:path}", include_in_schema=False)
 def serve_generated_file(filename: str):
     raw = str(filename or "").strip()
@@ -134,7 +153,12 @@ def serve_generated_file(filename: str):
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="file not found")
     background = BackgroundTask(_drop_generated_file_cache, target)
-    return FileResponse(path=target, filename=safe_name, background=background)
+    return FileResponse(
+        path=target,
+        filename=safe_name,
+        media_type=_sniff_generated_media_type(target),
+        background=background,
+    )
 
 store = JobStore()
 log_store = RequestLogStore(DATA_DIR / "request_logs.jsonl", max_items=5000)

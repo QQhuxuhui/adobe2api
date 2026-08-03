@@ -759,12 +759,12 @@ def build_gemini_native_router(
             return leonardo_variant(spec)
         return spec
 
-    def _fetch_cdn_image(url: str, headers: dict):
+    def _fetch_cdn_image(url: str, headers: dict, max_seconds=None):
         if fetch_cdn_image is not None:
-            return fetch_cdn_image(url, headers)
+            return fetch_cdn_image(url, headers)  # 注入的 fake 不接 max_seconds
         from api.routes.generation import _fetch_cdn_image as _real_fetch
 
-        return _real_fetch(url, headers)
+        return _real_fetch(url, headers, max_seconds=max_seconds)
 
     def require_api_key(request: Request) -> None:
         required = str(config_manager.get("api_key", "") or "").strip()
@@ -1015,23 +1015,32 @@ def build_gemini_native_router(
 
                     leo_client = LeonardoClient()
 
-                # Leonardo 无 deadline 参数：用剩余 deadline 钳生成超时，别让单次
-                # 阻塞盖过 gemini_native_deadline_seconds。
-                remaining = int(deadline - time.monotonic())
-                leo_timeout = max(1, min(LEONARDO_GENERATE_TIMEOUT, remaining))
-                _leo_error_cls = {
-                    "unsafe": adobe_error_cls,
-                    "auth": auth_error_cls,
-                    "quota": quota_error_cls,
-                    "temp": upstream_temp_error_cls,
-                }
+                def _map_leo_error(exc: Exception) -> Exception:
+                    # auth→标失效切号 / quota→标耗尽切号 / temp→可重试(须带 status_code，
+                    # 否则 should_retry_temporary_error 判 False) / unsafe→非重试 500。
+                    from core.leonardo_generation import classify_leonardo_error
+
+                    kind = classify_leonardo_error(exc)
+                    if kind == "auth":
+                        return auth_error_cls(str(exc))
+                    if kind == "quota":
+                        return quota_error_cls(str(exc))
+                    if kind == "temp":
+                        return upstream_temp_error_cls(
+                            str(exc),
+                            status_code=503,
+                            error_type="upstream_unavailable",
+                        )
+                    return adobe_error_cls(str(exc))
 
                 def run_once(token: str) -> dict:
-                    from core.leonardo_generation import (
-                        classify_leonardo_error,
-                        generate_images,
-                    )
+                    from core.leonardo_generation import generate_images
                     from core.leonardo_client import LeonardoError
+
+                    # 每次尝试按当前剩余 deadline 重算超时：切号重试不复用旧预算，
+                    # 避免第 N 个 token 仍拿满预算而整体远超 deadline。
+                    remaining = max(1, int(deadline - time.monotonic()))
+                    leo_timeout = min(LEONARDO_GENERATE_TIMEOUT, remaining)
 
                     try:
                         result = generate_images(
@@ -1045,19 +1054,19 @@ def build_gemini_native_router(
                             timeout=leo_timeout,
                         )
                     except LeonardoError as exc:
-                        # 分类映射：auth→标失效切号 / quota→标耗尽切号 / temp→可重试 /
-                        # unsafe→非重试。一刀切 500 会阻止失效标记与自动切换。
-                        raise _leo_error_cls[classify_leonardo_error(exc)](
-                            str(exc)
-                        ) from exc
+                        raise _map_leo_error(exc) from exc
 
                     items = result.get("data") or []
                     url = str((items[0] if items else {}).get("url") or "").strip()
                     if not url:
                         raise adobe_error_cls("Leonardo returned no image URL")
-                    # 生成已成功；CDN 下载失败(内部已重试)不得重发生成(重发=再次扣费)
+                    # 生成已成功；CDN 下载失败(内部已重试)不得重发生成(重发=再次扣费)。
+                    # 下载也按剩余 deadline 收窄，避免单请求整体阻塞远超 deadline。
+                    cdn_budget = max(1, int(deadline - time.monotonic()))
                     resp = _fetch_cdn_image(
-                        url, {"User-Agent": "adobe2api/1.0", "Accept": "image/*"}
+                        url,
+                        {"User-Agent": "adobe2api/1.0", "Accept": "image/*"},
+                        max_seconds=cdn_budget,
                     )
                     image_bytes = resp.content
                     job_id = uuid.uuid4().hex

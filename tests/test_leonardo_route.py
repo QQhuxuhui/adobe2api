@@ -264,6 +264,38 @@ def test_fetch_cdn_image_exhausts_retries_then_raises(monkeypatch):
     assert calls["n"] == 3
 
 
+def test_fetch_cdn_image_caps_timeout_to_budget(monkeypatch):
+    # #2b：给定 max_seconds → 单次超时被钳到预算内（不再固定 120s）
+    seen = {}
+
+    def capture_get(url, timeout, headers):
+        seen["timeout"] = timeout
+        return _fake_img_resp()
+
+    monkeypatch.setattr(req_mod, "get", capture_get)
+    _fetch_cdn_image("https://cdn.leonardo.ai/x.jpg", {}, max_seconds=5)
+    assert seen["timeout"] <= 5
+
+
+def test_fetch_cdn_image_stops_retrying_when_budget_gone(monkeypatch):
+    # 预算耗尽后不再继续重试（避免整体阻塞盖过 deadline）
+    calls = {"n": 0}
+    clock = {"t": 1000.0}
+
+    def always_fail(url, timeout, headers):
+        calls["n"] += 1
+        clock["t"] += 10.0  # 每次调用消耗 10s
+        raise req_mod.exceptions.ConnectionError("cdn down")
+
+    monkeypatch.setattr(req_mod, "get", always_fail)
+    monkeypatch.setattr(gen_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(gen_mod.time, "monotonic", lambda: clock["t"])
+    with pytest.raises(req_mod.exceptions.ConnectionError):
+        _fetch_cdn_image("https://cdn.leonardo.ai/x.jpg", {}, max_seconds=5)
+    # 5s 预算：第 1 次(消耗到 t+10)后预算已负 → 不再第 2、3 次
+    assert calls["n"] == 1
+
+
 def test_retry_unsafe_error_maps_to_non_retryable():
     from core.leonardo_client import LeonardoRetryUnsafeError
     mapped = _map_leonardo_error(

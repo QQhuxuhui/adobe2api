@@ -37,8 +37,22 @@ def classify_leonardo_error(exc: Exception) -> str:
     if isinstance(exc, (LeonardoGenerationError, LeonardoRetryUnsafeError)):
         return "unsafe"
     message = str(exc).lower()
-    if any(kw in message for kw in ("invalid", "jwt", "unauthorized", "verify", "signature")):
+    # HTTP 状态优先(网关拒绝，语义明确)
+    if "http 401" in message or "http 403" in message:
         return "auth"
+    if "http 429" in message:
+        return "quota"
+    # 文本特征：避免裸 "invalid" 误伤 "invalid model" 等请求错误而误废健康 token
+    if any(
+        kw in message
+        for kw in (
+            "jwt", "unauthorized", "not authorized", "forbidden",
+            "signature", "invalid token", "invalid jwt", "expired token",
+            "token expired", "token has expired",
+        )
+    ):
+        return "auth"
+    # 不用裸 "balance"：会误伤操作名 GetTokenBalance；真实额度错误含 insufficient/exhausted
     if any(kw in message for kw in ("quota", "insufficient", "exhausted", "credits")):
         return "quota"
     return "temp"

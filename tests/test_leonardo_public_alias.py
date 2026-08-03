@@ -7,11 +7,16 @@ import logging
 import time
 from pathlib import Path
 
+import pytest
 import requests as req_mod
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from api.routes.generation import build_generation_router, _leonardo_public_backend
+from api.routes.generation import (
+    build_generation_router,
+    _leonardo_public_backend,
+    _map_leonardo_error,
+)
 from core.models import (
     MODEL_CATALOG,
     SUPPORTED_RATIOS,
@@ -236,9 +241,74 @@ def test_classify_leonardo_error():
         classify_leonardo_error,
     )
 
-    assert classify_leonardo_error(LeonardoError("Could not verify JWT")) == "auth"
-    assert classify_leonardo_error(LeonardoError("unauthorized")) == "auth"
-    assert classify_leonardo_error(LeonardoError("insufficient balance")) == "quota"
-    assert classify_leonardo_error(LeonardoError("graphql HTTP 500")) == "temp"
-    assert classify_leonardo_error(LeonardoGenerationError("timeout")) == "unsafe"
-    assert classify_leonardo_error(LeonardoRetryUnsafeError("maybe accepted")) == "unsafe"
+    c = classify_leonardo_error
+    # 文本特征
+    assert c(LeonardoError("Could not verify JWT")) == "auth"
+    assert c(LeonardoError("unauthorized")) == "auth"
+    assert c(LeonardoError("insufficient balance")) == "quota"
+    assert c(LeonardoError("token balance exhausted")) == "quota"
+    assert c(LeonardoError("graphql HTTP 500")) == "temp"
+    assert c(LeonardoGenerationError("timeout")) == "unsafe"
+    assert c(LeonardoRetryUnsafeError("maybe accepted")) == "unsafe"
+    # HTTP 状态优先
+    assert c(LeonardoError("graphql HTTP 401")) == "auth"
+    assert c(LeonardoError("graphql HTTP 403")) == "auth"
+    assert c(LeonardoError("graphql HTTP 429")) == "quota"
+    # 不再误伤：GetTokenBalance/invalid model 不判 quota/auth
+    assert c(LeonardoError("graphql GetTokenBalance failed: connection reset")) == "temp"
+    assert c(LeonardoError("invalid model requested")) == "temp"
+
+
+def test_temp_error_is_retryable_has_status():
+    # #1(b)：temp 必须带可重试 status_code，否则 should_retry_temporary_error → False
+    from core.leonardo_client import LeonardoError
+
+    mapped = _map_leonardo_error(LeonardoError("graphql HTTP 500"))
+    assert mapped.status_code == 503
+
+
+@pytest.mark.parametrize(
+    "status,kind",
+    [(401, "auth"), (403, "auth"), (429, "quota")],
+)
+def test_client_gateway_reject_is_switchable_not_retry_unsafe(monkeypatch, status, kind):
+    # #1(a)：单发 Generate 收到 401/403/429 → LeonardoError(可切号/标记)，不是 RetryUnsafe
+    from unittest.mock import MagicMock
+    import core.leonardo_client as lc
+    from core.leonardo_client import (
+        LeonardoClient,
+        LeonardoError,
+        LeonardoRetryUnsafeError,
+    )
+    from core.leonardo_generation import classify_leonardo_error
+
+    resp = MagicMock()
+    resp.ok = False
+    resp.status_code = status
+    session = MagicMock()
+    session.post.return_value = resp
+    monkeypatch.setattr(lc.requests, "Session", lambda: session)
+
+    client = LeonardoClient()
+    with pytest.raises(LeonardoError) as ei:
+        client._http_gql("tok", {"operationName": "Generate"})
+    assert not isinstance(ei.value, LeonardoRetryUnsafeError)
+    assert classify_leonardo_error(ei.value) == kind
+
+
+def test_client_5xx_single_shot_stays_retry_unsafe(monkeypatch):
+    # 单发 5xx 仍视为"可能已生效" → RetryUnsafe(不重发，避免重复扣费)
+    from unittest.mock import MagicMock
+    import core.leonardo_client as lc
+    from core.leonardo_client import LeonardoClient, LeonardoRetryUnsafeError
+
+    resp = MagicMock()
+    resp.ok = False
+    resp.status_code = 500
+    session = MagicMock()
+    session.post.return_value = resp
+    monkeypatch.setattr(lc.requests, "Session", lambda: session)
+
+    client = LeonardoClient()
+    with pytest.raises(LeonardoRetryUnsafeError):
+        client._http_gql("tok", {"operationName": "Generate"})

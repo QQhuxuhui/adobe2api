@@ -129,13 +129,17 @@ def _map_leonardo_error(exc: Exception) -> Exception:
     """
     from core.leonardo_generation import classify_leonardo_error
 
-    cls = {
-        "unsafe": AdobeRequestError,  # 已提交后失败/单发可能已受理 → 非重试 500
-        "auth": AuthError,
-        "quota": QuotaExhaustedError,
-        "temp": UpstreamTemporaryError,
-    }[classify_leonardo_error(exc)]
-    return cls(str(exc))
+    kind = classify_leonardo_error(exc)
+    if kind == "auth":
+        return AuthError(str(exc))
+    if kind == "quota":
+        return QuotaExhaustedError(str(exc))
+    if kind == "temp":
+        # 必须带可重试 status_code，否则 should_retry_temporary_error → False → 不重试
+        return UpstreamTemporaryError(
+            str(exc), status_code=503, error_type="upstream_unavailable"
+        )
+    return AdobeRequestError(str(exc))  # unsafe：已提交后失败/单发可能已受理 → 非重试 500
 
 
 # CDN 下载：生成图从 cdn.leonardo.ai 拉回本地。经代理下大图偏慢，
@@ -145,23 +149,37 @@ _CDN_FETCH_ATTEMPTS = 3
 _CDN_FETCH_BACKOFF = 1.0
 
 
-def _fetch_cdn_image(url: str, headers: dict):
+def _fetch_cdn_image(url: str, headers: dict, *, max_seconds: Optional[float] = None):
     """下载生成图，扩展超时 + 有限重试。全部失败时抛最后一次异常。
 
     下载是幂等的（不触发新生成、不扣费），因此与"生成提交"不同，可安全重试。
+    max_seconds：给定则把总下载时间(单次超时 + 重试)钳到该预算内，供上游 deadline 约束。
     """
     last_exc: Optional[Exception] = None
+    start = time.monotonic()
     for attempt in range(_CDN_FETCH_ATTEMPTS):
+        if max_seconds is not None:
+            budget = max_seconds - (time.monotonic() - start)
+            if budget <= 0:
+                break
+            timeout = max(1.0, min(float(_CDN_FETCH_TIMEOUT), budget))
+        else:
+            timeout = _CDN_FETCH_TIMEOUT
         try:
-            resp = requests.get(url, timeout=_CDN_FETCH_TIMEOUT, headers=headers)
+            resp = requests.get(url, timeout=timeout, headers=headers)
             resp.raise_for_status()
             return resp
         except Exception as exc:  # noqa: BLE001 - 传输/HTTP 错误统一重试
             last_exc = exc
             if attempt < _CDN_FETCH_ATTEMPTS - 1:
+                if max_seconds is not None and (
+                    time.monotonic() - start
+                ) >= max_seconds:
+                    break
                 time.sleep(_CDN_FETCH_BACKOFF)
-    assert last_exc is not None
-    raise last_exc
+    if last_exc is not None:
+        raise last_exc
+    raise AdobeRequestError("CDN fetch budget exhausted before any attempt")
 
 
 # 池里只有 Leonardo token 时，这些对外公开名改由 Leonardo 出图。
