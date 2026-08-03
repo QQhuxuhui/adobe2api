@@ -1,5 +1,8 @@
 import json
 import base64
+import copy
+import logging
+import os
 import threading
 import time
 import uuid
@@ -16,6 +19,8 @@ CONFIG_DIR = BASE_DIR / "config"
 DATA_FILE = CONFIG_DIR / "tokens.json"
 LEGACY_DATA_FILE = DATA_DIR / "tokens.json"
 
+logger = logging.getLogger(__name__)
+
 
 class TokenManager:
     ERROR_COOLDOWN_SECONDS = 180
@@ -24,6 +29,7 @@ class TokenManager:
         self._lock = threading.Lock()
         self.tokens: List[Dict] = []
         self._rr_index = 0
+        self._unreadable_data_file: Optional[Path] = None
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         self.load()
 
@@ -44,14 +50,67 @@ class TokenManager:
                         t.setdefault("added_at", now_ts)
                         t.setdefault("error_until", 0)
                     if source == LEGACY_DATA_FILE and not DATA_FILE.exists():
-                        DATA_FILE.write_text(
-                            json.dumps(self.tokens, indent=2), encoding="utf-8"
-                        )
-                except Exception:
+                        self.save()
+                    self._unreadable_data_file = None
+                except Exception as exc:
                     self.tokens = []
+                    if source == DATA_FILE:
+                        self._unreadable_data_file = source
+                        logger.error(
+                            "failed to load token file %s after %s; "
+                            "refusing to overwrite the unreadable file",
+                            source,
+                            type(exc).__name__,
+                        )
+                    else:
+                        logger.error(
+                            "failed to load legacy token file %s after %s",
+                            source,
+                            type(exc).__name__,
+                        )
 
     def save(self):
-        DATA_FILE.write_text(json.dumps(self.tokens, indent=2), encoding="utf-8")
+        if (
+            self._unreadable_data_file == DATA_FILE
+            and self._unreadable_data_file.exists()
+        ):
+            raise RuntimeError(
+                "refusing to overwrite unreadable token file; repair or move it first"
+            )
+
+        payload = json.dumps(self.tokens, indent=2)
+        existing_metadata = DATA_FILE.stat() if DATA_FILE.exists() else None
+        file_mode = (
+            existing_metadata.st_mode & 0o777
+            if existing_metadata is not None
+            else 0o600
+        )
+        temp_file = DATA_FILE.with_name(
+            f".{DATA_FILE.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with temp_file.open("w", encoding="utf-8") as handle:
+                os.chmod(temp_file, file_mode)
+                if existing_metadata is not None:
+                    try:
+                        os.chown(
+                            temp_file,
+                            existing_metadata.st_uid,
+                            existing_metadata.st_gid,
+                        )
+                    except PermissionError:
+                        pass
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_file, DATA_FILE)
+            directory_fd = os.open(DATA_FILE.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            temp_file.unlink(missing_ok=True)
 
     def add(self, value: str, meta: Optional[Dict] = None):
         with self._lock:
@@ -149,6 +208,102 @@ class TokenManager:
             self.tokens.append(new_token)
             self.save()
             return dict(new_token)
+
+    def upsert_leonardo_token(
+        self,
+        value: str,
+        account_id: str,
+        label: Optional[str] = None,
+    ) -> Dict:
+        with self._lock:
+            token_value = str(value or "").strip()
+            if token_value.startswith("Bearer "):
+                token_value = token_value[7:].strip()
+
+            aid = str(account_id or "").strip()
+            token_account_id = self.account_id_from_token(token_value)
+            incoming_exp = self._decode_jwt_exp(token_value) or 0
+            if not aid or token_account_id != aid:
+                raise ValueError("account_id does not match token")
+            if incoming_exp <= 0:
+                raise ValueError("token exp is required")
+
+            original_tokens = copy.deepcopy(self.tokens)
+
+            def persist_or_rollback() -> None:
+                try:
+                    self.save()
+                except Exception:
+                    self.tokens = original_tokens
+                    raise
+
+            matches = [
+                item
+                for item in self.tokens
+                if item.get("type") == "leonardo"
+                and str(
+                    item.get("account_id")
+                    or self.account_id_from_token(item.get("value") or "")
+                ).strip()
+                == aid
+            ]
+            target = max(
+                matches,
+                key=lambda item: self._decode_jwt_exp(item.get("value") or "") or 0,
+                default=None,
+            )
+            changed = False
+
+            if target is not None and len(matches) > 1:
+                duplicate_object_ids = {
+                    id(item) for item in matches if item is not target
+                }
+                self.tokens = [
+                    item for item in self.tokens if id(item) not in duplicate_object_ids
+                ]
+                changed = True
+
+            if target is not None:
+                target_exp = self._decode_jwt_exp(target.get("value") or "") or 0
+                if incoming_exp < target_exp:
+                    if changed:
+                        persist_or_rollback()
+                    return {"status": "noop", "token": dict(target)}
+
+            now_ts = time.time()
+            profile_name = str(label or "").strip() or aid
+            desired = {
+                "value": token_value,
+                "status": "active",
+                "fails": 0,
+                "error_until": 0,
+                "type": "leonardo",
+                "source": "leonardo_refresher",
+                "account_id": aid,
+                "refresh_profile_name": profile_name,
+                "refresh_profile_email": "",
+            }
+
+            if target is None:
+                target = {
+                    "id": uuid.uuid4().hex[:8],
+                    "added_at": now_ts,
+                    "updated_at": now_ts,
+                    **desired,
+                }
+                self.tokens.append(target)
+                persist_or_rollback()
+                return {"status": "created", "token": dict(target)}
+
+            if all(target.get(key) == expected for key, expected in desired.items()):
+                if changed:
+                    persist_or_rollback()
+                return {"status": "noop", "token": dict(target)}
+
+            target.update(desired)
+            target["updated_at"] = now_ts
+            persist_or_rollback()
+            return {"status": "updated", "token": dict(target)}
 
     def remove(self, tid: str):
         with self._lock:

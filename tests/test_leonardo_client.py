@@ -34,6 +34,28 @@ def _jwt(payload: dict) -> str:
     return f"{seg({'alg':'none'})}.{seg(payload)}.sig"
 
 
+class _RecordingHttpSession:
+    def __init__(self, post):
+        self._post = post
+        self.trust_env = True
+        self.closed = False
+
+    def post(self, *args, **kwargs):
+        return self._post(*args, **kwargs)
+
+    def close(self):
+        self.closed = True
+
+
+def _install_http_session(monkeypatch, post):
+    session = _RecordingHttpSession(post)
+    monkeypatch.setattr(lc.requests, "Session", lambda: session)
+    # The direct patch keeps the pre-change implementation on a controlled
+    # transport during the RED phase; the new implementation uses Session.
+    monkeypatch.setattr(lc.requests, "post", post)
+    return session
+
+
 def test_decode_and_exp():
     tok = _jwt({"exp": 1900000000, "iss": "https://cognito-idp.us-east-1.amazonaws.com/x"})
     assert decode_jwt_payload(tok)["exp"] == 1900000000
@@ -259,6 +281,61 @@ def test_call_raises_on_graphql_errors():
         client.poll_status("TOK", "g")
 
 
+def test_http_gql_uses_only_leonardo_proxy(monkeypatch):
+    captured = {}
+
+    class _R:
+        ok = True
+
+        def json(self):
+            return {"data": {"user_details": []}}
+
+    def fake_post(url, **kwargs):
+        captured.update(kwargs)
+        return _R()
+
+    monkeypatch.setenv("HTTP_PROXY", "http://wrong-global:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://wrong-global:8080")
+    monkeypatch.setenv("LEONARDO_PROXY", "http://leo-proxy:10809")
+    session = _install_http_session(monkeypatch, fake_post)
+
+    lc.LeonardoClient()._http_gql("TOK", lc.TOKEN_BALANCE_QUERY)
+
+    assert session.trust_env is False
+    assert captured["proxies"] == {
+        "http": "http://leo-proxy:10809",
+        "https": "http://leo-proxy:10809",
+    }
+    assert session.closed is True
+
+
+def test_http_gql_ignores_environment_proxy_when_dedicated_proxy_is_empty(
+    monkeypatch,
+):
+    captured = {}
+
+    class _R:
+        ok = True
+
+        def json(self):
+            return {"data": {"user_details": []}}
+
+    def fake_post(url, **kwargs):
+        captured.update(kwargs)
+        return _R()
+
+    monkeypatch.setenv("HTTP_PROXY", "http://wrong-global:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://wrong-global:8080")
+    monkeypatch.delenv("LEONARDO_PROXY", raising=False)
+    session = _install_http_session(monkeypatch, fake_post)
+
+    lc.LeonardoClient()._http_gql("TOK", lc.TOKEN_BALANCE_QUERY)
+
+    assert session.trust_env is False
+    assert captured["proxies"] is None
+    assert session.closed is True
+
+
 def test_http_gql_retries_transient_query_then_succeeds(monkeypatch):
     calls = {"n": 0}
     sleeps = []
@@ -275,7 +352,7 @@ def test_http_gql_retries_transient_query_then_succeeds(monkeypatch):
             raise lc.requests.exceptions.ConnectionError("transient boom")
         return _R()
 
-    monkeypatch.setattr(lc.requests, "post", fake_post)
+    _install_http_session(monkeypatch, fake_post)
     monkeypatch.setattr(lc.time, "sleep", sleeps.append)
 
     out = lc.LeonardoClient()._http_gql("TOK", lc.TOKEN_BALANCE_QUERY)
@@ -293,7 +370,7 @@ def test_http_gql_raises_after_exhausting_query_retries(monkeypatch):
         calls["n"] += 1
         raise lc.requests.exceptions.ConnectionError("down")
 
-    monkeypatch.setattr(lc.requests, "post", fake_post)
+    _install_http_session(monkeypatch, fake_post)
     monkeypatch.setattr(lc.time, "sleep", sleeps.append)
 
     with pytest.raises(LeonardoError, match="after 3 attempts: down"):
@@ -310,7 +387,7 @@ def test_http_gql_does_not_retry_generate_mutation(monkeypatch):
         calls["n"] += 1
         raise lc.requests.exceptions.ConnectionError("connection lost")
 
-    monkeypatch.setattr(lc.requests, "post", fake_post)
+    _install_http_session(monkeypatch, fake_post)
     monkeypatch.setattr(lc.time, "sleep", sleeps.append)
     payload = {
         "operationName": "Generate",
@@ -334,7 +411,7 @@ def test_http_gql_single_shot_transport_raises_retry_unsafe(monkeypatch):
         calls["n"] += 1
         raise lc.requests.exceptions.ConnectionError("connection lost")
 
-    monkeypatch.setattr(lc.requests, "post", fake_post)
+    _install_http_session(monkeypatch, fake_post)
     payload = {
         "operationName": "Generate",
         "query": "mutation Generate { generate { generationId } }",
@@ -355,7 +432,7 @@ def test_http_gql_retryable_op_transport_exhaustion_is_plain_error(monkeypatch):
         calls["n"] += 1
         raise lc.requests.exceptions.ConnectionError("down")
 
-    monkeypatch.setattr(lc.requests, "post", fake_post)
+    _install_http_session(monkeypatch, fake_post)
     with pytest.raises(lc.LeonardoError) as excinfo:
         lc.LeonardoClient()._http_gql("TOK", lc.TOKEN_BALANCE_QUERY)
     assert not isinstance(excinfo.value, lc.LeonardoRetryUnsafeError)
@@ -371,7 +448,7 @@ def test_http_gql_single_shot_http_error_is_retry_unsafe(monkeypatch):
     def fake_post(url, headers=None, json=None, timeout=None, **kwargs):
         return _R()
 
-    monkeypatch.setattr(lc.requests, "post", fake_post)
+    _install_http_session(monkeypatch, fake_post)
     payload = {
         "operationName": "Generate",
         "query": "mutation Generate { generate { generationId } }",

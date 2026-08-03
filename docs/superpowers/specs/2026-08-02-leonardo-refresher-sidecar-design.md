@@ -102,6 +102,7 @@
 - get-session 超时、代理不通或地理封锁：不推断已经掉登录，进入 `state=refresh_retrying`、`session_state=unknown`；日志用 `last_error_kind` 区分 `network`、`proxy`、`geo_embargo`，按 MIN_INTERVAL 重试。
 - accessToken 剩余 < SAFETY_MARGIN：不推送，进入 `state=refresh_retrying`，按 MIN_INTERVAL 短间隔重取（P1.1）。
 - sidecar 已取得合格 token、但推送超时或返回非 2xx：进入 `state=push_failed`，保留浏览器登录状态并按 MIN_INTERVAL 重试推送/刷新；不得删除池中旧 token。
+- 浏览器控制通道不可用（launch/goto 失败、页面崩溃、懒开异常）：进入 `state=browser_unavailable`（第 5 态，spec:79 healthz 唯一返回 503 的状态），按 MIN_INTERVAL 重试懒开；连续 `MAX_BROWSER_CONTROL_FAILURES`(=3) 次仍不可用则进程退出交由容器重启。**启动时不 eager-open**：首个 `run_once` 经 `fetch_token` 懒加载驱动，避免 eager open 半开状态绕过降级导致崩溃循环。
 - 刷新并推送成功：进入 `state=healthy`、`session_state=authenticated`，更新 `last_success_at`、`current_token_exp` 并清零 `consecutive_failures`。
 - 容器重启：从持久化 profile 恢复；profile 失效则 healthz 降级、回到"需重新登录"。
 

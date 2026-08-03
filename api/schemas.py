@@ -18,6 +18,11 @@ class TokenBatchAddRequest(BaseModel):
     tokens: List[str]
 
 
+class LeonardoTokenUpsertRequest(BaseModel):
+    token: str = Field(min_length=1)
+    label: Optional[str] = Field(default=None, max_length=200)
+
+
 class ExportSelectionRequest(BaseModel):
     ids: Optional[List[str]] = None
 

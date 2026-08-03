@@ -23,6 +23,7 @@ from api.routes.admin import build_admin_router
 from api.routes.entity import build_entity_router
 from api.routes.gemini_native import build_gemini_native_router
 from api.routes.generation import build_generation_router
+from api.routes.leonardo_tokens import build_leonardo_token_router
 from api.routes.openai_videos import build_openai_videos_router
 from api.streaming import sse_chat_stream
 
@@ -1703,6 +1704,8 @@ def _shutdown_video_services() -> None:
 
 app.add_event_handler("shutdown", _shutdown_video_services)
 
+
+app.include_router(build_leonardo_token_router(token_manager=token_manager))
 
 app.include_router(
     build_admin_router(

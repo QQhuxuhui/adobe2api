@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -207,42 +208,51 @@ class LeonardoClient:
         self._gql_fn = gql  # 可注入；None 时用真实 HTTP
 
     def _http_gql(self, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        import os
         headers = dict(_BASE_HEADERS)
         headers["authorization"] = f"Bearer {token}"
         operation = str(payload.get("operationName") or "")
         attempts = _HTTP_ATTEMPTS if operation in _RETRYABLE_OPERATIONS else 1
-        # 从环境变量读取代理配置
-        proxies = {}
-        http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-        https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-        if http_proxy:
-            proxies["http"] = http_proxy
-        if https_proxy:
-            proxies["https"] = https_proxy
-        for attempt in range(attempts):
-            try:
-                resp = requests.post(GRAPHQL_URL, headers=headers, json=payload, timeout=60, proxies=proxies or None)
-            except requests.exceptions.RequestException as exc:
-                if attempt < attempts - 1:
-                    time.sleep(_RETRY_BACKOFF)
-                    continue
-                if attempts > 1:
-                    message = f"graphql {operation} failed after {attempts} attempts: {exc}"
-                    raise LeonardoError(message) from exc
-                # 单发(非幂等, 如 Generate)传输失败: 服务端可能已接受 → 禁止重试
-                message = (
-                    f"graphql {operation or 'request'} failed; request not retried "
-                    f"to avoid duplicate side effects: {exc}"
-                )
-                raise LeonardoRetryUnsafeError(message) from exc
-            if not resp.ok:
-                if attempts == 1:
-                    # 单发操作 HTTP 错误也可能已生效 → 禁止重试
-                    raise LeonardoRetryUnsafeError(f"graphql HTTP {resp.status_code}")
-                raise LeonardoError(f"graphql HTTP {resp.status_code}")
-            return resp.json()
-        raise LeonardoError("graphql request failed")
+        proxy = str(os.environ.get("LEONARDO_PROXY") or "").strip()
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        session = requests.Session()
+        session.trust_env = False
+        try:
+            for attempt in range(attempts):
+                try:
+                    resp = session.post(
+                        GRAPHQL_URL,
+                        headers=headers,
+                        json=payload,
+                        timeout=60,
+                        proxies=proxies,
+                    )
+                except requests.exceptions.RequestException as exc:
+                    if attempt < attempts - 1:
+                        time.sleep(_RETRY_BACKOFF)
+                        continue
+                    if attempts > 1:
+                        message = (
+                            f"graphql {operation} failed after {attempts} "
+                            f"attempts: {exc}"
+                        )
+                        raise LeonardoError(message) from exc
+                    # 单发(非幂等, 如 Generate)传输失败: 服务端可能已接受 → 禁止重试
+                    message = (
+                        f"graphql {operation or 'request'} failed; request not retried "
+                        f"to avoid duplicate side effects: {exc}"
+                    )
+                    raise LeonardoRetryUnsafeError(message) from exc
+                if not resp.ok:
+                    if attempts == 1:
+                        # 单发操作 HTTP 错误也可能已生效 → 禁止重试
+                        raise LeonardoRetryUnsafeError(
+                            f"graphql HTTP {resp.status_code}"
+                        )
+                    raise LeonardoError(f"graphql HTTP {resp.status_code}")
+                return resp.json()
+            raise LeonardoError("graphql request failed")
+        finally:
+            session.close()
 
     def _call(self, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         fn = self._gql_fn or self._http_gql
