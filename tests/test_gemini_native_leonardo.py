@@ -326,15 +326,25 @@ def test_leo_pool_png_declared_as_png(tmp_path):
     assert part["inlineData"]["mimeType"] == "image/png"
 
 
-# --- #3 Leonardo 计费档位钳到 2K ---
+# --- #4 Leonardo 拿不到真 4K → 明确拒绝(400) ---
 
-def test_leo_pool_4k_request_billed_as_2k(tmp_path):
+def test_leo_pool_4k_request_rejected(tmp_path):
     h = Harness(tmp_path)
     resp = post(
         h, "gemini-3-pro-image", "generateContent", image_request(size="4K")
     )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["status"] == "INVALID_ARGUMENT"
+    assert h.leo.create_calls == []
+
+
+def test_leo_pool_2k_request_ok(tmp_path):
+    # 2K 仍受理（Leonardo 实际 ~1536–2752）
+    h = Harness(tmp_path)
+    resp = post(
+        h, "gemini-3-pro-image", "generateContent", image_request(size="2K")
+    )
     assert resp.status_code == 200, resp.text
-    # credit context 记的是 2K，不是请求的 4K
     assert h.credit_contexts == [("gemini-3-pro-image", "2K")]
 
 

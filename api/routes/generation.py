@@ -545,9 +545,17 @@ def build_generation_router(
         model_conf = resolve_model(resolved_model_id)
 
         is_leonardo = str(model_conf.get("upstream_model") or "").startswith("leonardo:")
-        # Leonardo 实际输出尺寸由比例定死(~1536–2752)，拿不到真 4K → 计费档位钳到 2K。
+        # Leonardo 出图尺寸由比例定死(~1536–2752)，拿不到真 4K → 明确拒绝而非静默降级。
         if is_leonardo and output_resolution == "4K":
-            output_resolution = "2K"
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "This model does not support 4K image output",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
         # 展示/计费用公开名（如 gpt-image-2），后端仍是 leonardo-gpt-image-2。
         display_model_id = public_display_id or resolved_model_id
         set_request_credit_context(request, display_model_id, output_resolution)

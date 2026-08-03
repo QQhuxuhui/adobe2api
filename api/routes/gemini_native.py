@@ -984,10 +984,9 @@ def build_gemini_native_router(
                     "name": f"models/{spec.model_id}/operations/{operation_id}"
                 }
             parsed = parse_gemini_request(raw_body, spec)
-            # Leonardo 实际输出尺寸由比例定死(~1536–2752)，与请求 1K/2K/4K 无关；
-            # 4K 请求实拿不到 4K → 计费/usage 档位钳到 2K，避免按 4K 超收费。
+            # Leonardo 出图尺寸由比例定死(~1536–2752)，拿不到真 4K → 明确拒绝而非静默降级。
             if spec.is_leonardo and parsed.image_size == "4K":
-                parsed = replace(parsed, image_size="2K")
+                raise _invalid("This model does not support 4K image output")
             set_request_logging_fields(request, spec.model_id, parsed.prompt)
 
             if action != "countTokens" and spec.family != "text":

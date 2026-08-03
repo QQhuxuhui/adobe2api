@@ -441,6 +441,8 @@ curl -X POST "http://127.0.0.1:6001/v1/images/generations" \
 
 测活文本模型 `gemini-2.0-flash`、`gemini-2.5-flash`、`gemini-3-pro-preview`、`gemini-3.1-pro-preview` 返回固定短文本 `ok`，不调用 Adobe，且不接受输入图。
 
+> **后端按 token 类型自动路由**：上表映射为**有 Adobe token** 时的行为（全功能：图生图、`auto`/`free`、宽比例、`1K`/`2K`/`4K`）。若 token 池**只有 Leonardo token**（如搬瓦工 Leonardo-only 部署），这四个图像名自动改由 Leonardo 出图（`gemini-3-pro-image*`→nano-banana-pro、`gemini-3.1-flash-image*`→nano-banana-2），响应结构不变。**Leonardo 后端限制**：纯文生图（带 inlineData 输入图返回 400）、比例仅 `1:1`/`16:9`/`9:16`/`4:3`、**不支持 4K（`imageSize:4K` 返回 400）**。OpenAI 兼容端点的 `gpt-image-2` 同理（仅 `/v1/images/generations` 接了 Leonardo；`/v1/responses`、`/v1/chat/completions` 仍固定走 Adobe）。
+
 请求约束：
 
 - `generationConfig.imageConfig.aspectRatio` 默认 `1:1`；pro 支持 `1:1`、`16:9`、`9:16`、`4:3`、`3:4`，flash 额外支持 `1:8`、`1:4`、`4:1`、`8:1`

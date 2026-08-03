@@ -220,16 +220,21 @@ def test_gpt_image_2_empty_result_is_not_success(tmp_path, monkeypatch):
     assert "data" not in resp.json() or resp.json().get("data") != []
 
 
-def test_gpt_image_2_4k_billed_as_2k(tmp_path, monkeypatch):
-    # #3：Leonardo 拿不到真 4K → 计费档位钳到 2K
-    _patch_generate(monkeypatch, data=[{"url": "https://cdn.leonardo.ai/x.jpg"}])
-    client, credit_contexts, _ = _make_router(tmp_path, leonardo=True)
+def test_gpt_image_2_4k_rejected(tmp_path, monkeypatch):
+    # #4：Leonardo 拿不到真 4K → 400（不静默降级）
+    def _boom(**kw):
+        raise AssertionError("must not generate on 4K reject")
+
+    import core.leonardo_generation as lg
+
+    monkeypatch.setattr(lg, "generate_images", _boom)
+    client, _, _ = _make_router(tmp_path, leonardo=True)
     resp = client.post(
         "/v1/images/generations",
         json={"model": "gpt-image-2", "prompt": "x", "quality": "high"},
     )
-    assert resp.status_code == 200, resp.text
-    assert credit_contexts == [("gpt-image-2", "2K")]
+    assert resp.status_code == 400, resp.text
+    assert "4K" in resp.json()["error"]["message"]
 
 
 # --- 共享错误分类器（#1 的核心） ---
