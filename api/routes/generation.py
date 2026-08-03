@@ -21,6 +21,7 @@ from core.adobe_client import (
     UpstreamTemporaryError,
 )
 from core.leonardo_client import LeonardoClient
+from core.leonardo_generation import pool_prefers_leonardo
 from api.openai_responses import (
     ResponsesRequestError,
     build_responses_image_response,
@@ -164,6 +165,18 @@ def _fetch_cdn_image(url: str, headers: dict):
                 time.sleep(_CDN_FETCH_BACKOFF)
     assert last_exc is not None
     raise last_exc
+
+
+# 池里只有 Leonardo token 时，这些对外公开名改由 Leonardo 出图。
+# 值 = MODEL_CATALOG 里对应的 Leonardo 条目 id。对外展示/计费仍用公开名（键）。
+LEONARDO_PUBLIC_ALIASES = {"gpt-image-2": "leonardo-gpt-image-2"}
+
+
+def _leonardo_public_backend(model_id, enabled: bool):
+    """enabled 且请求名是公开别名 → 返回其 Leonardo 后端 catalog id；否则 None。"""
+    if not enabled:
+        return None
+    return LEONARDO_PUBLIC_ALIASES.get(str(model_id or "").strip())
 
 
 def _build_leonardo_run_once(
@@ -497,13 +510,22 @@ def build_generation_router(
                     }
                 },
             )
-        geometry = resolve_image_geometry(data, model_id, [])
+        # 池里只有 Leonardo token（如搬瓦工）时，gpt-image-2 等公开名改用 Leonardo 后端
+        # 解析(几何/配置/出图)；有 Adobe token 则维持 Adobe。对外展示/计费仍保留公开名。
+        leonardo_aliases_on = pool_prefers_leonardo(token_manager)
+        leo_backend_id = _leonardo_public_backend(model_id, leonardo_aliases_on)
+        geometry_model_id = leo_backend_id or model_id
+        public_display_id = model_id if leo_backend_id else None
+
+        geometry = resolve_image_geometry(data, geometry_model_id, [])
         ratio = geometry.aspect_ratio
         usage_ratio = geometry.usage_ratio
         output_resolution = geometry.output_resolution
         resolved_model_id = geometry.model_id
         model_conf = resolve_model(resolved_model_id)
-        set_request_credit_context(request, resolved_model_id, output_resolution)
+        # 展示/计费用公开名（如 gpt-image-2），后端仍是 leonardo-gpt-image-2。
+        display_model_id = public_display_id or resolved_model_id
+        set_request_credit_context(request, display_model_id, output_resolution)
 
         is_leonardo = str(model_conf.get("upstream_model") or "").startswith("leonardo:")
 
@@ -529,7 +551,7 @@ def build_generation_router(
                     n=data.get("n", 1),
                     timeout=int(data.get("timeout") or 300),
                     response_format=response_format,
-                    resolved_model_id=resolved_model_id,
+                    resolved_model_id=display_model_id,
                     output_resolution=output_resolution,
                     public_image_url=public_image_url,
                     generated_dir=generated_dir,

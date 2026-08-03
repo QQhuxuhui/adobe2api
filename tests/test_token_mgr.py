@@ -52,6 +52,22 @@ def test_add_does_not_tag_adobe_token(fresh_tm):
     assert t.get("type") != "leonardo"
 
 
+def test_has_active_token_by_type(fresh_tm):
+    # 空池
+    assert fresh_tm.has_active_token() is False
+    assert fresh_tm.has_active_token("leonardo") is False
+    assert fresh_tm.has_active_token("adobe") is False
+    # 只有 Adobe
+    fresh_tm.add(_adobe_jwt())
+    assert fresh_tm.has_active_token() is True
+    assert fresh_tm.has_active_token("adobe") is True
+    assert fresh_tm.has_active_token("leonardo") is False
+    # 再加 Leonardo → 两类都有
+    fresh_tm.add(_leonardo_cognito_jwt())
+    assert fresh_tm.has_active_token("leonardo") is True
+    assert fresh_tm.has_active_token("adobe") is True
+
+
 def test_add_meta_type_overrides_auto_detect(fresh_tm):
     t = fresh_tm.add(_leonardo_cognito_jwt(), meta={"type": "custom"})
     assert t.get("type") == "custom"

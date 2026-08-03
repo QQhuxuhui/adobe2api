@@ -25,6 +25,19 @@ def to_aspect(size: Optional[str] = None, aspect_ratio: Optional[str] = None) ->
     return mapped or "1:1"
 
 
+def pool_prefers_leonardo(token_manager) -> bool:
+    """共享公开名（gemini-3-pro-image / gpt-image-2 等）该不该用 Leonardo 后端。
+
+    规则：池里有 Leonardo token 且**没有** Adobe token → 用 Leonardo（如搬瓦工 Leonardo-only）。
+    有 Adobe（或 token_manager 不支持该判断）→ 用 Adobe（全功能，线上行为原样保留）。
+    单后端部署各自命中一支；同时有两类时优先 Adobe。
+    """
+    has = getattr(token_manager, "has_active_token", None)
+    if not callable(has):
+        return False
+    return bool(has("leonardo")) and not bool(has("adobe"))
+
+
 def clamp_quantity(n) -> int:
     try:
         value = int(n)

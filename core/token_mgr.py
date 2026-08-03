@@ -399,6 +399,20 @@ class TokenManager:
                 if t.get("status") == "active"
             ]
 
+    def has_active_token(self, token_type: Optional[str] = None) -> bool:
+        """池中是否存在指定类型的可用 token（非消费、不推进轮询）。
+
+        token_type: "leonardo" 只看 Leonardo；"adobe" 看非 Leonardo；None 看全部。
+        用于按 token 类型自动选择出图后端（Adobe / Leonardo）。
+        """
+        with self._lock:
+            active = [t for t in self.tokens if t.get("status") in {"active", "error"}]
+            if token_type == "leonardo":
+                return any(t.get("type") == "leonardo" for t in active)
+            if token_type == "adobe":
+                return any(t.get("type") != "leonardo" for t in active)
+            return bool(active)
+
     def _pick_active_token_locked(
         self, strategy: str = "round_robin", token_type: Optional[str] = None
     ) -> Optional[Dict]:

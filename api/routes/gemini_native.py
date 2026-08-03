@@ -7,7 +7,7 @@ import math
 import secrets
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -26,6 +26,7 @@ from core.models.catalog import (
     GEMINI_PRO_FIXED_RATIOS,
 )
 from core.models.resolver import resolve_requested_aspect_ratio
+from core.leonardo_generation import pool_prefers_leonardo
 from core.video_tasks import (
     VideoTaskCapacityError,
     VideoTaskSpec,
@@ -78,6 +79,46 @@ class GeminiModelSpec:
     supported_actions: frozenset[str] = GEMINI_CONTENT_ACTIONS
     video_engine: str | None = None
     video_upstream_model: str | None = None
+    # 非空 → 该图片模型改由 Leonardo 出图（池只有 Leonardo token 时由 leonardo_variant 注入），
+    # slug = Leonardo Generate mutation 的 request.model，model_id = custom_models 的 UUID。
+    leonardo_slug: str | None = None
+    leonardo_model_id: str | None = None
+
+    @property
+    def is_leonardo(self) -> bool:
+        return bool(self.leonardo_slug and self.leonardo_model_id)
+
+
+# Leonardo 出图链路是纯文生图，且仅支持这 4 种比例（= core.leonardo_generation._SUPPORTED_ASPECTS）。
+LEONARDO_IMAGE_RATIOS = frozenset({"1:1", "16:9", "9:16", "4:3"})
+# 池里只有 Leonardo token 时，把这些公开名的后端换成 Leonardo。
+# 值 = (slug, custom_models UUID)，与 core.models.catalog 的 _register_leonardo_model 一致。
+LEONARDO_GEMINI_BACKEND: dict[str, tuple[str, str]] = {
+    "gemini-3-pro-image": ("gemini-image-2", "7c02ef35-3a6b-4df6-b78d-873e5032c3b4"),
+    "gemini-3-pro-image-preview": ("gemini-image-2", "7c02ef35-3a6b-4df6-b78d-873e5032c3b4"),
+    "gemini-3.1-flash-image": ("nano-banana-2", "7418e71f-4133-4e1b-9895-bee19f48f2ce"),
+    "gemini-3.1-flash-image-preview": ("nano-banana-2", "7418e71f-4133-4e1b-9895-bee19f48f2ce"),
+}
+LEONARDO_GENERATE_TIMEOUT = 300
+
+
+def leonardo_variant(spec: "GeminiModelSpec") -> "GeminiModelSpec":
+    """把一个 gemini image spec 改挂 Leonardo 后端并把比例收窄到 4 种。
+
+    比例校验(parse_gemini_request)与 ListModels 都据 spec.aspect_ratios，
+    故换 spec 即让"仅 4 种比例、超出即 400"自动生效，无需改这两处。
+    非受支持的公开名原样返回。
+    """
+    backend = LEONARDO_GEMINI_BACKEND.get(spec.model_id)
+    if backend is None:
+        return spec
+    slug, model_uuid = backend
+    return replace(
+        spec,
+        leonardo_slug=slug,
+        leonardo_model_id=model_uuid,
+        aspect_ratios=LEONARDO_IMAGE_RATIOS,
+    )
 
 
 @dataclass(frozen=True)
@@ -691,8 +732,26 @@ def build_gemini_native_router(
     video_task_manager=None,
     video_task_store=None,
     public_generated_url=None,
+    token_manager=None,
+    leonardo_client=None,
+    fetch_cdn_image=None,
 ) -> APIRouter:
     router = APIRouter()
+
+    def _apply_backend(spec: GeminiModelSpec) -> GeminiModelSpec:
+        # 池里只有 Leonardo token → 这些公开名改挂 Leonardo；有 Adobe 则维持 Adobe。
+        if spec.model_id in LEONARDO_GEMINI_BACKEND and pool_prefers_leonardo(
+            token_manager
+        ):
+            return leonardo_variant(spec)
+        return spec
+
+    def _fetch_cdn_image(url: str, headers: dict):
+        if fetch_cdn_image is not None:
+            return fetch_cdn_image(url, headers)
+        from api.routes.generation import _fetch_cdn_image as _real_fetch
+
+        return _real_fetch(url, headers)
 
     def require_api_key(request: Request) -> None:
         required = str(config_manager.get("api_key", "") or "").strip()
@@ -712,7 +771,7 @@ def build_gemini_native_router(
         spec = GEMINI_MODELS.get(str(model_id or ""))
         if spec is None:
             raise GeminiNativeError(404, "Model not found", "NOT_FOUND")
-        return spec
+        return _apply_backend(spec)
 
     def error_response(request: Request, exc: Exception) -> JSONResponse:
         if isinstance(exc, GeminiNativeError):
@@ -772,7 +831,12 @@ def build_gemini_native_router(
     def list_models(request: Request):
         try:
             require_api_key(request)
-            return {"models": [model_resource(spec) for spec in GEMINI_MODELS.values()]}
+            return {
+                "models": [
+                    model_resource(_apply_backend(spec))
+                    for spec in GEMINI_MODELS.values()
+                ]
+            }
         except Exception as exc:
             return error_response(request, exc)
 
@@ -853,6 +917,7 @@ def build_gemini_native_router(
         try:
             require_api_key(request)
             spec, action = resolve_model_action(model_action)
+            spec = _apply_backend(spec)
             raw_body = await read_limited_body(
                 request,
                 max_bytes=(
@@ -918,6 +983,75 @@ def build_gemini_native_router(
 
             if spec.family == "text":
                 payload = build_canned_response(spec, parsed.prompt)
+            elif spec.is_leonardo:
+                # Leonardo 出图链路 = 纯文生图；带输入图（i2i）明确拒绝而非静默忽略。
+                if parsed.images:
+                    raise _invalid("This model does not support image input")
+                deadline = get_deadline()
+                # 比例已在 parse 阶段按 spec.aspect_ratios(=Leonardo 4 种)校验；
+                # auto/free 交给 generate_images 的 to_aspect 归一到 1:1。
+                leo_aspect = parsed.aspect_ratio
+                if leonardo_client is not None:
+                    leo_client = leonardo_client
+                else:
+                    from core.leonardo_client import LeonardoClient
+
+                    leo_client = LeonardoClient()
+
+                def run_once(token: str) -> dict:
+                    from core.leonardo_generation import generate_images
+                    from core.leonardo_client import LeonardoError
+
+                    try:
+                        result = generate_images(
+                            leo_client,
+                            token,
+                            prompt=parsed.prompt,
+                            model_id=str(spec.leonardo_model_id),
+                            model_slug=str(spec.leonardo_slug),
+                            aspect_ratio=leo_aspect,
+                            n=1,
+                            timeout=LEONARDO_GENERATE_TIMEOUT,
+                        )
+                    except LeonardoError as exc:
+                        raise adobe_error_cls(str(exc)) from exc
+
+                    items = result.get("data") or []
+                    url = str((items[0] if items else {}).get("url") or "").strip()
+                    if not url:
+                        raise adobe_error_cls("Leonardo returned no image URL")
+                    # 生成已成功；CDN 下载失败(内部已重试)不得重发生成(重发=再次扣费)
+                    resp = _fetch_cdn_image(
+                        url, {"User-Agent": "adobe2api/1.0", "Accept": "image/*"}
+                    )
+                    image_bytes = resp.content
+                    job_id = uuid.uuid4().hex
+                    out_path = generated_dir / f"{job_id}.png"
+                    generated_dir.mkdir(parents=True, exist_ok=True)
+                    old_size = (
+                        int(out_path.stat().st_size) if out_path.exists() else 0
+                    )
+                    out_path.write_bytes(image_bytes)
+                    new_size = int(out_path.stat().st_size)
+                    on_generated_file_written(out_path, old_size, new_size)
+                    set_request_preview(
+                        request, public_image_url(request, job_id), kind="image"
+                    )
+                    return build_image_response(spec, parsed, image_bytes)
+
+                payload = await run_in_threadpool(
+                    lambda: run_with_token_retries(
+                        request=request,
+                        operation_name=f"gemini.{action}",
+                        run_once=run_once,
+                        set_request_error_detail=set_request_error_detail,
+                        reraise_domain=True,
+                        deadline=deadline,
+                        token_selector=lambda: token_manager.get_available(
+                            token_type="leonardo"
+                        ),
+                    )
+                )
             else:
                 ordered_ratios = (
                     GEMINI_FLASH_FIXED_RATIOS

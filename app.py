@@ -1791,6 +1791,7 @@ app.include_router(
         video_task_manager=video_task_manager,
         video_task_store=video_task_store,
         public_generated_url=_public_generated_url,
+        token_manager=token_manager,
     )
 )
 
