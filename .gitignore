@@ -18,3 +18,6 @@ leonardo_session.json
 leonardo_auth.json
 browser_profile/
 canva_login_check.png
+
+# 部署密钥
+.env
