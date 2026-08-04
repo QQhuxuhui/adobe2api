@@ -43,10 +43,17 @@ def test_gemini_wide_ratios(slug):
 
 
 @pytest.mark.parametrize("slug", GEMINI_SLUGS)
-def test_gemini_has_no_4x3(slug):
-    # 上游无 4:3 档位 → 返回 None（路由据此 400），绝不回退成方图
-    assert aspect_to_size("4:3", model_slug=slug, output_resolution="2K") is None
-    assert "4:3" not in leonardo_supported_aspects(slug)
+def test_gemini_supports_portrait_landscape_ratios(slug):
+    # 2026-08-04 实测(pro+flash)：4:3/3:4/3:2/2:3 上游支持且正确输出，非改写成方图
+    assert aspect_to_size("4:3", model_slug=slug, output_resolution="2K") == (2048, 1536)
+    assert aspect_to_size("3:4", model_slug=slug, output_resolution="2K") == (1536, 2048)
+    assert aspect_to_size("3:2", model_slug=slug, output_resolution="2K") == (2304, 1536)
+    assert aspect_to_size("2:3", model_slug=slug, output_resolution="2K") == (1536, 2304)
+    for r in ("4:3", "3:4", "3:2", "2:3"):
+        assert r in leonardo_supported_aspects(slug)
+    # 21:9 实测仍被上游拒绝 → 不宣称
+    assert aspect_to_size("21:9", model_slug=slug, output_resolution="2K") is None
+    assert "21:9" not in leonardo_supported_aspects(slug)
 
 
 @pytest.mark.parametrize("slug", GPT_SLUGS)

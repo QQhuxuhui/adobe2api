@@ -99,6 +99,31 @@ class FakeLeonardoClient:
         self.wait_deadlines.append(deadline)
         return {"success": True, "images": self.images}
 
+    # --- 图生图(omni edit)所需 ---
+    def upload_init_image(self, token, image_bytes, extension="png", **kw):
+        self.uploads = getattr(self, "uploads", [])
+        self.uploads.append((image_bytes, extension))
+        return f"init-{len(self.uploads)}"
+
+    def create_edit_generation(
+        self, token, prompt, model_slug, width, height, init_image_ids, **kw
+    ):
+        on_cost = kw.get("on_cost")
+        if on_cost is not None and self.credit_cost is not None:
+            on_cost(self.credit_cost)
+        self.edit_calls = getattr(self, "edit_calls", [])
+        self.edit_calls.append(
+            {
+                "prompt": prompt,
+                "model_slug": model_slug,
+                "size": (width, height),
+                "ids": list(init_image_ids),
+            }
+        )
+        if self._raise_on_create is not None:
+            raise self._raise_on_create
+        return "edit-gen-1"
+
 
 class FakeTokenManager:
     def __init__(self, *, leonardo: bool = True):
@@ -275,17 +300,20 @@ def test_leo_pool_preview_variants_route_to_leonardo(tmp_path):
         assert h.leo.create_calls[0]["model_id"] == uuid_
 
 
-def test_leo_pool_rejects_input_image(tmp_path):
+def test_leo_pool_image_input_routes_to_i2i(tmp_path):
+    """带输入图 → Leonardo 图生图(omni edit)，而不是 400 拒绝。"""
     h = Harness(tmp_path)
-    # 一张最小 PNG 头即可（内容会被拒，不进 Leonardo）
     resp = post(
         h,
         "gemini-3-pro-image",
         "generateContent",
         image_request(inline_image=b"\x89PNG\r\n\x1a\n" + b"0" * 32),
     )
-    assert resp.status_code == 400
-    assert resp.json()["error"]["status"] == "INVALID_ARGUMENT"
+    assert resp.status_code == 200
+    # 走了 omni edit（上传参考图 + create_edit_generation）
+    assert getattr(h.leo, "edit_calls", []), "应调用 create_edit_generation"
+    assert getattr(h.leo, "uploads", []), "应上传参考图"
+    # 未走文生图
     assert h.leo.create_calls == []
 
 
@@ -369,14 +397,13 @@ def test_leo_pool_4k_request_rejected(tmp_path):
     assert h.leo.create_calls == []
 
 
-def test_leo_pool_4x3_rejected_not_silently_squared(tmp_path):
-    # 实测：nano-banana 系上游没有 4:3，硬发 2048x1536 会回 2048x2048 方图。
-    # 必须 400 拦下，绝不能生成一张与请求比例不符的图。
+def test_leo_pool_4x3_now_supported(tmp_path):
+    # 2026-08-04 实测(pro+flash)：上游支持 4:3 且正确输出 2048x1536（非方图）。
+    # 之前会 400 拦下，现在应正常出图。
     h = Harness(tmp_path)
     resp = post(h, "gemini-3-pro-image", "generateContent", image_request(ratio="4:3"))
-    assert resp.status_code == 400, resp.text
-    assert resp.json()["error"]["status"] == "INVALID_ARGUMENT"
-    assert h.leo.create_calls == []
+    assert resp.status_code == 200, resp.text
+    assert h.leo.create_calls and h.leo.create_calls[0]["aspect"] == "4:3"
 
 
 def test_leo_pool_lists_only_achievable_ratios(tmp_path):
@@ -386,8 +413,9 @@ def test_leo_pool_lists_only_achievable_ratios(tmp_path):
     by_id = {m["name"].split("/")[-1]: m for m in r.json()["models"]}
     for name in ("gemini-3-pro-image", "gemini-3.1-flash-image"):
         ratios = set(by_id[name].get("supportedAspectRatios") or [])
-        if ratios:  # 该字段存在时不得声明 4:3
-            assert "4:3" not in ratios, (name, ratios)
+        if ratios:  # 该字段存在时，实测支持的 4:3 应在其中、不支持的 21:9 不在
+            assert "4:3" in ratios, (name, ratios)
+            assert "21:9" not in ratios, (name, ratios)
 
 
 def test_leo_pool_image_size_threaded_to_upstream(tmp_path):

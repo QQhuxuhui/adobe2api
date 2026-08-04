@@ -5,8 +5,11 @@ def test_leonardo_model_in_catalog():
     assert conf["upstream_model"] == "leonardo:nano-banana-2"
     assert conf["dynamic"] is True
     assert conf["supports_auto_aspect_ratio"] is True
-    # nano-banana 系上游无 4:3（实测发 4:3 会被改写成方图）→ 不再宣称支持
-    assert set(conf["supported_aspect_ratios"]) == {"1:1", "16:9", "9:16"}
+    # 2026-08-04 实测(pro+flash 两模型)：上游确实支持并正确输出 4:3/3:4/3:2/2:3
+    # （请求 2048x1536 实际输出即 2048x1536，非改写成方图），故一并宣称支持。
+    assert set(conf["supported_aspect_ratios"]) == {
+        "1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16"
+    }
 
 
 def test_leonardo_gpt_model_keeps_4x3():

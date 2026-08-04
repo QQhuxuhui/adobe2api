@@ -1002,9 +1002,8 @@ def build_gemini_native_router(
             if spec.family == "text":
                 payload = build_canned_response(spec, parsed.prompt)
             elif spec.is_leonardo:
-                # Leonardo 出图链路 = 纯文生图；带输入图（i2i）明确拒绝而非静默忽略。
-                if parsed.images:
-                    raise _invalid("This model does not support image input")
+                # Leonardo 出图：无输入图走文生图；带输入图走图生图(omni edit)，
+                # 复用 /v1/images/edits 那套 edit_images。
                 deadline = get_deadline()
                 # 比例已在 parse 阶段按 spec.aspect_ratios(=Leonardo 4 种)校验；
                 # auto/free 交给 generate_images 的 to_aspect 归一到 1:1。
@@ -1035,7 +1034,7 @@ def build_gemini_native_router(
                     return adobe_error_cls(str(exc))
 
                 def run_once(token: str) -> dict:
-                    from core.leonardo_generation import generate_images
+                    from core.leonardo_generation import generate_images, edit_images
                     from core.leonardo_client import LeonardoError
 
                     # 每次尝试按当前剩余 deadline 重算超时：切号重试不复用旧预算，
@@ -1050,18 +1049,33 @@ def build_gemini_native_router(
                     leo_timeout = min(LEONARDO_GENERATE_TIMEOUT, remaining)
 
                     try:
-                        result = generate_images(
-                            leo_client,
-                            token,
-                            prompt=parsed.prompt,
-                            model_id=str(spec.leonardo_model_id),
-                            model_slug=str(spec.leonardo_slug),
-                            aspect_ratio=leo_aspect,
-                            n=1,
-                            timeout=leo_timeout,
-                            deadline=deadline,
-                            output_resolution=parsed.image_size,
-                        )
+                        if parsed.images:
+                            # 图生图：上传参考图 → omni edit
+                            result = edit_images(
+                                leo_client,
+                                token,
+                                prompt=parsed.prompt,
+                                model_slug=str(spec.leonardo_slug),
+                                model_id=str(spec.leonardo_model_id),
+                                input_images=parsed.images,
+                                aspect_ratio=leo_aspect,
+                                output_resolution=parsed.image_size,
+                                timeout=leo_timeout,
+                                deadline=deadline,
+                            )
+                        else:
+                            result = generate_images(
+                                leo_client,
+                                token,
+                                prompt=parsed.prompt,
+                                model_id=str(spec.leonardo_model_id),
+                                model_slug=str(spec.leonardo_slug),
+                                aspect_ratio=leo_aspect,
+                                n=1,
+                                timeout=leo_timeout,
+                                deadline=deadline,
+                                output_resolution=parsed.image_size,
+                            )
                     except LeonardoError as exc:
                         raise _map_leo_error(exc) from exc
 

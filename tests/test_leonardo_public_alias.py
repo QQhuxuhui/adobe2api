@@ -238,21 +238,36 @@ def test_gpt_image_2_4k_rejected(tmp_path, monkeypatch):
     assert "4K" in resp.json()["error"]["message"]
 
 
-def test_nano_banana_4x3_rejected_400(tmp_path, monkeypatch):
-    # nano-banana 系上游无 4:3（硬发会回方图）→ 400，且不得发起生成
+def test_nano_banana_4x3_now_supported(tmp_path, monkeypatch):
+    # 2026-08-04 实测(pro+flash)：nano-banana 系支持 4:3 且正确输出 → 正常出图
     import core.leonardo_generation as lg
 
-    monkeypatch.setattr(
-        lg, "generate_images",
-        lambda **kw: (_ for _ in ()).throw(AssertionError("must not generate")),
-    )
+    captured = {}
+
+    def fake_generate_images(**kw):
+        captured.update(kw)
+        return {
+            "created": int(time.time()),
+            "data": [{"url": "https://cdn.leonardo.ai/x/img-0.jpg"}],
+            "provider": {"generation_id": "gen-x", "aspect_ratio": "4:3", "model_id": "x"},
+        }
+
+    class _Resp:
+        content = b"leo-bytes"
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(lg, "generate_images", fake_generate_images)
+    monkeypatch.setattr(req_mod, "get", lambda url, timeout, headers: _Resp())
     client, _, _ = _make_router(tmp_path, leonardo=True)
     resp = client.post(
         "/v1/images/generations",
         json={"model": "leonardo-nano-banana-pro", "prompt": "x", "aspect_ratio": "4:3"},
     )
-    assert resp.status_code == 400, resp.text
-    assert "4:3" in resp.json()["error"]["message"]
+    assert resp.status_code == 200, resp.text
+    assert captured["aspect_ratio"] == "4:3"
 
 
 def test_gpt_image_4x3_still_allowed(tmp_path, monkeypatch):
