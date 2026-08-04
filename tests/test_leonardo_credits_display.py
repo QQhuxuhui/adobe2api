@@ -109,6 +109,24 @@ def test_generate_images_measures_cost_by_balance_diff():
     assert client.balance_calls == 2
 
 
+def test_measured_cost_ignored_when_account_used_concurrently():
+    # 账号被别处同时出图时，余额差分会混入他人消耗 → 数字离谱就不记
+    from core.leonardo_generation import generate_images
+
+    out = generate_images(_BalanceClient([8500, 500]), "tok", prompt="p",
+                          model_id="uuid", aspect_ratio="1:1")
+    assert out["provider"]["credit_cost"] is None
+
+
+def test_measured_cost_accepts_plausible_upper_bound():
+    from core.leonardo_generation import generate_images
+
+    # 最大合理单张（gpt-image 4.23Mpx≈262）仍应记录
+    out = generate_images(_BalanceClient([8500, 8238]), "tok", prompt="p",
+                          model_id="uuid", aspect_ratio="1:1")
+    assert out["provider"]["credit_cost"] == 262
+
+
 def test_measured_cost_ignored_when_diff_not_positive():
     # 余额没变/变大（并发或刷新导致）→ 不记，宁可空着也不记错账
     from core.leonardo_generation import generate_images

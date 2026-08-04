@@ -12,8 +12,8 @@ def test_leonardo_model_in_catalog():
 def test_leonardo_gpt_model_keeps_4x3():
     from core.models.catalog import MODEL_CATALOG
     conf = MODEL_CATALOG["leonardo-gpt-image-2"]
-    # gpt-image 系实测支持 4:3(2048x1536)
-    assert set(conf["supported_aspect_ratios"]) == {"1:1", "16:9", "9:16", "4:3"}
+    # gpt-image-2 实测只支持 1:1(1536²) 与 4:3(2048x1536)；16:9/9:16 被上游拒绝
+    assert set(conf["supported_aspect_ratios"]) == {"1:1", "4:3"}
 
 
 def test_resolve_leonardo_model():

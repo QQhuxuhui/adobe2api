@@ -53,8 +53,10 @@ def test_gemini_has_no_4x3(slug):
 def test_gpt_sizes(slug):
     assert aspect_to_size("1:1", model_slug=slug, output_resolution="2K") == (1536, 1536)
     assert aspect_to_size("4:3", model_slug=slug, output_resolution="2K") == (2048, 1536)
-    assert aspect_to_size("16:9", model_slug=slug, output_resolution="2K") == (2752, 1536)
-    assert "4:3" in leonardo_supported_aspects(slug)
+    # 16:9 / 9:16 实测被上游确定性拒绝（7 次全失败、0 积分）→ 不提供
+    assert aspect_to_size("16:9", model_slug=slug, output_resolution="2K") is None
+    assert aspect_to_size("9:16", model_slug=slug, output_resolution="2K") is None
+    assert set(leonardo_supported_aspects(slug)) == {"1:1", "4:3"}
 
 
 def test_gpt_image_1_is_its_own_family():

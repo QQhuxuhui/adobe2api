@@ -126,10 +126,17 @@ def _read_balance(client, token: str, deadline) -> Optional[int]:
     return value if isinstance(value, (int, float)) else None
 
 
+# 单张实测成本的合理上限：实测各模型 80~262（gpt-image 约 62 积分/百万像素，
+# 最大尺寸 4.23Mpx≈262）。超过此值几乎必然是**账号被并发使用**——同一账号若在
+# 别处同时出图，余额差分会把别人的消耗算进来，那样记录的数字是错的。
+_MAX_PLAUSIBLE_COST = 600
+
+
 def _measure_cost(client, token: str, before, deadline) -> Optional[int]:
     """生成前后余额差分 = 本次单张成本。
 
-    差值非正（并发出图/额度刚回补等）时返回 None——宁可不记，也不记错账。
+    差值非正（额度刚回补）或大得离谱（账号被并发使用，混入了他人消耗）时返回
+    None——宁可不记，也不记错账。
     """
     if before is None:
         return None
@@ -137,7 +144,9 @@ def _measure_cost(client, token: str, before, deadline) -> Optional[int]:
     if after is None:
         return None
     diff = int(before) - int(after)
-    return diff if diff > 0 else None
+    if diff <= 0 or diff > _MAX_PLAUSIBLE_COST:
+        return None
+    return diff
 
 
 def generate_images(
