@@ -159,7 +159,7 @@ def test_aspect_to_size_known_and_unsupported():
     assert aspect_to_size("16:9", model_slug="nano-banana-2") == (2752, 1536)
     assert aspect_to_size("9:16", model_slug="nano-banana-2") == (1536, 2752)
     assert aspect_to_size("weird", model_slug="nano-banana-2") is None
-    assert set(LEONARDO_SIZES) == {"gemini", "gpt"}
+    assert set(LEONARDO_SIZES) == {"gemini", "gpt", "gpt-image-1"}
 
 
 def test_build_generate_payload_core_fields():

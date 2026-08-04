@@ -446,7 +446,19 @@ curl -X POST "http://127.0.0.1:6001/v1/images/generations" \
 | | 1:1 | 16:9 | 9:16 | 4:3 | 4K |
 |---|---|---|---|---|---|
 | nano-banana 系（`gemini-3-pro-image*` / `gemini-3.1-flash-image*`） | 1K→1024²、2K→2048² | 2752×1536 | 1536×2752 | **不支持 → 400** | 不支持 → 400 |
-| gpt-image 系（`gpt-image-2` / `leonardo-gpt-image-*`） | 1536² | 2752×1536 | 1536×2752 | 2048×1536 | 不支持 → 400 |
+| `gpt-image-2` / `leonardo-gpt-image-2` | 1536² | 2752×1536 | 1536×2752 | 2048×1536 | 不支持 → 400 |
+| `leonardo-gpt-image-1`（与 gpt-image-2 **不同族**） | 1024² | 未验证 → 400 | 未验证 → 400 | 未验证 → 400 | 不支持 → 400 |
+
+**单张积分成本**（线上余额差分实测，请求日志逐条记录 `credits_used`）：
+
+| 模型 | 计费方式 | 单张积分 |
+|---|---|---|
+| `gemini-3.1-flash-image` | **按张固定**，与尺寸无关 | **120** |
+| `gemini-3-pro-image` | **按张固定**，与尺寸无关 | **140** |
+| `gpt-image-2` | **按像素线性**（约 62 积分/百万像素） | 1:1=146、4:3=195、16:9≈262 |
+| `leonardo-gpt-image-1` | 按像素 | 1024²=135 |
+
+省额度优先用 `gemini-3.1-flash-image`（固定 120，可放心出最大尺寸）；`gpt-image-2` 尺寸越大越贵。
 
 另：纯文生图（带 inlineData 输入图返回 400）。`imageSize` 仅对 nano-banana 系 1:1 改变像素（1K/2K 如上），其余比例上游只有单一档位。OpenAI 兼容端点的 `gpt-image-2` 同理（仅 `/v1/images/generations` 接了 Leonardo；`/v1/responses`、`/v1/chat/completions` 仍固定走 Adobe）。**以上仅 Leonardo 后端生效，Adobe 侧的尺寸/比例行为完全不变。**
 

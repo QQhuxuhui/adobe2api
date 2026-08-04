@@ -146,6 +146,12 @@ LEONARDO_SIZES: dict[str, dict[str, dict[str, Tuple[int, int]]]] = {
         "9:16": {"1K": (1536, 2752), "2K": (1536, 2752)},
         "4:3": {"1K": (2048, 1536), "2K": (2048, 1536)},
     },
+    # gpt-image-1 与 gpt-image-2 并不同族：实测发 1536² 会被上游改写成 1024²。
+    # 该模型暂不使用，未逐比例实测，故只保留已验证的 1:1，其余比例一律 400——
+    # 未经验证就宣称支持，会重演「静默返回错尺寸/错比例」的问题。
+    "gpt-image-1": {
+        "1:1": {"1K": (1024, 1024), "2K": (1024, 1024)},
+    },
 }
 _STYLE_IDS = ["111dc692-d470-4eec-b791-3475abac4c46"]
 _GENERATE_QUERY = (
@@ -155,8 +161,12 @@ _GENERATE_QUERY = (
 
 
 def leonardo_family(model_slug: Optional[str]) -> str:
-    """模型族：gpt-image-* 为 gpt 族，其余(nano-banana-2/gemini-image-2)为 gemini 族。"""
-    return "gpt" if str(model_slug or "").startswith("gpt-image") else "gemini"
+    """模型族：gpt-image-1 自成一族（尺寸与 gpt-image-2 不同，实测确认）；
+    其余 gpt-image-* 为 gpt 族；nano-banana-2 / gemini-image-2 为 gemini 族。"""
+    slug = str(model_slug or "")
+    if slug == "gpt-image-1":
+        return "gpt-image-1"
+    return "gpt" if slug.startswith("gpt-image") else "gemini"
 
 
 def leonardo_supported_aspects(model_slug: Optional[str]) -> Tuple[str, ...]:

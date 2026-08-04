@@ -16,7 +16,7 @@ from core.leonardo_client import (
 )
 
 GEMINI_SLUGS = ("nano-banana-2", "gemini-image-2")
-GPT_SLUGS = ("gpt-image-1", "gpt-image-2")
+GPT_SLUGS = ("gpt-image-2",)
 
 
 @pytest.mark.parametrize("slug", GEMINI_SLUGS)
@@ -55,6 +55,16 @@ def test_gpt_sizes(slug):
     assert aspect_to_size("4:3", model_slug=slug, output_resolution="2K") == (2048, 1536)
     assert aspect_to_size("16:9", model_slug=slug, output_resolution="2K") == (2752, 1536)
     assert "4:3" in leonardo_supported_aspects(slug)
+
+
+def test_gpt_image_1_is_its_own_family():
+    # 实测：gpt-image-1 发 1536² 会被上游改写成 1024²，与 gpt-image-2 不同族。
+    # 该模型暂不使用、未逐比例实测 → 只保留已验证的 1:1，其余一律 None(→400)。
+    assert leonardo_family("gpt-image-1") == "gpt-image-1"
+    assert aspect_to_size("1:1", model_slug="gpt-image-1") == (1024, 1024)
+    assert leonardo_supported_aspects("gpt-image-1") == ("1:1",)
+    for unverified in ("16:9", "9:16", "4:3"):
+        assert aspect_to_size(unverified, model_slug="gpt-image-1") is None
 
 
 def test_unknown_aspect_is_none_not_fallback():
