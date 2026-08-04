@@ -579,6 +579,86 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (cookieInput) cookieInput.focus();
     });
   }
+  // --- 导入 Leonardo Cookie（与 Adobe 的 Cookie 导入是两套流程）---
+  const openLeoCookieBtn = document.getElementById("openLeoCookieBtn");
+  const leoCookieModal = document.getElementById("leoCookieModal");
+  const leoCookieCloseBtn = document.getElementById("leoCookieCloseBtn");
+  const leoCookieInput = document.getElementById("leoCookieInput");
+  const leoCookieSubmitBtn = document.getElementById("leoCookieSubmitBtn");
+  const leoCookieMsg = document.getElementById("leoCookieMsg");
+  const leoCookieStatus = document.getElementById("leoCookieStatus");
+
+  async function refreshLeoCookieStatus() {
+    if (!leoCookieStatus) return;
+    try {
+      const res = await fetch("/api/v1/leonardo/cookie/status");
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data.uploaded) {
+        leoCookieStatus.textContent = "当前未上传 Leonardo cookie。";
+        return;
+      }
+      const when = data.updated_at
+        ? new Date(data.updated_at * 1000).toLocaleString()
+        : "-";
+      leoCookieStatus.textContent =
+        `已上传：指纹 ${String(data.fingerprint).slice(0, 16)}…，更新于 ${when}`;
+    } catch (err) {
+      /* 状态展示失败不影响导入 */
+    }
+  }
+
+  if (openLeoCookieBtn) {
+    openLeoCookieBtn.addEventListener("click", () => {
+      openDialog(leoCookieModal);
+      if (leoCookieMsg) leoCookieMsg.textContent = "";
+      refreshLeoCookieStatus();
+      if (leoCookieInput) leoCookieInput.focus();
+    });
+  }
+  if (leoCookieCloseBtn) {
+    leoCookieCloseBtn.addEventListener("click", () => closeDialog(leoCookieModal));
+  }
+  if (leoCookieModal) {
+    leoCookieModal.addEventListener("click", (event) => {
+      if (event.target === leoCookieModal) closeDialog(leoCookieModal);
+    });
+  }
+  if (leoCookieSubmitBtn) {
+    leoCookieSubmitBtn.addEventListener("click", async () => {
+      const raw = (leoCookieInput?.value || "").trim();
+      if (!raw) {
+        if (leoCookieMsg) leoCookieMsg.textContent = "请先粘贴 cookie";
+        return;
+      }
+      leoCookieSubmitBtn.disabled = true;
+      if (leoCookieMsg) leoCookieMsg.textContent = "保存中…";
+      try {
+        const res = await fetch("/api/v1/leonardo/cookie", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cookie: raw }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          if (leoCookieMsg) {
+            leoCookieMsg.textContent = data.detail || `失败（HTTP ${res.status}）`;
+          }
+          return;
+        }
+        if (leoCookieInput) leoCookieInput.value = "";
+        if (leoCookieMsg) {
+          leoCookieMsg.textContent = data.message || "已保存";
+        }
+        refreshLeoCookieStatus();
+      } catch (err) {
+        if (leoCookieMsg) leoCookieMsg.textContent = `失败：${err}`;
+      } finally {
+        leoCookieSubmitBtn.disabled = false;
+      }
+    });
+  }
+
   if (refreshModalCloseBtn) {
     refreshModalCloseBtn.addEventListener("click", () => closeDialog(refreshModal));
   }

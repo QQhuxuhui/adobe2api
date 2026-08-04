@@ -97,6 +97,42 @@ def validate_leonardo_id_token(token: str, *, now: int) -> dict:
     return payload
 
 
+def store_leonardo_cookie(raw_cookie: str) -> dict:
+    """抽取 better-auth 三条并落盘，返回 {fingerprint, updated_at}。
+
+    refresh-key 接口与后台「导入 Leonardo Cookie」共用此实现，避免两套逻辑走偏。
+    非 Leonardo cookie 抛 ValueError。
+    """
+    cookie = extract_better_auth_cookies(raw_cookie)  # 非法时 ValueError
+    fingerprint = hashlib.sha256(cookie.encode("utf-8")).hexdigest()
+    updated_at = int(time.time())
+    path = _cookie_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {"cookie": cookie, "fingerprint": fingerprint, "updated_at": updated_at}
+        ),
+        encoding="utf-8",
+    )
+    return {"fingerprint": fingerprint, "updated_at": updated_at}
+
+
+def read_leonardo_cookie_status() -> dict:
+    """后台展示用的 cookie 状态——只回指纹与时间，绝不回传 cookie 明文。"""
+    path = _cookie_path()
+    if not path.exists():
+        return {"uploaded": False, "fingerprint": "", "updated_at": None}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - 文件损坏当作未上传
+        return {"uploaded": False, "fingerprint": "", "updated_at": None}
+    return {
+        "uploaded": bool(data.get("cookie")),
+        "fingerprint": str(data.get("fingerprint") or ""),
+        "updated_at": data.get("updated_at"),
+    }
+
+
 def build_leonardo_token_router(*, token_manager) -> APIRouter:
     router = APIRouter()
 
@@ -107,23 +143,12 @@ def build_leonardo_token_router(*, token_manager) -> APIRouter:
     ):
         _require_refresh_key(request)
         try:
-            cookie = extract_better_auth_cookies(req.cookie)
+            return store_leonardo_cookie(req.cookie)
         except ValueError:
             raise HTTPException(
                 status_code=400,
                 detail="cookie must contain better-auth session cookies",
             )
-        fingerprint = hashlib.sha256(cookie.encode("utf-8")).hexdigest()
-        updated_at = int(time.time())
-        path = _cookie_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                {"cookie": cookie, "fingerprint": fingerprint, "updated_at": updated_at}
-            ),
-            encoding="utf-8",
-        )
-        return {"fingerprint": fingerprint, "updated_at": updated_at}
 
     @router.get("/api/v1/tokens/leonardo/cookie")
     def get_leonardo_cookie(request: Request):

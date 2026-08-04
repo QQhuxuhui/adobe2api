@@ -29,6 +29,7 @@
         <div class="actions">
           <button id="openAddTokenModalBtn">添加 Token</button>
           <button id="openCookieImportBtn" class="secondary">导入 Cookie</button>
+          <button id="openLeoCookieBtn" class="secondary">导入 Leonardo Cookie</button>
         </div>
       </section>
 
@@ -368,6 +369,28 @@
           <button id="addBtn">确认添加</button>
           <span id="addMsg" class="msg"></span>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="leoCookieModal" class="dialog-modal" aria-hidden="true">
+    <div class="dialog-card" role="dialog" aria-modal="true" aria-label="导入 Leonardo Cookie">
+      <div class="list-head" style="margin-bottom: 10px;">
+        <h2>导入 Leonardo Cookie</h2>
+        <button id="leoCookieCloseBtn" class="secondary small" type="button">关闭</button>
+      </div>
+      <div class="config-form">
+        <div class="form-group">
+          <label for="leoCookieInput">粘贴 app.leonardo.ai 的整条 cookie</label>
+          <textarea id="leoCookieInput" rows="7" placeholder="登录 app.leonardo.ai → F12 → Network → 任选一条请求 → Request Headers → 复制整条 cookie 值后粘贴到这里"></textarea>
+          <p class="help">仅用于 <b>Leonardo</b> 账号。必须包含 <code>__Secure-better-auth.session_token</code> 与 <code>session_data.0/.1</code>（HttpOnly，只能从 Network 的请求头复制，Console 里 <code>document.cookie</code> 读不到）。</p>
+          <p class="help">Adobe 账号请走「导入 Cookie」；一段 Bearer/JWT 请走「添加 Token」。会话约 6 周过期，到期重新导一次即可。</p>
+        </div>
+        <div class="actions">
+          <button id="leoCookieSubmitBtn" class="secondary">保存并刷新</button>
+        </div>
+        <span id="leoCookieMsg" class="msg"></span>
+        <p id="leoCookieStatus" class="help"></p>
       </div>
     </div>
   </div>

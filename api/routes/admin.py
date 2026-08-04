@@ -792,6 +792,40 @@ def build_admin_router(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
+    @router.get("/api/v1/leonardo/cookie/status")
+    def leonardo_cookie_status(request: Request):
+        require_admin_auth(request)
+        from api.routes.leonardo_tokens import read_leonardo_cookie_status
+
+        return read_leonardo_cookie_status()
+
+    @router.post("/api/v1/leonardo/cookie")
+    def leonardo_cookie_import(req: RefreshCookieImportRequest, request: Request):
+        """后台「导入 Leonardo Cookie」。
+
+        与 Adobe 的 Cookie 导入是两套：Leonardo 账号的 cookie 交给 leonardo-refresher
+        换 Cognito id_token，而不是走 Adobe IMS（那样只会得到没额度的游客号）。
+        """
+        require_admin_auth(request)
+        from api.routes.leonardo_tokens import store_leonardo_cookie
+
+        try:
+            saved = store_leonardo_cookie(req.cookie)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "这不是 Leonardo 账号的 cookie：需要包含 "
+                    "__Secure-better-auth.session_token 与 session_data.0/.1"
+                    "（登录 app.leonardo.ai 后从 DevTools→Network 的请求头复制整条 cookie）"
+                ),
+            )
+        return {
+            "status": "ok",
+            **saved,
+            "message": "已保存；refresher 约 60 秒内自动取新 token 入池",
+        }
+
     @router.post("/api/v1/refresh-profiles/import-cookie-batch")
     def refresh_profiles_import_cookie_batch(
         req: RefreshCookieBatchImportRequest, request: Request
