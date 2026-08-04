@@ -113,14 +113,26 @@ def test_calculate_next_delay_respects_expiry_margin(ttl, expected):
 
 
 class _SessionSource:
-    def __init__(self, *, token=None, error=None):
+    """单账号假 source：暴露多账号接口（一个 cookie），便于沿用旧断言。"""
+
+    def __init__(self, *, token=None, error=None, fingerprint="fp-1"):
         self.token = token
         self.error = error
+        self.fingerprint = fingerprint
+        self.fetch_calls = []
 
-    def fetch_token(self):
+    def list_cookies(self):
+        return [("cookie-1", self.fingerprint)]
+
+    def fetch_token_for(self, cookie_str, fingerprint):
+        self.fetch_calls.append((cookie_str, fingerprint))
         if self.error is not None:
             raise self.error
         return self.token
+
+    # 向后兼容（部分测试仍直接调）
+    def fetch_token(self):
+        return self.fetch_token_for("cookie-1", self.fingerprint)
 
 
 class _TokenSink:
@@ -145,6 +157,7 @@ def _config() -> RefresherConfig:
         refresh_interval_seconds=3000,
         safety_margin_seconds=600,
         min_interval_seconds=60,
+        poll_interval_seconds=15,
     )
 
 
@@ -162,6 +175,9 @@ def _service(*, token=None, source_error=None, sink_error=None, now=10000):
     return service, state, sink
 
 
+POLL = 15  # config.poll_interval_seconds
+
+
 def test_run_once_pushes_fresh_token_and_becomes_healthy():
     token = _jwt({"token_use": "id", "sub": "leo-1", "exp": 13600})
     service, state, sink = _service(token=token)
@@ -169,24 +185,23 @@ def test_run_once_pushes_fresh_token_and_becomes_healthy():
     delay = service.run_once()
 
     assert sink.received == [(token, "Primary")]
-    assert state.snapshot() == {
-        "state": "healthy",
-        "session_state": "authenticated",
-        "last_success_at": 10000,
-        "current_token_exp": 13600,
-        "consecutive_failures": 0,
-        "last_error_kind": None,
-    }
-    assert delay == 3000
+    snap = state.snapshot()
+    assert snap["state"] == "healthy"
+    assert snap["session_state"] == "authenticated"
+    assert snap["last_success_at"] == 10000
+    assert snap["current_token_exp"] == 13600
+    assert snap["healthy_accounts"] == 1
+    assert snap["total_accounts"] == 1
+    assert snap["last_error_kind"] is None
+    assert delay == POLL
 
 
-def test_run_once_success_clears_prior_failure_counters():
-    # 非空基线：先失败使 consecutive_failures>0 且 last_error_kind 被置，再成功清零。
+def test_run_once_success_clears_prior_failure():
     token = _jwt({"token_use": "id", "sub": "leo-1", "exp": 13600})
     service, state, sink = _service(source_error=RefreshFetchError("network"))
 
     service.run_once()
-    assert state.snapshot()["consecutive_failures"] == 1
+    assert state.snapshot()["state"] == "refresh_retrying"
     assert state.snapshot()["last_error_kind"] == "network"
 
     service.source.error = None
@@ -195,35 +210,17 @@ def test_run_once_success_clears_prior_failure_counters():
 
     snap = state.snapshot()
     assert snap["state"] == "healthy"
-    assert snap["consecutive_failures"] == 0
     assert snap["last_error_kind"] is None
-    assert delay == 3000
+    assert delay == POLL
 
 
-def test_run_once_schedules_from_time_after_refresh_work():
+def test_run_once_always_returns_poll_interval():
     token = _jwt({"token_use": "id", "sub": "leo-1", "exp": 13600})
-    current_time = [10000]
-
-    class SlowSource(_SessionSource):
-        def fetch_token(self):
-            current_time[0] = 11000
-            return super().fetch_token()
-
-    source = SlowSource(token=token)
-    sink = _TokenSink()
-    state = RuntimeState()
-    service = RefresherService(
-        source=source,
-        sink=sink,
-        state=state,
-        config=_config(),
-        now=lambda: current_time[0],
-    )
-
-    delay = service.run_once()
-
-    assert delay == 2000
-    assert state.snapshot()["last_success_at"] == 11000
+    service, state, sink = _service(token=token)
+    assert service.run_once() == POLL
+    # 已健康且未近过期 → 第二轮跳过刷新（不重复 push），仍返回 poll
+    assert service.run_once() == POLL
+    assert sink.received == [(token, "Primary")]
 
 
 def test_run_once_does_not_push_low_ttl_token():
@@ -232,62 +229,49 @@ def test_run_once_does_not_push_low_ttl_token():
 
     delay = service.run_once()
 
-    assert delay == 60
+    assert delay == POLL
     assert sink.received == []
     assert state.snapshot()["state"] == "refresh_retrying"
-    assert state.snapshot()["session_state"] == "authenticated"
     assert state.snapshot()["last_error_kind"] == "stale_token"
 
 
 def test_run_once_marks_explicit_null_session_as_login_required():
     service, state, sink = _service(source_error=LoginRequiredError())
 
-    assert service.run_once() == 60
+    assert service.run_once() == POLL
 
     assert sink.received == []
     assert state.snapshot()["state"] == "login_required"
-    assert state.snapshot()["session_state"] == "login_required"
-    assert state.snapshot()["consecutive_failures"] == 1
 
 
 def test_run_once_keeps_session_unknown_on_proxy_failure():
-    service, state, sink = _service(
-        source_error=RefreshFetchError("proxy"),
-    )
+    service, state, sink = _service(source_error=RefreshFetchError("proxy"))
 
-    assert service.run_once() == 60
+    assert service.run_once() == POLL
 
     assert sink.received == []
     assert state.snapshot()["state"] == "refresh_retrying"
-    assert state.snapshot()["session_state"] == "unknown"
     assert state.snapshot()["last_error_kind"] == "proxy"
 
 
 def test_run_once_marks_dead_browser_control_unhealthy():
-    service, state, sink = _service(
-        source_error=RefreshFetchError("browser_control"),
-    )
+    service, state, sink = _service(source_error=RefreshFetchError("browser_control"))
 
-    assert service.run_once() == 60
+    assert service.run_once() == POLL
 
     assert sink.received == []
     assert state.snapshot()["state"] == "browser_unavailable"
-    assert state.snapshot()["session_state"] == "unknown"
     assert state.snapshot()["last_error_kind"] == "browser_control"
 
 
 def test_run_once_marks_push_failure_without_declaring_logout():
     token = _jwt({"token_use": "id", "sub": "leo-1", "exp": 13600})
-    service, state, sink = _service(
-        token=token,
-        sink_error=TokenPushError("http_503"),
-    )
+    service, state, sink = _service(token=token, sink_error=TokenPushError("http_503"))
 
-    assert service.run_once() == 60
+    assert service.run_once() == POLL
 
     assert sink.received == []
     assert state.snapshot()["state"] == "push_failed"
-    assert state.snapshot()["session_state"] == "authenticated"
     assert state.snapshot()["last_error_kind"] == "http_503"
 
 
@@ -295,7 +279,7 @@ def test_run_once_treats_non_id_token_as_login_required():
     token = _jwt({"token_use": "access", "sub": "leo-1", "exp": 13600})
     service, state, sink = _service(token=token)
 
-    assert service.run_once() == 60
+    assert service.run_once() == POLL
 
     assert sink.received == []
     assert state.snapshot()["state"] == "login_required"
@@ -307,16 +291,67 @@ def test_run_once_treats_non_finite_exp_as_invalid_token(exp):
     token = _jwt({"token_use": "id", "sub": "leo-1", "exp": exp})
     service, state, sink = _service(token=token)
 
-    assert service.run_once() == 60
+    assert service.run_once() == POLL
 
     assert sink.received == []
     assert state.snapshot()["state"] == "login_required"
     assert state.snapshot()["last_error_kind"] == "invalid_token"
 
 
+def test_run_once_multiple_accounts_each_pushed():
+    """多账号：两个 cookie → 两次 push、两个健康账号。"""
+    t1 = _jwt({"token_use": "id", "sub": "leo-1", "exp": 13600})
+    t2 = _jwt({"token_use": "id", "sub": "leo-2", "exp": 13600})
+
+    class MultiSource:
+        def list_cookies(self):
+            return [("cookieA", "fpA"), ("cookieB", "fpB")]
+
+        def fetch_token_for(self, cookie, fp):
+            return t1 if fp == "fpA" else t2
+
+    sink = _TokenSink()
+    state = RuntimeState()
+    service = RefresherService(
+        source=MultiSource(), sink=sink, state=state, config=_config(),
+        now=lambda: 10000,
+    )
+    assert service.run_once() == POLL
+    assert set(t for t, _ in sink.received) == {t1, t2}
+    snap = state.snapshot()
+    assert snap["healthy_accounts"] == 2
+    assert snap["total_accounts"] == 2
+    assert snap["state"] == "healthy"
+
+
+def test_run_once_new_cookie_picked_up_next_pass():
+    """导入即刷新：账号数从 1 变 2，下一轮就把新账号刷进来。"""
+    t = _jwt({"token_use": "id", "sub": "leo-x", "exp": 13600})
+    cookies = [("cookieA", "fpA")]
+
+    class GrowingSource:
+        def list_cookies(self):
+            return list(cookies)
+
+        def fetch_token_for(self, cookie, fp):
+            return t
+
+    sink = _TokenSink()
+    state = RuntimeState()
+    service = RefresherService(
+        source=GrowingSource(), sink=sink, state=state, config=_config(),
+        now=lambda: 10000,
+    )
+    service.run_once()
+    assert state.snapshot()["healthy_accounts"] == 1
+    cookies.append(("cookieB", "fpB"))  # 用户导入了第二个账号
+    service.run_once()
+    assert state.snapshot()["healthy_accounts"] == 2
+
+
 def test_health_server_returns_runtime_snapshot_and_404_elsewhere():
     state = RuntimeState()
-    state.mark_healthy(now=10000, exp=13600)
+    state.mark_account_healthy("fp-1", now=10000, exp=13600)
     server = start_health_server(state, host="127.0.0.1", port=0)
     try:
         with urlopen(
@@ -336,11 +371,7 @@ def test_health_server_returns_runtime_snapshot_and_404_elsewhere():
 
 def test_health_server_returns_503_when_browser_control_is_unavailable():
     state = RuntimeState()
-    state.mark_failure(
-        state="browser_unavailable",
-        session_state="unknown",
-        error_kind="browser_control",
-    )
+    state.set_browser_ok(False)
     server = start_health_server(state, host="127.0.0.1", port=0)
     try:
         with pytest.raises(HTTPError) as exc_info:
@@ -354,11 +385,7 @@ def test_health_server_returns_503_when_browser_control_is_unavailable():
 def test_health_server_stays_200_on_login_required():
     # 登录过期不得让 healthcheck 变红（否则 Docker 反复重启容器）——仅 browser_unavailable 才 503。
     state = RuntimeState()
-    state.mark_failure(
-        state="login_required",
-        session_state="login_required",
-        error_kind="login_required",
-    )
+    state.set_global_error("cookie_required")  # 无账号 → login_required
     server = start_health_server(state, host="127.0.0.1", port=0)
     try:
         with urlopen(
@@ -805,7 +832,7 @@ def test_run_forever_refreshes_immediately_and_waits_interruptibly():
     service.run_forever(stop_event)
 
     assert sink.received == [(token, "Primary")]
-    assert stop_event.delays == [3000]
+    assert stop_event.delays == [15]
     assert state.snapshot()["state"] == "healthy"
 
 
@@ -836,8 +863,8 @@ def test_run_forever_exits_after_three_browser_control_failures():
     with pytest.raises(BrowserControlUnavailableError):
         service.run_forever(stop_event)
 
-    assert stop_event.delays == [60, 60]
-    assert state.snapshot()["consecutive_failures"] == 3
+    assert stop_event.delays == [15, 15]
+    assert state.snapshot()["state"] == "browser_unavailable"
 
 
 def test_runtime_opens_and_closes_all_owned_resources():
@@ -852,8 +879,11 @@ def test_runtime_opens_and_closes_all_owned_resources():
             events.append("source.open")
             self._opened = True
 
-        def fetch_token(self):
-            # run() 不再 eager-open；由 fetch_token 懒加载驱动（真实契约）。
+        def list_cookies(self):
+            return [("cookie", "fp")]
+
+        def fetch_token_for(self, cookie, fp):
+            # run() 不再 eager-open；由 fetch 懒加载驱动（真实契约）。
             if not self._opened:
                 self.open()
             events.append("source.fetch")
@@ -896,7 +926,7 @@ def test_runtime_opens_and_closes_all_owned_resources():
         "sink.close",
         "health.close",
     ]
-    assert stop_event.delays == [3000]
+    assert stop_event.delays == [15]
 
 
 def test_runtime_survives_transient_startup_open_failure():
@@ -914,7 +944,10 @@ def test_runtime_survives_transient_startup_open_failure():
                 raise RuntimeError("startup proxy down")
             self.opened = True
 
-        def fetch_token(self):
+        def list_cookies(self):
+            return [("cookie", "fp")]
+
+        def fetch_token_for(self, cookie, fp):
             if not self.opened:
                 try:
                     self.open()

@@ -30,7 +30,50 @@ def _require_refresh_key(request: Request) -> None:
 
 
 def _cookie_path():
+    # 旧的单 cookie 文件（仅用于向后迁移）
     return token_mgr_module.CONFIG_DIR / "leonardo_cookie.json"
+
+
+def _cookies_path():
+    # 新的多 cookie 文件：按指纹去重的列表，支持多个 Leonardo 账号
+    return token_mgr_module.CONFIG_DIR / "leonardo_cookies.json"
+
+
+def _load_cookies() -> list:
+    """读多 cookie 列表；不存在时从旧单 cookie 文件迁移。返回 [{cookie,fingerprint,updated_at}]。"""
+    path = _cookies_path()
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            items = data.get("cookies") if isinstance(data, dict) else data
+            return [
+                x
+                for x in (items or [])
+                if isinstance(x, dict) and str(x.get("cookie") or "").strip()
+            ]
+        except Exception:  # noqa: BLE001 - 损坏当作空
+            return []
+    old = _cookie_path()
+    if old.exists():
+        try:
+            d = json.loads(old.read_text(encoding="utf-8"))
+            if str(d.get("cookie") or "").strip():
+                return [
+                    {
+                        "cookie": d["cookie"],
+                        "fingerprint": d.get("fingerprint", ""),
+                        "updated_at": d.get("updated_at"),
+                    }
+                ]
+        except Exception:  # noqa: BLE001
+            pass
+    return []
+
+
+def _save_cookies(items: list) -> None:
+    path = _cookies_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"cookies": items}), encoding="utf-8")
 
 
 def extract_better_auth_cookies(raw: str) -> str:
@@ -98,38 +141,76 @@ def validate_leonardo_id_token(token: str, *, now: int) -> dict:
 
 
 def store_leonardo_cookie(raw_cookie: str) -> dict:
-    """抽取 better-auth 三条并落盘，返回 {fingerprint, updated_at}。
+    """抽取 better-auth 三条，按指纹 upsert 进多账号列表（不覆盖其它账号）。
 
-    refresh-key 接口与后台「导入 Leonardo Cookie」共用此实现，避免两套逻辑走偏。
-    非 Leonardo cookie 抛 ValueError。
+    同一 cookie 再次导入只更新时间；不同 cookie（不同账号/新登录）追加为新条目。
+    refresh-key 接口与后台「导入 Leonardo Cookie」共用此实现。非法 cookie 抛 ValueError。
     """
     cookie = extract_better_auth_cookies(raw_cookie)  # 非法时 ValueError
     fingerprint = hashlib.sha256(cookie.encode("utf-8")).hexdigest()
     updated_at = int(time.time())
-    path = _cookie_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {"cookie": cookie, "fingerprint": fingerprint, "updated_at": updated_at}
-        ),
-        encoding="utf-8",
-    )
-    return {"fingerprint": fingerprint, "updated_at": updated_at}
+    items = _load_cookies()
+    for it in items:
+        if it.get("fingerprint") == fingerprint:
+            it["cookie"] = cookie
+            it["updated_at"] = updated_at
+            _save_cookies(items)
+            return {"fingerprint": fingerprint, "updated_at": updated_at, "count": len(items)}
+    items.append({"cookie": cookie, "fingerprint": fingerprint, "updated_at": updated_at})
+    _save_cookies(items)
+    return {"fingerprint": fingerprint, "updated_at": updated_at, "count": len(items)}
+
+
+def replace_leonardo_cookie(raw_cookie: str, old_fingerprint: str) -> dict:
+    """会话 cookie 被上游轮换后回写：把 old_fingerprint 那条替换成新 cookie。
+
+    找不到旧条目则按去重追加。用于 refresher 回写单个账号的轮换 cookie，
+    不影响其它账号。
+    """
+    cookie = extract_better_auth_cookies(raw_cookie)
+    fingerprint = hashlib.sha256(cookie.encode("utf-8")).hexdigest()
+    updated_at = int(time.time())
+    items = _load_cookies()
+    old_fp = str(old_fingerprint or "").strip()
+    for it in items:
+        if old_fp and it.get("fingerprint") == old_fp:
+            it["cookie"] = cookie
+            it["fingerprint"] = fingerprint
+            it["updated_at"] = updated_at
+            _save_cookies(items)
+            return {"fingerprint": fingerprint, "updated_at": updated_at, "count": len(items)}
+    if not any(it.get("fingerprint") == fingerprint for it in items):
+        items.append({"cookie": cookie, "fingerprint": fingerprint, "updated_at": updated_at})
+    _save_cookies(items)
+    return {"fingerprint": fingerprint, "updated_at": updated_at, "count": len(items)}
+
+
+def list_leonardo_cookies() -> list:
+    """全部已导入 cookie（含明文，仅供 refresh-key 接口内部使用）。"""
+    return [
+        {
+            "cookie": it.get("cookie", ""),
+            "fingerprint": it.get("fingerprint", ""),
+            "updated_at": it.get("updated_at"),
+        }
+        for it in _load_cookies()
+    ]
 
 
 def read_leonardo_cookie_status() -> dict:
     """后台展示用的 cookie 状态——只回指纹与时间，绝不回传 cookie 明文。"""
-    path = _cookie_path()
-    if not path.exists():
-        return {"uploaded": False, "fingerprint": "", "updated_at": None}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001 - 文件损坏当作未上传
-        return {"uploaded": False, "fingerprint": "", "updated_at": None}
+    items = _load_cookies()
+    cookies = [
+        {"fingerprint": str(it.get("fingerprint") or ""), "updated_at": it.get("updated_at")}
+        for it in items
+    ]
     return {
-        "uploaded": bool(data.get("cookie")),
-        "fingerprint": str(data.get("fingerprint") or ""),
-        "updated_at": data.get("updated_at"),
+        "uploaded": bool(items),
+        "count": len(items),
+        "cookies": cookies,
+        # 向后兼容旧字段（取第一条）
+        "fingerprint": cookies[0]["fingerprint"] if cookies else "",
+        "updated_at": cookies[0]["updated_at"] if cookies else None,
     }
 
 
@@ -143,6 +224,9 @@ def build_leonardo_token_router(*, token_manager) -> APIRouter:
     ):
         _require_refresh_key(request)
         try:
+            # 带 replace_fingerprint 表示 refresher 回写某账号轮换后的 cookie
+            if req.replace_fingerprint:
+                return replace_leonardo_cookie(req.cookie, req.replace_fingerprint)
             return store_leonardo_cookie(req.cookie)
         except ValueError:
             raise HTTPException(
@@ -150,21 +234,20 @@ def build_leonardo_token_router(*, token_manager) -> APIRouter:
                 detail="cookie must contain better-auth session cookies",
             )
 
+    @router.get("/api/v1/tokens/leonardo/cookies")
+    def get_leonardo_cookies(request: Request):
+        """多账号：返回全部已导入 cookie，供 refresher 逐个刷新。"""
+        _require_refresh_key(request)
+        return {"cookies": list_leonardo_cookies()}
+
     @router.get("/api/v1/tokens/leonardo/cookie")
     def get_leonardo_cookie(request: Request):
+        # 向后兼容：返回第一条（旧版 refresher 单账号用）
         _require_refresh_key(request)
-        path = _cookie_path()
-        if not path.exists():
+        items = list_leonardo_cookies()
+        if not items:
             raise HTTPException(status_code=404, detail="no cookie uploaded")
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            raise HTTPException(status_code=404, detail="no cookie uploaded")
-        return {
-            "cookie": data.get("cookie", ""),
-            "fingerprint": data.get("fingerprint", ""),
-            "updated_at": data.get("updated_at"),
-        }
+        return items[0]
 
     @router.post("/api/v1/tokens/leonardo")
     def upsert_leonardo_token(

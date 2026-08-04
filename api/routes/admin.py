@@ -870,7 +870,7 @@ def build_admin_router(
         return {
             "status": "ok",
             **saved,
-            "message": "已保存；refresher 约 60 秒内自动取新 token 入池",
+            "message": "已保存；refresher 约 15 秒内自动取新 token 入池（支持多账号，不覆盖已导入的）",
         }
 
     @router.post("/api/v1/refresh-profiles/import-cookie-batch")

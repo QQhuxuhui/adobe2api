@@ -594,15 +594,20 @@ document.addEventListener("DOMContentLoaded", async () => {
       const res = await fetch("/api/v1/leonardo/cookie/status");
       if (!res.ok) return;
       const data = await res.json();
-      if (!data.uploaded) {
-        leoCookieStatus.textContent = "当前未上传 Leonardo cookie。";
+      const list = Array.isArray(data.cookies) ? data.cookies : [];
+      if (!data.uploaded || list.length === 0) {
+        leoCookieStatus.textContent = "当前未导入 Leonardo cookie。";
         return;
       }
-      const when = data.updated_at
-        ? new Date(data.updated_at * 1000).toLocaleString()
-        : "-";
+      const lines = list.map((c, i) => {
+        const when = c.updated_at
+          ? new Date(c.updated_at * 1000).toLocaleString()
+          : "-";
+        return `  ${i + 1}. 指纹 ${String(c.fingerprint || "").slice(0, 12)}… · 更新于 ${when}`;
+      });
       leoCookieStatus.textContent =
-        `已上传：指纹 ${String(data.fingerprint).slice(0, 16)}…，更新于 ${when}`;
+        `已导入 ${list.length} 个 Leonardo 账号（新导入约 15 秒内入池）：\n` +
+        lines.join("\n");
     } catch (err) {
       /* 状态展示失败不影响导入 */
     }

@@ -25,6 +25,8 @@ class LeonardoTokenUpsertRequest(BaseModel):
 
 class LeonardoCookieUploadRequest(BaseModel):
     cookie: str = Field(min_length=1, max_length=32768)
+    # 轮换回写时带上旧指纹，只替换该账号那条，不影响其它账号
+    replace_fingerprint: Optional[str] = None
 
 
 class ExportSelectionRequest(BaseModel):

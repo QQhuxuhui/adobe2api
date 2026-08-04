@@ -25,6 +25,9 @@ class RefresherConfig:
     refresh_interval_seconds: int = 3000
     safety_margin_seconds: int = 600
     min_interval_seconds: int = 60
+    # 多账号：每隔这么久瞄一眼 cookie 列表，发现新导入的账号就立刻刷（秒级生效）。
+    # 只做一次轻量 HTTP 拉取；不到期的账号不会真的跑浏览器。
+    poll_interval_seconds: int = 15
     health_host: str = "0.0.0.0"
     health_port: int = 8080
     profile_dir: str = "/profile"
@@ -54,7 +57,10 @@ class RefresherConfig:
         min_interval = _read_int(source, "MIN_INTERVAL_SECONDS", 60)
         safety_margin = _read_int(source, "SAFETY_MARGIN_SECONDS", 600)
         refresh_interval = _read_int(source, "REFRESH_INTERVAL_SECONDS", 3000)
+        poll_interval = _read_int(source, "POLL_INTERVAL_SECONDS", 15)
         health_port = _read_int(source, "HEALTH_PORT", 8080)
+        if poll_interval <= 0:
+            raise ValueError("POLL_INTERVAL_SECONDS must be greater than zero")
         if min_interval <= 0:
             raise ValueError("MIN_INTERVAL_SECONDS must be greater than zero")
         if safety_margin <= min_interval:
@@ -80,6 +86,7 @@ class RefresherConfig:
             refresh_interval_seconds=refresh_interval,
             safety_margin_seconds=safety_margin,
             min_interval_seconds=min_interval,
+            poll_interval_seconds=poll_interval,
             health_host=str(source.get("HEALTH_HOST", "0.0.0.0") or "0.0.0.0").strip(),
             health_port=health_port,
             profile_dir=str(source.get("PROFILE_DIR", "/profile") or "/profile").strip(),

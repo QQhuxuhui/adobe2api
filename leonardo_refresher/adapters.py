@@ -118,7 +118,33 @@ class Adobe2ApiCookieProvider:
             return None
         return cookie, fingerprint
 
-    def store(self, cookie_str: str) -> bool:
+    def fetch_all(self):
+        """多账号：拉取全部已导入 cookie，返回 [(cookie, fingerprint), ...]。空列表＝没导入。"""
+        try:
+            resp = self._session.get(
+                f"{self._base_url}/api/v1/tokens/leonardo/cookies",
+                headers={"X-Leonardo-Refresh-Key": self._refresh_key},
+                timeout=15,
+            )
+        except requests.RequestException as exc:
+            raise RefreshFetchError("network") from exc
+        if resp.status_code == 404:
+            return []
+        if resp.status_code >= 400:
+            raise RefreshFetchError(f"cookie_http_{resp.status_code}")
+        try:
+            data = resp.json()
+        except (TypeError, ValueError) as exc:
+            raise RefreshFetchError("invalid_response") from exc
+        out = []
+        for item in (data or {}).get("cookies") or []:
+            cookie = str((item or {}).get("cookie") or "").strip()
+            fingerprint = str((item or {}).get("fingerprint") or "").strip()
+            if cookie and fingerprint:
+                out.append((cookie, fingerprint))
+        return out
+
+    def store(self, cookie_str: str, replace_fingerprint: Optional[str] = None) -> bool:
         """把浏览器里轮换后的会话 cookie 存回 adobe2api。
 
         better-auth 会轮换 session token；不回写的话，容器重启时会重新注入那份
@@ -128,10 +154,14 @@ class Adobe2ApiCookieProvider:
         cookie = str(cookie_str or "").strip()
         if not cookie:
             return False
+        payload = {"cookie": cookie}
+        if replace_fingerprint:
+            # 只替换该账号那条，不影响其它账号
+            payload["replace_fingerprint"] = str(replace_fingerprint)
         try:
             resp = self._session.post(
                 f"{self._base_url}/api/v1/tokens/leonardo/cookie",
-                json={"cookie": cookie},
+                json=payload,
                 headers={"X-Leonardo-Refresh-Key": self._refresh_key},
                 timeout=15,
             )
@@ -200,8 +230,17 @@ class PlaywrightSessionSource:
         if cookies:
             self._context.add_cookies(cookies)
 
-    def _persist_rotated_cookie(self, loaded_cookie: str) -> None:
-        """会话 cookie 被上游轮换后回写存储，避免重启时注入作废的旧 cookie。"""
+    def list_cookies(self):
+        """多账号：返回全部已导入 cookie [(cookie, fingerprint), ...]。空＝没导入。"""
+        fetch_all = getattr(self._cookie_provider, "fetch_all", None)
+        if callable(fetch_all):
+            return fetch_all()
+        # 兼容只有单 cookie 的旧 provider
+        provided = self._cookie_provider.fetch()
+        return [provided] if provided else []
+
+    def _persist_rotated_cookie(self, loaded_cookie: str, fingerprint: str) -> None:
+        """会话 cookie 被上游轮换后回写存储（只替换该账号那条）。"""
         store = getattr(self._cookie_provider, "store", None)
         if not callable(store):
             return
@@ -211,22 +250,26 @@ class PlaywrightSessionSource:
             return
         if not current or current == str(loaded_cookie or "").strip():
             return
-        if store(current):
-            # 存储已更新，指纹随之变化；置空以便下轮按新 cookie 重新注入
-            self._loaded_fingerprint = None
+        if store(current, replace_fingerprint=fingerprint):
+            # 该账号存储已更新（指纹变了），置空以便下轮重新注入
+            if fingerprint == self._loaded_fingerprint:
+                self._loaded_fingerprint = None
 
     def fetch_token(self) -> str:
+        """单账号：拉第一条 cookie 刷新（向后兼容）。"""
+        provided = self._cookie_provider.fetch()
+        if not provided:
+            raise CookieRequiredError()
+        cookie_str, fingerprint = provided
+        return self.fetch_token_for(cookie_str, fingerprint)
+
+    def fetch_token_for(self, cookie_str: str, fingerprint: str) -> str:
         if self._context is None:
             try:
                 self.open()
             except Exception as exc:
                 self._reset_browser()
                 raise RefreshFetchError("browser_control") from exc
-
-        provided = self._cookie_provider.fetch()
-        if not provided:
-            raise CookieRequiredError()
-        cookie_str, fingerprint = provided
 
         try:
             if fingerprint != self._loaded_fingerprint:
@@ -236,7 +279,7 @@ class PlaywrightSessionSource:
                 )
                 self._loaded_fingerprint = fingerprint
             result = self._page.evaluate(_SESSION_FETCH_SCRIPT)
-            self._persist_rotated_cookie(cookie_str)
+            self._persist_rotated_cookie(cookie_str, fingerprint)
         except Exception as exc:
             if self._is_browser_control_error(exc):
                 self._reset_browser()
