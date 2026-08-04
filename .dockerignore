@@ -19,3 +19,12 @@ config/*.json
 !config/*.example.json
 **/cookie*.json
 **/cookies*.json
+
+# 本地会话记录/登录截图/浏览器 profile（含真实 cookie、账号，绝不进镜像）
+/20??-??-??-*.txt
+canva_login_check.png
+*.png
+leonardo_session.json
+leonardo_auth.json
+browser_profile/
+tests/canva_member_emails_*.txt
