@@ -352,6 +352,31 @@
         </div>
         <p id="logStatsUpdatedAt" class="help" style="margin: 0 0 16px 0;"></p>
 
+        <h3 style="margin: 8px 0 8px 0;">并发 / 排队实时状态</h3>
+        <div class="stats-grid" id="gateStatsGrid">
+          <div class="stat-card">
+            <div class="stat-label">排队等待</div>
+            <div id="gateWaiters" class="stat-value">-</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">在飞请求</div>
+            <div id="gateInflight" class="stat-value">-</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">空闲账号</div>
+            <div id="gateReady" class="stat-value">-</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">冷却中账号</div>
+            <div id="gateCooling" class="stat-value">-</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">总账号 / 容量</div>
+            <div id="gateCapacity" class="stat-value">-</div>
+          </div>
+        </div>
+        <p id="gateStatusLine" class="help" style="margin: 0 0 16px 0;"></p>
+
         <div class="table-wrapper">
           <table id="logsTable">
             <thead>

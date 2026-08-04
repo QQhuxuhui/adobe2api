@@ -1612,12 +1612,19 @@ document.addEventListener("DOMContentLoaded", async () => {
     try {
       const rangeValue = logStatsRange ? String(logStatsRange.value || "today") : "today";
       const modelParam = logsModelFilter ? `&model=${encodeURIComponent(logsModelFilter)}` : "";
-      const [runningResult, logsResult, statsResult, modelsResult] = await Promise.allSettled([
+      const [runningResult, logsResult, statsResult, modelsResult, gateResult] = await Promise.allSettled([
         fetch(`/api/v1/logs/running?limit=200${modelParam}`),
         fetch(`/api/v1/logs?limit=${LOGS_PAGE_SIZE}&page=${logsCurrentPage}${modelParam}`),
         fetch(`/api/v1/logs/stats?range=${encodeURIComponent(rangeValue)}${modelParam}`),
         fetch("/api/v1/logs/models"),
+        fetch("/api/v1/gate-status"),
       ]);
+
+      if (gateResult.status === "fulfilled" && gateResult.value.ok) {
+        renderGateStatus(await gateResult.value.json());
+      } else {
+        renderGateStatus(null);
+      }
 
       if (modelsResult.status === "fulfilled" && modelsResult.value.ok) {
         const modelsData = await modelsResult.value.json();
@@ -1683,6 +1690,41 @@ document.addEventListener("DOMContentLoaded", async () => {
       logModelFilter.appendChild(option);
     });
     logModelFilter.value = logsModelFilter;
+  }
+
+  function renderGateStatus(data) {
+    const g = document.getElementById("gateWaiters");
+    const inflight = document.getElementById("gateInflight");
+    const ready = document.getElementById("gateReady");
+    const cooling = document.getElementById("gateCooling");
+    const capacity = document.getElementById("gateCapacity");
+    const line = document.getElementById("gateStatusLine");
+    if (!g) return;
+    if (!data) {
+      [g, inflight, ready, cooling, capacity].forEach((el) => { if (el) el.textContent = "-"; });
+      if (line) line.textContent = "";
+      return;
+    }
+    // 拆分部署下本容器只有一种账号；把有账号的那一类当主类展示
+    const adobe = data.adobe || {};
+    const leo = data.leonardo || {};
+    const main = (adobe.accounts || 0) >= (leo.accounts || 0) ? adobe : leo;
+    g.textContent = String(data.waiters ?? 0);
+    if (inflight) inflight.textContent = String(main.inflight_total ?? 0);
+    if (ready) ready.textContent = String(main.ready ?? 0);
+    if (cooling) cooling.textContent = String(main.cooling ?? 0);
+    if (capacity) capacity.textContent = `${main.accounts ?? 0} / ${main.capacity ?? 0}`;
+    if (line) {
+      const gateOff = data.gate_enabled === false ? "（闸门已关闭）" : "";
+      const busyList = Array.isArray(main.busy_accounts) && main.busy_accounts.length
+        ? "　忙碌账号: " + main.busy_accounts
+            .map((a) => `${a.email || "?"}×${a.inflight}`)
+            .join("、")
+        : "";
+      line.textContent =
+        `每账号并发上限 ${data.max_inflight_per_account}，队列上限 ${data.queue_size}，`
+        + `排队超时 ${data.queue_timeout_seconds}s ${gateOff}${busyList}`;
+    }
   }
 
   function renderLogStats(stats) {

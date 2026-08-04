@@ -175,6 +175,28 @@ def test_gate_disabled_never_blocks(make_tm, monkeypatch):
     tm.release_lease(l2)
 
 
+def test_gate_status_reports_live_numbers(make_tm, monkeypatch):
+    _cfg(monkeypatch, max_inflight_per_account=1)
+    tm = _pool(make_tm, 3)
+    # 一个占用、一个冷却，剩一个空闲
+    l1, _ = tm.acquire_lease(token_type="adobe")
+    tm.report_rate_limited("adobe-2", retry_after=30)
+
+    st = tm.gate_status()
+    assert st["gate_enabled"] is True
+    assert st["max_inflight_per_account"] == 1
+    a = st["adobe"]
+    assert a["accounts"] == 3
+    assert a["inflight_total"] == 1
+    assert a["cooling"] == 1
+    assert a["ready"] == 1  # 3 - 1忙 - 1冷却
+    assert a["capacity"] == 3
+    assert len(a["busy_accounts"]) == 1 and a["busy_accounts"][0]["inflight"] == 1
+    assert st["waiters"] == 0
+    tm.release_lease(l1)
+    assert tm.gate_status()["adobe"]["inflight_total"] == 0
+
+
 def test_stress_more_threads_than_accounts(make_tm, monkeypatch):
     """压力测试：40 个线程抢 8 个账号，每个持有一小会儿再释放。
     验证：任一时刻单账号在飞≤1，全部完成，无死锁，结束后占用清零。"""

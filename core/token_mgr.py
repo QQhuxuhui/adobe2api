@@ -752,6 +752,68 @@ class TokenManager:
         with self._lock:
             return dict(self._inflight)
 
+    def gate_status(self) -> Dict:
+        """并发闸门 / 排队 的实时快照，供后台页面展示。"""
+        enabled, max_inflight, queue_size, q_timeout = self._gate_config()
+        now = time.time()
+        with self._lock:
+
+            def summarize(is_leo: bool) -> Dict:
+                rows = [
+                    t
+                    for t in self.tokens
+                    if t.get("status") in {"active", "error"}
+                    and ((t.get("type") == "leonardo") == is_leo)
+                ]
+                # 按账号聚合（同账号多行只算一个）
+                by_acct: Dict[str, Dict] = {}
+                for t in rows:
+                    by_acct.setdefault(self._account_key(t), t)
+                keys = list(by_acct.keys())
+                cooling = sum(
+                    1 for k in keys if float(by_acct[k].get("error_until") or 0) > now
+                )
+                inflight_total = sum(self._inflight.get(k, 0) for k in keys)
+                busy = sum(
+                    1 for k in keys if self._inflight.get(k, 0) >= max_inflight
+                )
+                ready = sum(
+                    1
+                    for k in keys
+                    if float(by_acct[k].get("error_until") or 0) <= now
+                    and self._inflight.get(k, 0) < max_inflight
+                )
+                busy_accounts = sorted(
+                    (
+                        {
+                            "email": by_acct[k].get("refresh_profile_email") or "",
+                            "inflight": self._inflight.get(k, 0),
+                        }
+                        for k in keys
+                        if self._inflight.get(k, 0) > 0
+                    ),
+                    key=lambda x: -x["inflight"],
+                )
+                return {
+                    "accounts": len(keys),
+                    "ready": ready,
+                    "cooling": cooling,
+                    "busy": busy,
+                    "inflight_total": inflight_total,
+                    "capacity": len(keys) * max_inflight,
+                    "busy_accounts": busy_accounts,
+                }
+
+            return {
+                "gate_enabled": enabled,
+                "max_inflight_per_account": max_inflight,
+                "queue_size": queue_size,
+                "queue_timeout_seconds": q_timeout,
+                "waiters": self._waiters,
+                "adobe": summarize(False),
+                "leonardo": summarize(True),
+            }
+
     def list_active_account_tokens(self) -> List[Dict]:
         with self._lock:
             items = []

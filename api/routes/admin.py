@@ -176,6 +176,11 @@ def build_admin_router(
             raise HTTPException(status_code=404, detail="error code not found")
         return item
 
+    @router.get("/api/v1/gate-status")
+    def gate_status(request: Request):
+        require_admin_auth(request)
+        return token_manager.gate_status()
+
     @router.get("/api/v1/logs/running")
     def list_running_logs(request: Request, limit: int = 200, model: str = ""):
         require_admin_auth(request)
