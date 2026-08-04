@@ -406,6 +406,16 @@ class RefreshManager:
         lines = [ln for ln in re.split(r"[\r\n]+", str(text or "")) if ln.strip()]
         return len(lines) >= 2 and all(cls._is_single_token(ln) for ln in lines)
 
+    @staticmethod
+    def _looks_like_leonardo_cookie(text: str) -> bool:
+        """判定是否是 Leonardo（better-auth）的会话 cookie。
+
+        Leonardo 账号走的是另一套导入（cookie 上传给 leonardo-refresher），
+        粘进 Adobe 的「Cookie 导入」会让 IMS 发一个没有 user_id 的游客 token，
+        入池后查积分 403，界面只显示「刷新失败」，看不出是粘错了框。
+        """
+        return "__Secure-better-auth.session_token" in str(text or "")
+
     def import_cookie(self, cookie_input, name: Optional[str] = None) -> Dict:
         cookie = self._cookie_string_from_input(cookie_input)
         if not cookie:
@@ -414,6 +424,14 @@ class RefreshManager:
             raise ValueError(
                 "这看起来是 token（Adobe/Leonardo Bearer），不是 Cookie；"
                 "请改用『添加 Token』导入"
+            )
+        if self._looks_like_leonardo_cookie(cookie):
+            raise ValueError(
+                "这是 Leonardo 账号的 cookie，不能用 Adobe 的『Cookie 导入』"
+                "（会导入成没有额度的 Adobe 游客号并提示刷新失败）；"
+                "请改用 Leonardo cookie 上传接口："
+                "POST /api/v1/tokens/leonardo/cookie（头 X-Leonardo-Refresh-Key），"
+                "详见 docs/leonardo-refresh-cookie.md"
             )
         firefly_headers = self._firefly_headers_from_input(cookie_input)
         account = self._account_from_cookie_input(
