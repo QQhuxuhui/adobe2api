@@ -16,6 +16,9 @@ tests/canva_member_emails_*.txt
 # Leonardo bootstrap spike 产出（真实会话/浏览器 profile）
 leonardo_session.json
 leonardo_auth.json
+# 导入用的 Leonardo cookie 文件（含真实会话 cookie，绝不提交）
+leonardo_cookie*.txt
+leonardo_cookies*.txt
 browser_profile/
 canva_login_check.png
 

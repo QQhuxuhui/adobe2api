@@ -12,6 +12,7 @@ from api.routes.leonardo_tokens import (
     read_leonardo_cookie_status,
     replace_leonardo_cookie,
     list_leonardo_cookies,
+    remove_leonardo_cookie,
 )
 
 LEO_COOKIE = (
@@ -72,6 +73,28 @@ def test_reimport_same_cookie_updates_not_duplicates(cookie_dir):
     store_leonardo_cookie(_leo_cookie("acctA"))
     out = store_leonardo_cookie(_leo_cookie("acctA"))  # 同一 cookie 再导
     assert out["count"] == 1  # 不重复
+
+
+def test_remove_cookie_by_fingerprint(cookie_dir):
+    a = store_leonardo_cookie(_leo_cookie("acctA"))
+    store_leonardo_cookie(_leo_cookie("acctB"))
+    out = remove_leonardo_cookie(a["fingerprint"])
+    assert out["removed"] == 1 and out["count"] == 1
+    fps = {c["fingerprint"] for c in list_leonardo_cookies()}
+    assert a["fingerprint"] not in fps
+
+
+def test_remove_cookie_by_prefix(cookie_dir):
+    a = store_leonardo_cookie(_leo_cookie("acctA"))
+    # 后台只展示前 12 位，支持前缀删除
+    out = remove_leonardo_cookie(a["fingerprint"][:12])
+    assert out["removed"] == 1 and out["count"] == 0
+
+
+def test_remove_missing_cookie_is_noop(cookie_dir):
+    store_leonardo_cookie(_leo_cookie("acctA"))
+    out = remove_leonardo_cookie("deadbeef")
+    assert out["removed"] == 0 and out["count"] == 1
 
 
 def test_replace_rotated_cookie_targets_one_account(cookie_dir):

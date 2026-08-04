@@ -185,6 +185,24 @@ def replace_leonardo_cookie(raw_cookie: str, old_fingerprint: str) -> dict:
     return {"fingerprint": fingerprint, "updated_at": updated_at, "count": len(items)}
 
 
+def remove_leonardo_cookie(fingerprint: str) -> dict:
+    """按指纹删除一条已导入的 cookie（用于清理刷不出来的失效账号）。
+
+    支持完整指纹或前缀匹配（后台只展示前 12 位）。返回删除条数与剩余数。
+    """
+    fp = str(fingerprint or "").strip()
+    if not fp:
+        return {"removed": 0, "count": len(_load_cookies())}
+    items = _load_cookies()
+    kept = [
+        it
+        for it in items
+        if not str(it.get("fingerprint") or "").startswith(fp)
+    ]
+    _save_cookies(kept)
+    return {"removed": len(items) - len(kept), "count": len(kept)}
+
+
 def list_leonardo_cookies() -> list:
     """全部已导入 cookie（含明文，仅供 refresh-key 接口内部使用）。"""
     return [

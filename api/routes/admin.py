@@ -839,6 +839,17 @@ def build_admin_router(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
+    @router.delete("/api/v1/leonardo/cookie/{fingerprint}")
+    def leonardo_cookie_remove(fingerprint: str, request: Request):
+        """删除某个已导入的 Leonardo 账号（按指纹，用于清理失效账号）。"""
+        require_admin_auth(request)
+        from api.routes.leonardo_tokens import remove_leonardo_cookie
+
+        result = remove_leonardo_cookie(fingerprint)
+        if not result.get("removed"):
+            raise HTTPException(status_code=404, detail="未找到该账号")
+        return {"status": "ok", **result}
+
     @router.get("/api/v1/leonardo/cookie/status")
     def leonardo_cookie_status(request: Request):
         require_admin_auth(request)

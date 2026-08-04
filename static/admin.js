@@ -595,21 +595,60 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (!res.ok) return;
       const data = await res.json();
       const list = Array.isArray(data.cookies) ? data.cookies : [];
+      leoCookieStatus.innerHTML = "";
       if (!data.uploaded || list.length === 0) {
         leoCookieStatus.textContent = "当前未导入 Leonardo cookie。";
         return;
       }
-      const lines = list.map((c, i) => {
+      const head = document.createElement("div");
+      head.style.marginBottom = "6px";
+      head.textContent = `已导入 ${list.length} 个 Leonardo 账号（新导入约 15 秒内入池）：`;
+      leoCookieStatus.appendChild(head);
+      list.forEach((c, i) => {
+        const row = document.createElement("div");
+        row.style.display = "flex";
+        row.style.alignItems = "center";
+        row.style.gap = "8px";
+        row.style.margin = "2px 0";
         const when = c.updated_at
           ? new Date(c.updated_at * 1000).toLocaleString()
           : "-";
-        return `  ${i + 1}. 指纹 ${String(c.fingerprint || "").slice(0, 12)}… · 更新于 ${when}`;
+        const span = document.createElement("span");
+        span.textContent = `${i + 1}. 指纹 ${String(c.fingerprint || "").slice(0, 12)}… · 更新于 ${when}`;
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "danger";
+        btn.textContent = "删除";
+        btn.style.padding = "1px 8px";
+        btn.addEventListener("click", () => removeLeoCookie(c.fingerprint, btn));
+        row.appendChild(span);
+        row.appendChild(btn);
+        leoCookieStatus.appendChild(row);
       });
-      leoCookieStatus.textContent =
-        `已导入 ${list.length} 个 Leonardo 账号（新导入约 15 秒内入池）：\n` +
-        lines.join("\n");
     } catch (err) {
       /* 状态展示失败不影响导入 */
+    }
+  }
+
+  async function removeLeoCookie(fingerprint, btn) {
+    if (!fingerprint) return;
+    if (!window.confirm("确定删除这个 Leonardo 账号（cookie）？")) return;
+    if (btn) btn.disabled = true;
+    try {
+      const res = await fetch(
+        `/api/v1/leonardo/cookie/${encodeURIComponent(fingerprint)}`,
+        { method: "DELETE" }
+      );
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        window.alert(d.detail || `删除失败（HTTP ${res.status}）`);
+        if (btn) btn.disabled = false;
+        return;
+      }
+      refreshLeoCookieStatus();
+    } catch (err) {
+      window.alert("删除失败");
+      if (btn) btn.disabled = false;
     }
   }
 
