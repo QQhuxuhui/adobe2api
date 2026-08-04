@@ -216,13 +216,19 @@ def _leonardo_public_backend(model_id, enabled: bool):
 
 
 def _record_leonardo_credit_cost(request, result) -> None:
-    """把上游回报的本次积分成本写进请求日志（精确值，来源标 upstream）。"""
-    cost = ((result or {}).get("provider") or {}).get("credit_cost")
+    """把本次单张积分成本写进请求日志。
+
+    来源 upstream=上游回报的精确值；measured=生成前后余额差分实测。
+    """
+    provider = (result or {}).get("provider") or {}
+    cost = provider.get("credit_cost")
     if cost is None:
         return
     try:
         request.state.log_credits_used = float(cost)
-        request.state.log_credits_source = "upstream"
+        request.state.log_credits_source = (
+            provider.get("credit_cost_source") or "measured"
+        )
     except Exception:  # noqa: BLE001 - 记账失败不得影响出图
         pass
 

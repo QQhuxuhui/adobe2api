@@ -80,7 +80,62 @@ def test_generate_images_returns_credit_cost():
     assert out["provider"]["credit_cost"] == 250
 
 
-def test_generate_images_credit_cost_none_when_upstream_silent():
+class _BalanceClient:
+    """上游 apiCreditCost 恒为 null（实测如此）→ 只能用生成前后的余额差分测量。"""
+
+    def __init__(self, balances):
+        self._balances = list(balances)
+        self.balance_calls = 0
+
+    def get_credits(self, token, **kw):
+        self.balance_calls += 1
+        return self._balances.pop(0) if self._balances else None
+
+    def create_generation(self, *a, **kw):
+        return "gen-1"
+
+    def wait_for_completion(self, token, gen_id, **kw):
+        return {"success": True, "images": ["https://cdn/x.jpg"]}
+
+
+def test_generate_images_measures_cost_by_balance_diff():
+    from core.leonardo_generation import generate_images
+
+    client = _BalanceClient([8500, 8250])  # 生成前 8500，生成后 8250
+    out = generate_images(client, "tok", prompt="p", model_id="uuid",
+                          model_slug="gemini-image-2", aspect_ratio="1:1")
+    assert out["provider"]["credit_cost"] == 250
+    assert out["provider"]["credit_cost_source"] == "measured"
+    assert client.balance_calls == 2
+
+
+def test_measured_cost_ignored_when_diff_not_positive():
+    # 余额没变/变大（并发或刷新导致）→ 不记，宁可空着也不记错账
+    from core.leonardo_generation import generate_images
+
+    for balances in ([8500, 8500], [8500, 8600]):
+        out = generate_images(_BalanceClient(balances), "tok", prompt="p",
+                              model_id="uuid", aspect_ratio="1:1")
+        assert out["provider"]["credit_cost"] is None
+
+
+def test_upstream_cost_wins_over_balance_diff():
+    # 上游若回报了 apiCreditCost，以它为准（精确），不用差分
+    from core.leonardo_generation import generate_images
+
+    class _C(_BalanceClient):
+        def create_generation(self, *a, on_cost=None, **kw):
+            if on_cost:
+                on_cost(300)
+            return "gen-1"
+
+    out = generate_images(_C([8500, 8250]), "tok", prompt="p", model_id="uuid",
+                          aspect_ratio="1:1")
+    assert out["provider"]["credit_cost"] == 300
+    assert out["provider"]["credit_cost_source"] == "upstream"
+
+
+def test_generate_images_credit_cost_none_when_no_balance_api():
     from core.leonardo_generation import generate_images
 
     class _Client:

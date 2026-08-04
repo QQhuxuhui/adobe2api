@@ -62,7 +62,8 @@ def test_generate_images_happy_path():
         "generation_id": "gen-9",
         "aspect_ratio": "16:9",
         "model_id": "M1",
-        "credit_cost": None,  # 该 fake 不回报 apiCreditCost
+        "credit_cost": None,  # 该 fake 不回报 apiCreditCost，也无余额接口
+        "credit_cost_source": None,
     }
     # 归一化正确传给 client
     assert client.calls["create"]["aspect_ratio"] == "16:9"

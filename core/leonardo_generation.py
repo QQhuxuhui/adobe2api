@@ -114,6 +114,32 @@ def clamp_quantity(n) -> int:
     return max(1, min(4, value))
 
 
+def _read_balance(client, token: str, deadline) -> Optional[int]:
+    """读出图可用额度；余额查询不消耗积分。任何失败都不得影响出图。"""
+    reader = getattr(client, "get_credits", None)
+    if not callable(reader):
+        return None
+    try:
+        value = reader(token)
+    except Exception:  # noqa: BLE001 - 记账失败不影响出图
+        return None
+    return value if isinstance(value, (int, float)) else None
+
+
+def _measure_cost(client, token: str, before, deadline) -> Optional[int]:
+    """生成前后余额差分 = 本次单张成本。
+
+    差值非正（并发出图/额度刚回补等）时返回 None——宁可不记，也不记错账。
+    """
+    if before is None:
+        return None
+    after = _read_balance(client, token, deadline)
+    if after is None:
+        return None
+    diff = int(before) - int(after)
+    return diff if diff > 0 else None
+
+
 def generate_images(
     client,
     token: str,
@@ -136,8 +162,10 @@ def generate_images(
     aspect = to_aspect(size=size, aspect_ratio=aspect_ratio)
     quantity = clamp_quantity(n)
 
-    # 上游 Generate 直接回报本次积分成本（apiCreditCost），比余额差分精确
+    # 单张积分成本：优先用上游 Generate 回报的 apiCreditCost；实测该字段恒为 null，
+    # 故回退到「生成前后余额差分」实测（余额查询免费，不消耗积分）。
     cost_holder: Dict[str, Any] = {}
+    balance_before = _read_balance(client, token, deadline)
     create_kwargs = {
         "quantity": quantity,
         "model_slug": model_slug,
@@ -162,6 +190,12 @@ def generate_images(
         raise LeonardoGenerationError(str(result.get("error") or "generation failed"))
 
     urls: List[str] = result.get("images") or []
+    credit_cost = cost_holder.get("credit_cost")
+    credit_cost_source = "upstream" if credit_cost is not None else None
+    if credit_cost is None:
+        measured = _measure_cost(client, token, balance_before, deadline)
+        if measured is not None:
+            credit_cost, credit_cost_source = measured, "measured"
     return {
         "created": int(now()),
         "data": [{"url": url} for url in urls],
@@ -169,6 +203,7 @@ def generate_images(
             "generation_id": gen_id,
             "aspect_ratio": aspect,
             "model_id": model_id,
-            "credit_cost": cost_holder.get("credit_cost"),
+            "credit_cost": credit_cost,
+            "credit_cost_source": credit_cost_source,
         },
     }
