@@ -32,6 +32,8 @@ class ConfigManager:
             "retry_on_status_codes": [429, 451, 500, 502, 503, 504],
             "retry_on_error_types": ["timeout", "connection", "proxy"],
             "token_rotation_strategy": "round_robin",
+            # 429 后该账号冷却多久（秒）。上游带 Retry-After 时以 Retry-After 为准。
+            "rate_limit_cooldown_seconds": 60,
             "batch_concurrency": 5,
             "generated_max_size_mb": 1024,
             "generated_prune_size_mb": 200,

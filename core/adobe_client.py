@@ -118,10 +118,28 @@ class UpstreamTemporaryError(AdobeRequestError):
         message: str,
         status_code: Optional[int] = None,
         error_type: str = "",
+        retry_after: Optional[float] = None,
     ):
         super().__init__(message)
         self.status_code = status_code
         self.error_type = str(error_type or "").strip().lower()
+        # 上游 429 带的 Retry-After（秒）。没带就是 None，由调用方回退到配置的冷却时长。
+        self.retry_after = retry_after
+
+
+def retry_after_seconds(resp) -> Optional[float]:
+    """从响应里读 Retry-After（秒）。只认秒数形式，读不出来就返回 None。"""
+    try:
+        raw = str(resp.headers.get("retry-after") or "").strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return None
+    return seconds if seconds > 0 else None
 
 
 class AdobeClient:
@@ -244,7 +262,9 @@ class AdobeClient:
             .strip()
             .lower()
         )
-        if strategy not in {"round_robin", "random"}:
+        if strategy == "lru":
+            strategy = "least_recently_used"
+        if strategy not in {"round_robin", "random", "least_recently_used"}:
             strategy = "round_robin"
         self.token_rotation_strategy = strategy
         if self.proxy:
@@ -1395,6 +1415,7 @@ class AdobeClient:
                     f"video submit failed: {submit_resp.status_code} {submit_resp.text[:300]}",
                     status_code=submit_resp.status_code,
                     error_type="status",
+                    retry_after=retry_after_seconds(submit_resp),
                 )
             raise AdobeRequestError(
                 f"video submit failed: {submit_resp.status_code} {submit_resp.text[:300]}"
@@ -1574,6 +1595,11 @@ class AdobeClient:
             if submit_resp.status_code in (401, 403):
                 break
 
+            # 候选载荷是用来绕开「载荷形状被拒」的（400 一类）。429/451/5xx 跟载荷无关，
+            # 换个形状也救不回来；继续试只会在毫秒内把同一个账号再打几次，限流更解不开。
+            if submit_resp.status_code in (429, 451) or submit_resp.status_code >= 500:
+                break
+
             last_error = submit_resp.text[:300]
 
         if submit_resp is None:
@@ -1602,6 +1628,7 @@ class AdobeClient:
                     f"submit failed: {submit_resp.status_code} {submit_resp.text[:300]}",
                     status_code=submit_resp.status_code,
                     error_type="status",
+                    retry_after=retry_after_seconds(submit_resp),
                 )
             if last_error:
                 raise AdobeRequestError(

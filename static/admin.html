@@ -239,7 +239,14 @@
               <select id="confTokenRotationStrategy" class="input-select">
                 <option value="round_robin">round_robin（始终轮换）</option>
                 <option value="random">random（随机轮换）</option>
+                <option value="least_recently_used">least_recently_used（最久未用优先，最不容易触发限流）</option>
               </select>
+            </div>
+
+            <div class="form-group">
+              <label for="confRateLimitCooldownSeconds">限流冷却 (秒)</label>
+              <input type="number" id="confRateLimitCooldownSeconds" class="input-text" min="0" max="3600" step="1" placeholder="默认 60" />
+              <small>账号收到 429 后暂时不再被选中的时长；上游返回 Retry-After 时以 Retry-After 为准。0 表示不冷却。</small>
             </div>
           </section>
 

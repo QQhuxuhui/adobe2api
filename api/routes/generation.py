@@ -653,7 +653,10 @@ def build_generation_router(
                     on_generated_file_written=on_generated_file_written,
                     set_request_preview=set_request_preview,
                 )
-                token_selector = lambda: token_manager.get_available(token_type="leonardo")
+                token_selector = lambda: token_manager.get_available(
+                    strategy=getattr(client, "token_rotation_strategy", None),
+                    token_type="leonardo",
+                )
             else:
                 def run_once(token: str):
                     def _image_progress_cb(update: dict):
@@ -1275,7 +1278,8 @@ def build_generation_router(
                     operation_name="images.edits",
                     run_once=_run_once_leo,
                     token_selector=lambda: token_manager.get_available(
-                        token_type="leonardo"
+                        strategy=getattr(client, "token_rotation_strategy", None),
+                        token_type="leonardo",
                     ),
                 )
 
@@ -1526,6 +1530,11 @@ def build_generation_router(
                     last_status_code = 401
                     retryable = attempt < max_attempts
                 except upstream_temp_error_cls as exc:
+                    if int(getattr(exc, "status_code", 0) or 0) == 429:
+                        # 账号级限流：冷却这个账号，别让下一个请求立刻又打上去
+                        token_manager.report_rate_limited(
+                            token, getattr(exc, "retry_after", None)
+                        )
                     last_error = str(exc)
                     last_status_code = 503
                     retryable = (

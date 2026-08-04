@@ -718,6 +718,11 @@ def build_video_task_runner(
                 )
                 retryable = attempt < max_attempts
             except upstream_temp_error_cls as exc:
+                if int(getattr(exc, "status_code", 0) or 0) == 429:
+                    # 账号级限流：冷却这个账号，别让下一个请求立刻又打上去
+                    limiter = getattr(token_manager, "report_rate_limited", None)
+                    if callable(limiter):
+                        limiter(token, getattr(exc, "retry_after", None))
                 last_error = exc
                 should_retry = getattr(client, "should_retry_temporary_error", None)
                 retryable = attempt < max_attempts and (

@@ -24,11 +24,16 @@ logger = logging.getLogger(__name__)
 
 class TokenManager:
     ERROR_COOLDOWN_SECONDS = 180
+    # 429 冷却的封顶：无论 Retry-After 说多久，最多冷却这么久（秒）
+    MAX_COOLDOWN_SECONDS = 3600
 
     def __init__(self):
         self._lock = threading.Lock()
         self.tokens: List[Dict] = []
         self._rr_index = 0
+        # 账号内轮换（get_available_for_account）的独立游标，按账号 key 分开，
+        # 不碰全局 _rr_index——否则「只有一行的账号池」会把全局游标夹回 0。
+        self._rr_cursors: Dict[str, int] = {}
         self._unreadable_data_file: Optional[Path] = None
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         self.load()
@@ -49,6 +54,8 @@ class TokenManager:
                         t.setdefault("fails", 0)
                         t.setdefault("added_at", now_ts)
                         t.setdefault("error_until", 0)
+                        # 老库没有这个字段：视为「从未用过」，重启后先轮到它们
+                        t.setdefault("last_used_at", 0)
                     if source == LEGACY_DATA_FILE and not DATA_FILE.exists():
                         self.save()
                     self._unreadable_data_file = None
@@ -136,6 +143,7 @@ class TokenManager:
                 "fails": 0,
                 "added_at": time.time(),
                 "error_until": 0,
+                "last_used_at": 0,
             }
             # 未显式指定 type 时按 token 形态自动判定；meta 含 type 则以其为准
             if not meta or "type" not in meta:
@@ -178,7 +186,10 @@ class TokenManager:
                 target["value"] = value
                 target["status"] = "active"
                 target["fails"] = 0
-                target["error_until"] = 0
+                # 刷新只换了 token 值，账号没变；限流是账号级的，正在冷却中就别清零，
+                # 否则一次自动刷新会把 429 冷却窗口悄悄抹掉。已过期的照常归零。
+                if float(target.get("error_until") or 0) <= now_ts:
+                    target["error_until"] = 0
                 target["updated_at"] = now_ts
                 target["source"] = "auto_refresh"
                 target["auto_refresh"] = True
@@ -198,6 +209,7 @@ class TokenManager:
                 "added_at": now_ts,
                 "updated_at": now_ts,
                 "error_until": 0,
+                "last_used_at": 0,
                 "source": "auto_refresh",
                 "auto_refresh": True,
                 "refresh_profile_id": pid,
@@ -413,6 +425,88 @@ class TokenManager:
                 return any(t.get("type") != "leonardo" for t in active)
             return bool(active)
 
+    @staticmethod
+    def _account_key(t: Dict) -> str:
+        """账号身份。
+
+        同一个账号可能占多行 token（手动导入一行、自动刷新又一行）。上游限流是按
+        账号算的，所以调度也必须按账号来，否则「轮换」会在同一个账号的两行之间空转。
+        """
+        return (
+            str(t.get("account_id") or "").strip()
+            or str(t.get("refresh_profile_id") or "").strip()
+            or str(t.get("value") or "").strip()
+        )
+
+    @staticmethod
+    def _cooldown_seconds() -> float:
+        from core.config_mgr import config_manager
+
+        raw = config_manager.get("rate_limit_cooldown_seconds", 60)
+        try:
+            seconds = float(str(raw).strip())
+        except (TypeError, ValueError):
+            return 60.0
+        return seconds if seconds >= 0 else 60.0
+
+    def _ready_pool_locked(self, active: List[Dict]) -> List[Dict]:
+        """滤掉还在限流冷却里的 token。
+
+        全部都在冷却时不能直接返回空——那会让整个池子暂时不可用；此时退而求其次，
+        交出最早解冻的那个，由上层的重试/报错去处理。
+        """
+        now = time.time()
+        ready = [t for t in active if float(t.get("error_until") or 0) <= now]
+        if ready:
+            return ready
+        return [min(active, key=lambda t: float(t.get("error_until") or 0))]
+
+    def _mark_used_locked(self, chosen: Dict) -> None:
+        """记账号的最近使用时间，同账号的所有行一起更新。
+
+        在「选中」时就打点而不是等请求结束，是为了让正在飞行中的账号立刻显得「刚用过」，
+        并发请求才不会同时落到同一个账号上。
+        """
+        now = time.time()
+        key = self._account_key(chosen)
+        for t in self.tokens:
+            if self._account_key(t) == key:
+                t["last_used_at"] = now
+        self.save()
+
+    def _choose_locked(
+        self, pool: List[Dict], mode: str, cursor_key: str = ""
+    ) -> Dict:
+        if mode in {"least_recently_used", "lru"}:
+            by_account: Dict[str, List[Dict]] = {}
+            for t in pool:
+                by_account.setdefault(self._account_key(t), []).append(t)
+
+            def account_last_used(rows: List[Dict]) -> float:
+                return max(float(r.get("last_used_at") or 0) for r in rows)
+
+            # 账号按「最近一次被用」排序取最旧的；账号内部再取最旧的那一行。
+            # 并列时用 key/id 兜底，保证顺序稳定、可测试。
+            _, rows = min(
+                by_account.items(), key=lambda kv: (account_last_used(kv[1]), kv[0])
+            )
+            return min(
+                rows,
+                key=lambda r: (float(r.get("last_used_at") or 0), str(r.get("id") or "")),
+            )
+        if mode == "random":
+            return random.choice(pool)
+        # round_robin：只在「读」时对当前池子大小取模；写回时**不能**再 % len(pool)，
+        # 否则 get_available_for_account 传进来的单行账号池会把游标夹成 0，
+        # 让默认策略永远塌缩到第一个账号。账号内轮换用各自的游标，不动全局位置。
+        if cursor_key:
+            idx = self._rr_cursors.get(cursor_key, 0) % len(pool)
+            self._rr_cursors[cursor_key] = idx + 1
+        else:
+            idx = self._rr_index % len(pool)
+            self._rr_index = idx + 1
+        return pool[idx]
+
     def _pick_active_token_locked(
         self, strategy: str = "round_robin", token_type: Optional[str] = None
     ) -> Optional[Dict]:
@@ -424,14 +518,9 @@ class TokenManager:
         if not active:
             return None
 
-        chosen = None
         mode = str(strategy or "round_robin").strip().lower()
-        if mode == "random":
-            chosen = random.choice(active)
-        else:
-            idx = self._rr_index % len(active)
-            chosen = active[idx]
-            self._rr_index = (idx + 1) % len(active)
+        chosen = self._choose_locked(self._ready_pool_locked(active), mode)
+        self._mark_used_locked(chosen)
         return chosen
 
     def get_available(
@@ -469,11 +558,11 @@ class TokenManager:
             if not active:
                 return None
             mode = str(strategy or "round_robin").strip().lower()
-            if mode == "random":
-                return random.choice(active)["value"]
-            idx = self._rr_index % len(active)
-            self._rr_index = (self._rr_index + 1) % max(1, len(self.tokens))
-            return active[idx]["value"]
+            chosen = self._choose_locked(
+                self._ready_pool_locked(active), mode, cursor_key=aid
+            )
+            self._mark_used_locked(chosen)
+            return chosen["value"]
 
     def list_active_account_tokens(self) -> List[Dict]:
         with self._lock:
@@ -513,6 +602,47 @@ class TokenManager:
                     t["status"] = "invalid"
                     t["error_until"] = 0
             self.save()
+
+    def report_rate_limited(
+        self, value: str, retry_after: Optional[float] = None
+    ) -> float:
+        """上游 429：让这个账号冷却一段时间，别让下一个请求立刻又打上去。
+
+        限流是账号级的，所以同账号的每一行 token 一起冷却。上游给了 Retry-After 就照它，
+        否则用配置里的 rate_limit_cooldown_seconds。返回实际冷却秒数（0 表示没生效）。
+
+        Retry-After 是上游可控的值，会被写进 tokens.json 持久化，所以要封顶——
+        一个畸形/恶意的头不能把账号封禁几个小时。
+        """
+        token_value = str(value or "").strip()
+        if not token_value:
+            return 0.0
+        try:
+            cooldown = float(retry_after or 0)
+        except (TypeError, ValueError):
+            cooldown = 0.0
+        if cooldown <= 0:
+            cooldown = self._cooldown_seconds()
+        if cooldown <= 0:
+            return 0.0
+        cooldown = min(cooldown, self.MAX_COOLDOWN_SECONDS)
+
+        until = time.time() + cooldown
+        with self._lock:
+            target = None
+            for t in self.tokens:
+                if str(t.get("value") or "").strip() == token_value:
+                    target = t
+                    break
+            if target is None:
+                return 0.0
+            key = self._account_key(target)
+            for t in self.tokens:
+                # 已有更晚的解冻时间就别缩短它
+                if self._account_key(t) == key and float(t.get("error_until") or 0) < until:
+                    t["error_until"] = until
+            self.save()
+        return cooldown
 
     def handle_auth_failure(
         self, value: str, *, refresh_credits: bool = True
@@ -682,6 +812,10 @@ class TokenManager:
                         "fails": t["fails"],
                         "added_at": t["added_at"],
                         "error_until": t.get("error_until", 0),
+                        "cooling_down": bool(
+                            float(t.get("error_until") or 0) > now_ts
+                        ),
+                        "last_used_at": t.get("last_used_at", 0),
                         "source": t.get("source", "manual"),
                         "auto_refresh": bool(t.get("auto_refresh", False)),
                         "refresh_profile_id": t.get("refresh_profile_id"),

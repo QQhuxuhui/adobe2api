@@ -979,6 +979,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const confRetryOnStatusCodes = document.getElementById("confRetryOnStatusCodes");
   const confRetryOnErrorTypes = document.getElementById("confRetryOnErrorTypes");
   const confTokenRotationStrategy = document.getElementById("confTokenRotationStrategy");
+  const confRateLimitCooldownSeconds = document.getElementById("confRateLimitCooldownSeconds");
   const confRefreshIntervalHours = document.getElementById("confRefreshIntervalHours");
   const confBatchConcurrency = document.getElementById("confBatchConcurrency");
   const confGeneratedMaxSizeMb = document.getElementById("confGeneratedMaxSizeMb");
@@ -1144,6 +1145,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           ? data.retry_on_error_types.join(",")
           : "timeout,connection,proxy";
         confTokenRotationStrategy.value = String(data.token_rotation_strategy || "round_robin");
+        confRateLimitCooldownSeconds.value = Number(data.rate_limit_cooldown_seconds ?? 60);
         confRefreshIntervalHours.value = Number(data.refresh_interval_hours || 15);
         currentBatchConcurrency = Math.max(1, Math.min(100, Number(data.batch_concurrency || 5)));
         confBatchConcurrency.value = currentBatchConcurrency;
@@ -1189,6 +1191,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           .map(s => String(s).trim().toLowerCase())
           .filter(Boolean),
         token_rotation_strategy: String(confTokenRotationStrategy.value || "round_robin").trim() || "round_robin",
+        rate_limit_cooldown_seconds: Math.max(0, Math.min(3600, Number(confRateLimitCooldownSeconds.value ?? 60))),
         refresh_interval_hours: Number(confRefreshIntervalHours.value || 15),
         batch_concurrency: Math.max(1, Math.min(100, Number(confBatchConcurrency.value || 5))),
         generated_max_size_mb: Math.max(100, Math.min(102400, Number(confGeneratedMaxSizeMb.value || 1024))),
@@ -1226,8 +1229,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (!Number.isFinite(payload.retry_backoff_seconds) || payload.retry_backoff_seconds < 0 || payload.retry_backoff_seconds > 30) {
         throw new Error("重试退避基数必须是 0-30 的数字");
       }
-      if (!["round_robin", "random"].includes(payload.token_rotation_strategy)) {
+      if (!["round_robin", "random", "least_recently_used"].includes(payload.token_rotation_strategy)) {
         throw new Error("Token 轮换策略无效");
+      }
+      if (!Number.isFinite(payload.rate_limit_cooldown_seconds)) {
+        throw new Error("限流冷却秒数必须是 0-3600 的数字");
       }
 
       const res = await fetch("/api/v1/config", {

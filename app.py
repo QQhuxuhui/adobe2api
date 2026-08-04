@@ -939,8 +939,15 @@ def _run_with_token_retries(
     tried_identities: set[str] = set()
 
     def _identity_of(token_value: str) -> str:
+        # 按账号去重，不是按 token 行：同一个账号可能有两行 token（手动导入 + 自动刷新），
+        # 只看 refresh_profile_id 的话它们是两个身份，429 后重试会立刻打回同一个账号。
+        # 取值顺序与 TokenManager._account_key 保持一致。
         meta = token_manager.get_meta_by_value(token_value)
-        return str(meta.get("refresh_profile_id") or "").strip() or token_value
+        return (
+            str(meta.get("token_account_id") or "").strip()
+            or str(meta.get("refresh_profile_id") or "").strip()
+            or token_value
+        )
 
     def _ensure_deadline() -> None:
         if deadline is not None and time.monotonic() >= deadline:
@@ -1068,6 +1075,12 @@ def _run_with_token_retries(
             retry_error_text = str(err_value)
         except UpstreamTemporaryError as exc:
             last_exc = exc
+            if int(exc.status_code or 0) == 429:
+                # 429 是账号级限流，不是单次请求的偶发失败：给这个账号一个冷却窗口，
+                # 否则下一个请求可能立刻又落回同一个账号，限流就一直解不开。
+                token_manager.report_rate_limited(
+                    token, getattr(exc, "retry_after", None)
+                )
             limited_retry_attempts += 1
             retryable = limited_retry_attempts < max_attempts and client.should_retry_temporary_error(
                 exc

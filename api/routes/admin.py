@@ -659,12 +659,31 @@ def build_admin_router(
             update_data["retry_on_error_types"] = sorted(set(error_types))
         if "token_rotation_strategy" in incoming:
             strategy = str(incoming["token_rotation_strategy"] or "").strip().lower()
-            if strategy not in {"round_robin", "random"}:
+            if strategy == "lru":
+                strategy = "least_recently_used"
+            if strategy not in {"round_robin", "random", "least_recently_used"}:
                 raise HTTPException(
                     status_code=400,
-                    detail="token_rotation_strategy must be one of: round_robin, random",
+                    detail=(
+                        "token_rotation_strategy must be one of: "
+                        "round_robin, random, least_recently_used"
+                    ),
                 )
             update_data["token_rotation_strategy"] = strategy
+        if "rate_limit_cooldown_seconds" in incoming:
+            try:
+                cooldown = int(incoming["rate_limit_cooldown_seconds"])
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail="rate_limit_cooldown_seconds must be an integer between 0 and 3600",
+                )
+            if cooldown < 0 or cooldown > 3600:
+                raise HTTPException(
+                    status_code=400,
+                    detail="rate_limit_cooldown_seconds must be between 0 and 3600",
+                )
+            update_data["rate_limit_cooldown_seconds"] = cooldown
         if "batch_concurrency" in incoming:
             try:
                 batch_concurrency = int(incoming["batch_concurrency"])
