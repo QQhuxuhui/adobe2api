@@ -52,6 +52,30 @@ def _start_playwright():
     return sync_playwright().start()
 
 
+_BETTER_AUTH_ORDER = (
+    "__Secure-better-auth.session_token",
+    "__Secure-better-auth.session_data.0",
+    "__Secure-better-auth.session_data.1",
+)
+
+
+def extract_session_cookie_string(cookies) -> str:
+    """从浏览器上下文 cookie 列表拼出 better-auth 会话串（顺序固定，便于比较）。
+
+    缺 session_token 视为无效（返回空串），避免把半截会话写回存储。
+    """
+    by_name = {}
+    for item in cookies or []:
+        name = str((item or {}).get("name") or "").strip()
+        if name in _BETTER_AUTH_ORDER:
+            by_name[name] = str(item.get("value") or "")
+    if not by_name.get(_BETTER_AUTH_ORDER[0]):
+        return ""
+    return "; ".join(
+        f"{name}={by_name[name]}" for name in _BETTER_AUTH_ORDER if name in by_name
+    )
+
+
 class Adobe2ApiCookieProvider:
     """从 adobe2api 拉取已上传的 Leonardo cookie（refresh key 鉴权）。
 
@@ -93,6 +117,27 @@ class Adobe2ApiCookieProvider:
         if not cookie or not fingerprint:
             return None
         return cookie, fingerprint
+
+    def store(self, cookie_str: str) -> bool:
+        """把浏览器里轮换后的会话 cookie 存回 adobe2api。
+
+        better-auth 会轮换 session token；不回写的话，容器重启时会重新注入那份
+        已作废的原始 cookie，导致 login_required、被迫人工重导账号。
+        回写失败只记为 False，绝不影响本次 token 刷新。
+        """
+        cookie = str(cookie_str or "").strip()
+        if not cookie:
+            return False
+        try:
+            resp = self._session.post(
+                f"{self._base_url}/api/v1/tokens/leonardo/cookie",
+                json={"cookie": cookie},
+                headers={"X-Leonardo-Refresh-Key": self._refresh_key},
+                timeout=15,
+            )
+        except Exception:  # noqa: BLE001 - 回写失败不影响刷新主流程
+            return False
+        return int(getattr(resp, "status_code", 0)) < 400
 
     def close(self) -> None:
         self._session.close()
@@ -155,6 +200,21 @@ class PlaywrightSessionSource:
         if cookies:
             self._context.add_cookies(cookies)
 
+    def _persist_rotated_cookie(self, loaded_cookie: str) -> None:
+        """会话 cookie 被上游轮换后回写存储，避免重启时注入作废的旧 cookie。"""
+        store = getattr(self._cookie_provider, "store", None)
+        if not callable(store):
+            return
+        try:
+            current = extract_session_cookie_string(self._context.cookies())
+        except Exception:  # noqa: BLE001 - 读取失败不影响刷新
+            return
+        if not current or current == str(loaded_cookie or "").strip():
+            return
+        if store(current):
+            # 存储已更新，指纹随之变化；置空以便下轮按新 cookie 重新注入
+            self._loaded_fingerprint = None
+
     def fetch_token(self) -> str:
         if self._context is None:
             try:
@@ -176,6 +236,7 @@ class PlaywrightSessionSource:
                 )
                 self._loaded_fingerprint = fingerprint
             result = self._page.evaluate(_SESSION_FETCH_SCRIPT)
+            self._persist_rotated_cookie(cookie_str)
         except Exception as exc:
             if self._is_browser_control_error(exc):
                 self._reset_browser()
