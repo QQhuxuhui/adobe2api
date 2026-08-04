@@ -684,6 +684,29 @@ def build_admin_router(
                     detail="rate_limit_cooldown_seconds must be between 0 and 3600",
                 )
             update_data["rate_limit_cooldown_seconds"] = cooldown
+        if "concurrency_gate_enabled" in incoming:
+            update_data["concurrency_gate_enabled"] = bool(
+                incoming["concurrency_gate_enabled"]
+            )
+        for _key, _lo, _hi in (
+            ("max_inflight_per_account", 1, 100),
+            ("account_queue_size", 0, 10000),
+            ("account_queue_timeout_seconds", 0, 300),
+        ):
+            if _key in incoming:
+                try:
+                    _val = int(incoming[_key])
+                except Exception:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{_key} must be an integer between {_lo} and {_hi}",
+                    )
+                if _val < _lo or _val > _hi:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{_key} must be between {_lo} and {_hi}",
+                    )
+                update_data[_key] = _val
         if "batch_concurrency" in incoming:
             try:
                 batch_concurrency = int(incoming["batch_concurrency"])

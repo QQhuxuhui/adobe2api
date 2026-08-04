@@ -980,6 +980,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   const confRetryOnErrorTypes = document.getElementById("confRetryOnErrorTypes");
   const confTokenRotationStrategy = document.getElementById("confTokenRotationStrategy");
   const confRateLimitCooldownSeconds = document.getElementById("confRateLimitCooldownSeconds");
+  const confConcurrencyGateEnabled = document.getElementById("confConcurrencyGateEnabled");
+  const confMaxInflightPerAccount = document.getElementById("confMaxInflightPerAccount");
+  const confAccountQueueSize = document.getElementById("confAccountQueueSize");
+  const confAccountQueueTimeoutSeconds = document.getElementById("confAccountQueueTimeoutSeconds");
   const confRefreshIntervalHours = document.getElementById("confRefreshIntervalHours");
   const confBatchConcurrency = document.getElementById("confBatchConcurrency");
   const confGeneratedMaxSizeMb = document.getElementById("confGeneratedMaxSizeMb");
@@ -1146,6 +1150,10 @@ document.addEventListener("DOMContentLoaded", async () => {
           : "timeout,connection,proxy";
         confTokenRotationStrategy.value = String(data.token_rotation_strategy || "round_robin");
         confRateLimitCooldownSeconds.value = Number(data.rate_limit_cooldown_seconds ?? 60);
+        confConcurrencyGateEnabled.value = String(data.concurrency_gate_enabled === false ? "false" : "true");
+        confMaxInflightPerAccount.value = Number(data.max_inflight_per_account ?? 1);
+        confAccountQueueSize.value = Number(data.account_queue_size ?? 100);
+        confAccountQueueTimeoutSeconds.value = Number(data.account_queue_timeout_seconds ?? 25);
         confRefreshIntervalHours.value = Number(data.refresh_interval_hours || 15);
         currentBatchConcurrency = Math.max(1, Math.min(100, Number(data.batch_concurrency || 5)));
         confBatchConcurrency.value = currentBatchConcurrency;
@@ -1192,6 +1200,10 @@ document.addEventListener("DOMContentLoaded", async () => {
           .filter(Boolean),
         token_rotation_strategy: String(confTokenRotationStrategy.value || "round_robin").trim() || "round_robin",
         rate_limit_cooldown_seconds: Math.max(0, Math.min(3600, Number(confRateLimitCooldownSeconds.value ?? 60))),
+        concurrency_gate_enabled: String(confConcurrencyGateEnabled.value) !== "false",
+        max_inflight_per_account: Math.max(1, Math.min(100, Number(confMaxInflightPerAccount.value ?? 1))),
+        account_queue_size: Math.max(0, Math.min(10000, Number(confAccountQueueSize.value ?? 100))),
+        account_queue_timeout_seconds: Math.max(0, Math.min(300, Number(confAccountQueueTimeoutSeconds.value ?? 25))),
         refresh_interval_hours: Number(confRefreshIntervalHours.value || 15),
         batch_concurrency: Math.max(1, Math.min(100, Number(confBatchConcurrency.value || 5))),
         generated_max_size_mb: Math.max(100, Math.min(102400, Number(confGeneratedMaxSizeMb.value || 1024))),

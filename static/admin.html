@@ -248,6 +248,32 @@
               <input type="number" id="confRateLimitCooldownSeconds" class="input-text" min="0" max="3600" step="1" placeholder="默认 60" />
               <small>账号收到 429 后暂时不再被选中的时长；上游返回 Retry-After 时以 Retry-After 为准。0 表示不冷却。</small>
             </div>
+
+            <div class="form-group">
+              <label for="confConcurrencyGateEnabled">并发闸门 + 账号占用锁</label>
+              <select id="confConcurrencyGateEnabled" class="input-select">
+                <option value="true">开启（推荐：一个账号同时只服务限定数量请求，满载排队）</option>
+                <option value="false">关闭（旧行为：不限并发，可能多个请求打到同一账号触发 429）</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label for="confMaxInflightPerAccount">每账号最大并发</label>
+              <input type="number" id="confMaxInflightPerAccount" class="input-text" min="1" max="100" step="1" placeholder="默认 1" />
+              <small>同一个账号最多允许多少个请求同时在跑。Adobe 建议 1。</small>
+            </div>
+
+            <div class="form-group">
+              <label for="confAccountQueueSize">排队队列大小</label>
+              <input type="number" id="confAccountQueueSize" class="input-text" min="0" max="10000" step="1" placeholder="默认 100" />
+              <small>账号全部满载后，最多允许多少个请求排队等待。0 表示不排队、直接返回 503。</small>
+            </div>
+
+            <div class="form-group">
+              <label for="confAccountQueueTimeoutSeconds">排队超时 (秒)</label>
+              <input type="number" id="confAccountQueueTimeoutSeconds" class="input-text" min="0" max="300" step="1" placeholder="默认 25" />
+              <small>排队最长等待时间，应小于上游/反代超时（如 30s）。超时返回 503。</small>
+            </div>
           </section>
 
           <section id="cfg-storage" class="config-cat-pane">

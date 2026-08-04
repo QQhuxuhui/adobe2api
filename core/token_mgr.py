@@ -22,6 +22,29 @@ LEGACY_DATA_FILE = DATA_DIR / "tokens.json"
 logger = logging.getLogger(__name__)
 
 
+class TokenLease:
+    """一次账号占用。持有期间该账号被计入 in-flight，用完必须 release。
+
+    leased=False 表示闸门关闭时的「空租约」——没有真正占用计数，release 是空操作，
+    只是让调用方的代码路径统一。
+    """
+
+    __slots__ = ("token", "account_key", "token_id", "leased")
+
+    def __init__(self, token: str, account_key: str, token_id: str, leased: bool = True):
+        self.token = token
+        self.account_key = account_key
+        self.token_id = token_id
+        self.leased = leased
+
+
+# acquire_lease 的结果原因
+LEASE_OK = "ok"
+LEASE_NO_TOKEN = "no_token"      # 该请求可用的账号已试完/池里没有该类型
+LEASE_QUEUE_FULL = "queue_full"  # 排队人数已达上限，快速失败
+LEASE_TIMEOUT = "timeout"        # 排队等待超时（队列超时或请求 deadline）
+
+
 class TokenManager:
     ERROR_COOLDOWN_SECONDS = 180
     # 429 冷却的封顶：无论 Retry-After 说多久，最多冷却这么久（秒）
@@ -34,6 +57,12 @@ class TokenManager:
         # 账号内轮换（get_available_for_account）的独立游标，按账号 key 分开，
         # 不碰全局 _rr_index——否则「只有一行的账号池」会把全局游标夹回 0。
         self._rr_cursors: Dict[str, int] = {}
+        # 账号在飞占用计数：account_key -> 当前正在执行的请求数。仅存内存，
+        # 进程重启即清零（重启后本来就没有在飞请求）。用同一把锁 + 条件变量
+        # 实现「账号满载→排队等待→有账号释放立刻唤醒」。
+        self._inflight: Dict[str, int] = {}
+        self._gate_cond = threading.Condition(self._lock)
+        self._waiters = 0
         self._unreadable_data_file: Optional[Path] = None
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         self.load()
@@ -449,17 +478,61 @@ class TokenManager:
             return 60.0
         return seconds if seconds >= 0 else 60.0
 
-    def _ready_pool_locked(self, active: List[Dict]) -> List[Dict]:
-        """滤掉还在限流冷却里的 token。
+    @staticmethod
+    def _gate_config():
+        """读并发闸门配置。返回 (enabled, max_inflight_per_account, queue_size, queue_timeout)。"""
+        from core.config_mgr import config_manager
 
-        全部都在冷却时不能直接返回空——那会让整个池子暂时不可用；此时退而求其次，
+        def _int(key, default):
+            try:
+                return int(float(str(config_manager.get(key, default)).strip()))
+            except (TypeError, ValueError):
+                return int(default)
+
+        enabled = bool(config_manager.get("concurrency_gate_enabled", True))
+        max_inflight = _int("max_inflight_per_account", 1)
+        if max_inflight < 1:
+            max_inflight = 1
+        queue_size = _int("account_queue_size", 100)
+        if queue_size < 0:
+            queue_size = 0
+        timeout = _int("account_queue_timeout_seconds", 25)
+        if timeout < 0:
+            timeout = 0
+        return enabled, max_inflight, queue_size, timeout
+
+    def _max_inflight_per_account(self) -> int:
+        _enabled, max_inflight, _q, _t = self._gate_config()
+        # 闸门关时不限并发：用一个很大的值让 in-flight 过滤形同虚设
+        return max_inflight if _enabled else 1_000_000
+
+    def _is_busy(self, t: Dict, max_inflight: int) -> bool:
+        return self._inflight.get(self._account_key(t), 0) >= max_inflight
+
+    def _ready_pool_locked(self, active: List[Dict]) -> List[Dict]:
+        """滤掉还在限流冷却、以及正在被占满的账号。
+
+        全部都在冷却/占满时不能直接返回空——那会让整个池子暂时不可用；此时退而求其次，
         交出最早解冻的那个，由上层的重试/报错去处理。
+        （这是给不排队的 get_available 用的兜底路径；排队逻辑在 acquire_lease 里。）
         """
         now = time.time()
-        ready = [t for t in active if float(t.get("error_until") or 0) <= now]
+        max_inflight = self._max_inflight_per_account()
+        ready = [
+            t
+            for t in active
+            if float(t.get("error_until") or 0) <= now and not self._is_busy(t, max_inflight)
+        ]
         if ready:
             return ready
         return [min(active, key=lambda t: float(t.get("error_until") or 0))]
+
+    def _stamp_used_by_key_locked(self, key: str) -> None:
+        now = time.time()
+        for t in self.tokens:
+            if self._account_key(t) == key:
+                t["last_used_at"] = now
+        self.save()
 
     def _mark_used_locked(self, chosen: Dict) -> None:
         """记账号的最近使用时间，同账号的所有行一起更新。
@@ -467,12 +540,7 @@ class TokenManager:
         在「选中」时就打点而不是等请求结束，是为了让正在飞行中的账号立刻显得「刚用过」，
         并发请求才不会同时落到同一个账号上。
         """
-        now = time.time()
-        key = self._account_key(chosen)
-        for t in self.tokens:
-            if self._account_key(t) == key:
-                t["last_used_at"] = now
-        self.save()
+        self._stamp_used_by_key_locked(self._account_key(chosen))
 
     def _choose_locked(
         self, pool: List[Dict], mode: str, cursor_key: str = ""
@@ -563,6 +631,126 @@ class TokenManager:
             )
             self._mark_used_locked(chosen)
             return chosen["value"]
+
+    def _universe_locked(
+        self, token_type: Optional[str], account_id: str, exclude_accounts
+    ) -> List[Dict]:
+        """该请求「理论上可用」的账号（状态可用、类型匹配、未被本请求试过）。
+        不看在飞/冷却——那是「暂时不可用、将来会恢复」，用于区分「排队等」还是「彻底没号」。
+        """
+        active = [t for t in self.tokens if t.get("status") in {"active", "error"}]
+        if account_id:
+            active = [t for t in active if self._account_key(t) == account_id]
+        elif token_type == "leonardo":
+            active = [t for t in active if t.get("type") == "leonardo"]
+        elif token_type == "adobe":
+            active = [t for t in active if t.get("type") != "leonardo"]
+        if exclude_accounts:
+            active = [t for t in active if self._account_key(t) not in exclude_accounts]
+        return active
+
+    def acquire_lease(
+        self,
+        *,
+        strategy: str = "round_robin",
+        token_type: Optional[str] = "adobe",
+        account_id: Optional[str] = None,
+        exclude_accounts=frozenset(),
+        deadline: Optional[float] = None,
+    ):
+        """占用一个【空闲(非在飞)且非冷却】的账号并返回 (TokenLease, LEASE_OK)。
+
+        没有空闲账号时按队列排队等待，直到有账号释放/解冻、或队列超时/请求 deadline 到、
+        或排队人数已满。deadline 用 time.monotonic() 计时（与调用方一致）。
+
+        返回 (TokenLease, LEASE_OK) 或 (None, 原因)。用完必须调用 release_lease。
+        """
+        enabled, max_inflight, queue_size, q_timeout = self._gate_config()
+        aid = str(account_id or "").strip()
+        mode = str(strategy or "round_robin").strip().lower()
+        started = time.monotonic()
+
+        with self._gate_cond:
+            while True:
+                now = time.time()
+                universe = self._universe_locked(token_type, aid, exclude_accounts)
+                if not universe:
+                    return None, LEASE_NO_TOKEN
+
+                free = [
+                    t
+                    for t in universe
+                    if float(t.get("error_until") or 0) <= now
+                    and self._inflight.get(self._account_key(t), 0) < max_inflight
+                ]
+                if free:
+                    chosen = self._choose_locked(free, mode, cursor_key=aid)
+                    key = self._account_key(chosen)
+                    # 先落盘打点，成功后再记占用：save() 万一抛（磁盘满/文件不可写），
+                    # 占用计数不会被永久加上去而漏还，把账号从池里悄悄抹掉。
+                    self._stamp_used_by_key_locked(key)
+                    if enabled:
+                        self._inflight[key] = self._inflight.get(key, 0) + 1
+                    return (
+                        TokenLease(chosen.get("value"), key, chosen.get("id"), leased=enabled),
+                        LEASE_OK,
+                    )
+
+                # 没有空闲账号了
+                if not enabled:
+                    # 闸门关：不排队，退回旧兜底（返回最早解冻的，即便在飞/冷却）
+                    chosen = self._choose_locked(
+                        self._ready_pool_locked(universe), mode, cursor_key=aid
+                    )
+                    key = self._account_key(chosen)
+                    self._stamp_used_by_key_locked(key)
+                    return TokenLease(chosen.get("value"), key, chosen.get("id"), leased=False), LEASE_OK
+
+                # 闸门开：排队等待。先算各种「等待上限」
+                q_left = (q_timeout - (time.monotonic() - started)) if q_timeout > 0 else None
+                d_left = (deadline - time.monotonic()) if deadline is not None else None
+                if (q_left is not None and q_left <= 0) or (d_left is not None and d_left <= 0):
+                    return None, LEASE_TIMEOUT
+                if self._waiters >= queue_size:
+                    return None, LEASE_QUEUE_FULL
+
+                # 冷却中但没被占满的账号：等到最早解冻时再看一眼
+                thaws = [
+                    float(t.get("error_until") or 0) - now
+                    for t in universe
+                    if float(t.get("error_until") or 0) > now
+                    and self._inflight.get(self._account_key(t), 0) < max_inflight
+                ]
+                next_thaw = min(thaws) if thaws else None
+                # 在飞账号会通过 release 的 notify 唤醒；没有任何定时信号时用 1s 轮询兜底
+                candidates = [w for w in (q_left, d_left, next_thaw) if w is not None and w > 0]
+                wait_for = min(candidates) if candidates else 1.0
+                wait_for = max(0.01, min(wait_for, 5.0))
+
+                self._waiters += 1
+                try:
+                    self._gate_cond.wait(timeout=wait_for)
+                finally:
+                    self._waiters -= 1
+                # 醒来后重新走一圈判断
+
+    def release_lease(self, lease) -> None:
+        """归还账号占用，唤醒一个排队者。对空租约/None 是安全的空操作。"""
+        if lease is None or not getattr(lease, "leased", False):
+            return
+        key = getattr(lease, "account_key", "") or ""
+        with self._gate_cond:
+            cur = self._inflight.get(key, 0)
+            if cur <= 1:
+                self._inflight.pop(key, None)
+            else:
+                self._inflight[key] = cur - 1
+            self._gate_cond.notify_all()
+
+    def inflight_snapshot(self) -> Dict[str, int]:
+        """当前各账号在飞数（调试/监控用）。"""
+        with self._lock:
+            return dict(self._inflight)
 
     def list_active_account_tokens(self) -> List[Dict]:
         with self._lock:

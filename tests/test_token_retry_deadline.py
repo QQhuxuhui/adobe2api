@@ -63,6 +63,26 @@ class FakeTokenManager:
         self.selection_calls += 1
         return self.tokens.pop(0) if self.tokens else None
 
+    def acquire_lease(
+        self,
+        *,
+        strategy=None,
+        token_type=None,
+        account_id=None,
+        exclude_accounts=frozenset(),
+        deadline=None,
+    ):
+        from core.token_mgr import TokenLease, LEASE_OK, LEASE_NO_TOKEN
+
+        # 复用 get_available，保持 selection_calls 计数与测试对它的 monkeypatch 生效
+        tok = self.get_available(strategy=strategy)
+        if not tok:
+            return None, LEASE_NO_TOKEN
+        return TokenLease(tok, tok, tok, leased=False), LEASE_OK
+
+    def release_lease(self, lease) -> None:
+        pass
+
     def get_meta_by_value(self, token: str) -> dict:
         return {"token": token}
 

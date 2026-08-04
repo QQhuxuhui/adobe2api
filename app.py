@@ -39,7 +39,11 @@ from core.adobe_client import (
     QuotaExhaustedError,
     UpstreamTemporaryError,
 )
-from core.token_mgr import token_manager
+from core.token_mgr import (
+    token_manager,
+    LEASE_QUEUE_FULL,
+    LEASE_TIMEOUT,
+)
 from core.config_mgr import config_manager
 from core.credits_tracker import CreditsTracker
 from core.refresh_mgr import refresh_manager
@@ -922,7 +926,8 @@ def _run_with_token_retries(
     operation_name: str,
     run_once: Callable[[str], Any],
     set_request_error_detail: Optional[Callable[..., str]] = None,
-    token_selector: Optional[Callable[[], Optional[str]]] = None,
+    token_type: Optional[str] = "adobe",
+    account_id: Optional[str] = None,
     reraise_domain: bool = False,
     deadline: Optional[float] = None,
 ) -> Any:
@@ -932,22 +937,9 @@ def _run_with_token_retries(
     report_error = set_request_error_detail or _set_request_error_detail
     attempt = 0
     limited_retry_attempts = 0
-    # Dedupe by account identity, not token value: an auto-refresh account whose
-    # cookie refresh succeeds gets a *new* token value, so keying on the raw value
-    # would let the same account be retried forever. profile_id is stable across
-    # refreshes; manual tokens fall back to their value.
-    tried_identities: set[str] = set()
-
-    def _identity_of(token_value: str) -> str:
-        # 按账号去重，不是按 token 行：同一个账号可能有两行 token（手动导入 + 自动刷新），
-        # 只看 refresh_profile_id 的话它们是两个身份，429 后重试会立刻打回同一个账号。
-        # 取值顺序与 TokenManager._account_key 保持一致。
-        meta = token_manager.get_meta_by_value(token_value)
-        return (
-            str(meta.get("token_account_id") or "").strip()
-            or str(meta.get("refresh_profile_id") or "").strip()
-            or token_value
-        )
+    # 已试过的账号（按 account_key 去重）。一个账号在本请求里试过就不再选它，
+    # 避免 429 后重试又打回同一个号。acquire_lease 用它做 exclude。
+    tried_accounts: set[str] = set()
 
     def _ensure_deadline() -> None:
         if deadline is not None and time.monotonic() >= deadline:
@@ -960,27 +952,25 @@ def _run_with_token_retries(
     while True:
         _ensure_deadline()
         attempt += 1
-        token = ""
-        fetch_attempts = 0
-        while not token:
-            _ensure_deadline()
-            fetch_attempts += 1
-            candidate = (
-                token_selector()
-                if token_selector is not None
-                else token_manager.get_available(strategy=client.token_rotation_strategy)
-            )
-            candidate = str(candidate or "").strip()
-            if not candidate:
-                break
-            if _identity_of(candidate) not in tried_identities:
-                token = candidate
-                break
-            if fetch_attempts >= max(1, len(tried_identities) + 1):
-                break
-        if not token:
+        # 占用一个空闲账号（含并发闸门 + 排队）。拿不到时区分是「排队没排到(池满)」
+        # 还是「本请求可用的账号已试完」。
+        lease, lease_reason = token_manager.acquire_lease(
+            strategy=client.token_rotation_strategy,
+            token_type=token_type,
+            account_id=account_id,
+            exclude_accounts=tried_accounts,
+            deadline=deadline,
+        )
+        if lease is None:
+            if lease_reason in (LEASE_QUEUE_FULL, LEASE_TIMEOUT):
+                last_exc = UpstreamTemporaryError(
+                    "All accounts are busy (concurrency gate); please retry later.",
+                    status_code=503,
+                    error_type="pool_saturated",
+                )
             break
-        tried_identities.add(_identity_of(token))
+        token = str(lease.token or "").strip()
+        tried_accounts.add(lease.account_key)
         token_meta = _set_request_token_context(request, token, attempt)
         attempt_started = time.time()
         retryable = False
@@ -1181,6 +1171,9 @@ def _run_with_token_retries(
                 task_status_override="FAILED",
             )
             raise
+        finally:
+            # 无论成功/失败/异常，都要归还账号占用，否则会永久吃掉一个名额
+            token_manager.release_lease(lease)
 
         if retryable:
             logger.warning(

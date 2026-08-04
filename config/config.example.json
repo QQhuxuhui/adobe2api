@@ -14,5 +14,9 @@
   "retry_on_status_codes": [429, 451, 500, 502, 503, 504],
   "retry_on_error_types": ["timeout", "connection", "proxy"],
   "token_rotation_strategy": "round_robin",
-  "rate_limit_cooldown_seconds": 60
+  "rate_limit_cooldown_seconds": 60,
+  "concurrency_gate_enabled": true,
+  "max_inflight_per_account": 1,
+  "account_queue_size": 100,
+  "account_queue_timeout_seconds": 25
 }

@@ -1106,10 +1106,7 @@ def build_gemini_native_router(
                         set_request_error_detail=set_request_error_detail,
                         reraise_domain=True,
                         deadline=deadline,
-                        token_selector=lambda: token_manager.get_available(
-                            strategy=getattr(client, "token_rotation_strategy", None),
-                            token_type="leonardo",
-                        ),
+                        token_type="leonardo",
                     )
                 )
             else:

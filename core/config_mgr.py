@@ -34,6 +34,11 @@ class ConfigManager:
             "token_rotation_strategy": "round_robin",
             # 429 后该账号冷却多久（秒）。上游带 Retry-After 时以 Retry-After 为准。
             "rate_limit_cooldown_seconds": 60,
+            # 并发闸门 + 账号在飞占用锁 + 排队机制
+            "concurrency_gate_enabled": True,
+            "max_inflight_per_account": 1,       # 每个账号最多同时在飞几个请求
+            "account_queue_size": 100,           # 账号满载后最多多少个请求排队等待
+            "account_queue_timeout_seconds": 25, # 排队最长等多久（应 < 反代超时）
             "batch_concurrency": 5,
             "generated_max_size_mb": 1024,
             "generated_prune_size_mb": 200,

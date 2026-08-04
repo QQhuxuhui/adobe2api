@@ -71,8 +71,9 @@ def _make_router(tmp_path: Path, *, leonardo: bool):
     credit_contexts: list[tuple] = []
     tokens = FakeTokenManager(leonardo=leonardo)
 
-    def retry_runner(*, run_once, token_selector=None, **kwargs):
-        token = token_selector() if token_selector is not None else "adobe-token"
+    def retry_runner(*, run_once, token_type="adobe", account_id=None, **kwargs):
+        del account_id, kwargs
+        token = tokens.get_available(token_type=token_type)
         return run_once(token)
 
     api = FastAPI()

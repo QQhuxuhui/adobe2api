@@ -161,9 +161,9 @@ class Harness:
             self.cdn_budgets.append(max_seconds)
             return _Resp(cdn_bytes)
 
-        def retry_runner(*, run_once, token_selector=None, **kwargs):
-            del kwargs
-            token = token_selector() if token_selector is not None else "adobe-token"
+        def retry_runner(*, run_once, token_type="adobe", account_id=None, **kwargs):
+            del kwargs, account_id
+            token = self.tokens.get_available(token_type=token_type)
             return run_once(token)
 
         api = FastAPI()

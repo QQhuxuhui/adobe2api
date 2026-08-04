@@ -653,10 +653,7 @@ def build_generation_router(
                     on_generated_file_written=on_generated_file_written,
                     set_request_preview=set_request_preview,
                 )
-                token_selector = lambda: token_manager.get_available(
-                    strategy=getattr(client, "token_rotation_strategy", None),
-                    token_type="leonardo",
-                )
+                sel_token_type = "leonardo"
             else:
                 def run_once(token: str):
                     def _image_progress_cb(update: dict):
@@ -706,13 +703,13 @@ def build_generation_router(
                         ),
                     }
 
-                token_selector = None
+                sel_token_type = "adobe"
 
             return run_with_token_retries(
                 request=request,
                 operation_name="images.generations",
                 run_once=run_once,
-                token_selector=token_selector,
+                token_type=sel_token_type,
             )
 
         except quota_error_cls:
@@ -1277,10 +1274,7 @@ def build_generation_router(
                     request=request,
                     operation_name="images.edits",
                     run_once=_run_once_leo,
-                    token_selector=lambda: token_manager.get_available(
-                        strategy=getattr(client, "token_rotation_strategy", None),
-                        token_type="leonardo",
-                    ),
+                    token_type="leonardo",
                 )
 
             def _run_once(token: str):
@@ -1894,16 +1888,11 @@ def build_generation_router(
                     )
                 return response_payload
 
-            token_selector = None
-            if entity_account_id:
-                token_selector = lambda: token_manager.get_available_for_account(
-                    entity_account_id, strategy=client.token_rotation_strategy
-                )
             return run_with_token_retries(
                 request=request,
                 operation_name="chat.completions",
                 run_once=_run_once,
-                token_selector=token_selector,
+                account_id=entity_account_id or None,
             )
         except quota_error_cls:
             error_code = str(

@@ -56,6 +56,10 @@ class ConfigUpdateRequest(BaseModel):
     retry_on_error_types: Optional[List[str]] = None
     token_rotation_strategy: Optional[str] = None
     rate_limit_cooldown_seconds: Optional[int] = None
+    concurrency_gate_enabled: Optional[bool] = None
+    max_inflight_per_account: Optional[int] = None
+    account_queue_size: Optional[int] = None
+    account_queue_timeout_seconds: Optional[int] = None
     batch_concurrency: Optional[int] = None
     generated_max_size_mb: Optional[int] = None
     generated_prune_size_mb: Optional[int] = None
