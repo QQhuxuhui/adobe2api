@@ -1216,15 +1216,44 @@ def _run_with_token_retries(
                 detail="Upstream is temporarily unavailable. Please retry later.",
             )
         raise last_exc
+    detail = describe_missing_token(token_manager)
     if reraise_domain:
         raise UpstreamTemporaryError(
-            "No active tokens available in the pool",
+            detail,
             status_code=503,
             error_type="upstream_unavailable",
         )
-    raise HTTPException(
-        status_code=503, detail="No active tokens available in the pool"
-    )
+    raise HTTPException(status_code=503, detail=detail)
+
+
+def describe_missing_token(manager) -> str:
+    """取不到 token 时，说清楚是「池子空」还是「池里的类型不对」。
+
+    只说 "No active tokens" 会把人带偏：池里明明有 Leonardo 账号，用户会以为
+    cookie 没导入成功而反复重导；实际是该接口/模型需要 Adobe（如 /v1/images/edits
+    图片编辑、firefly-*/视频模型，Leonardo 后端不提供）。
+    """
+    probe = getattr(manager, "has_active_token", None)
+    if not callable(probe):
+        return "No active tokens available in the pool"
+    try:
+        has_leo = bool(probe("leonardo"))
+        has_adobe = bool(probe("adobe"))
+    except Exception:  # noqa: BLE001 - 探测失败退回原文案
+        return "No active tokens available in the pool"
+    if has_leo and not has_adobe:
+        return (
+            "池中只有 Leonardo token，但该接口/模型需要 Adobe token"
+            "（图片编辑 /v1/images/edits、firefly-* 与视频模型只支持 Adobe；"
+            "Leonardo 后端仅支持文生图）。请改用文生图接口 /v1/images/generations，"
+            "或在池中加入 Adobe 账号。"
+        )
+    if has_adobe and not has_leo:
+        return (
+            "池中只有 Adobe token，但该请求需要 Leonardo token；"
+            "请在后台用「导入 Leonardo Cookie」加入 Leonardo 账号。"
+        )
+    return "No active tokens available in the pool"
 
 
 def _extract_prompt_from_messages(messages) -> str:
