@@ -1178,6 +1178,11 @@ def build_generation_router(
         if model_id in video_model_catalog:
             return _bad_request("Use /v1/chat/completions for video generation")
 
+        # 与 /v1/images/generations 一致：池里只有 Leonardo token 时，
+        # gpt-image-2 等公开名改用 Leonardo 后端解析；展示仍用公开名。
+        edit_leo_backend = _leonardo_public_backend(
+            model_id, pool_prefers_leonardo(token_manager)
+        )
         try:
             geometry = resolve_image_geometry(
                 {
@@ -1185,13 +1190,13 @@ def build_generation_router(
                     "quality": _field("quality"),
                     "aspect_ratio": _field("aspect_ratio"),
                 },
-                model_id,
+                edit_leo_backend or model_id,
                 input_images,
             )
             ratio = geometry.aspect_ratio
             output_resolution = geometry.output_resolution
-            resolved_model_id = geometry.model_id
-            model_conf = resolve_model(resolved_model_id)
+            resolved_model_id = model_id if edit_leo_backend else geometry.model_id
+            model_conf = resolve_model(geometry.model_id)
         except HTTPException as exc:
             return _openai_image_error_response(
                 request, exc, endpoint="/v1/images/edits", model_label=str(model_id)
@@ -1201,10 +1206,78 @@ def build_generation_router(
         set_request_logging_fields(request, resolved_model_id, prompt)
         set_request_credit_context(request, resolved_model_id, output_resolution)
 
+        edit_is_leonardo = str(
+            model_conf.get("upstream_model") or ""
+        ).startswith("leonardo:")
+
         def _execute():
             set_request_task_progress(
                 request, task_status="IN_PROGRESS", task_progress=0.0
             )
+
+            if edit_is_leonardo:
+                # Leonardo 图生图（omni edit）：上传参考图 → 带 guidances 生成 → 取 CDN 图
+                from core.leonardo_generation import edit_images
+
+                leo_client = leonardo_client or LeonardoClient()
+                leo_slug = str(model_conf.get("upstream_model") or "").split(":", 1)[1]
+
+                def _run_once_leo(token: str):
+                    from core.leonardo_client import LeonardoError
+
+                    try:
+                        result = edit_images(
+                            leo_client,
+                            token,
+                            prompt=prompt,
+                            model_slug=leo_slug or "nano-banana-2",
+                            model_id=str(model_conf.get("upstream_model_id") or ""),
+                            input_images=input_images,
+                            aspect_ratio=ratio,
+                            output_resolution=output_resolution,
+                        )
+                    except LeonardoError as exc:
+                        raise _map_leonardo_error(exc) from exc
+
+                    _record_leonardo_credit_cost(request, result)
+                    items = result.get("data") or []
+                    url = str((items[0] if items else {}).get("url") or "").strip()
+                    if not url:
+                        raise AdobeRequestError("Leonardo returned no image URL")
+                    resp = _fetch_cdn_image(
+                        url, {"User-Agent": "adobe2api/1.0", "Accept": "image/*"}
+                    )
+                    job_id = f"{result['provider']['generation_id']}-0"
+                    out_path = generated_dir / f"{job_id}.png"
+                    generated_dir.mkdir(parents=True, exist_ok=True)
+                    old_size = int(out_path.stat().st_size) if out_path.exists() else 0
+                    out_path.write_bytes(resp.content)
+                    on_generated_file_written(
+                        out_path, old_size, int(out_path.stat().st_size)
+                    )
+                    image_url = public_image_url(request, job_id)
+                    set_request_preview(request, image_url, kind="image")
+                    if response_format == "b64_json":
+                        item = {"b64_json": base64.b64encode(resp.content).decode()}
+                    else:
+                        item = {"url": image_url}
+                    return {
+                        "created": int(time.time()),
+                        "model": resolved_model_id,
+                        "data": [item],
+                        "usage": build_image_usage(
+                            prompt, output_resolution, geometry.usage_ratio, input_images
+                        ),
+                    }
+
+                return run_with_token_retries(
+                    request=request,
+                    operation_name="images.edits",
+                    run_once=_run_once_leo,
+                    token_selector=lambda: token_manager.get_available(
+                        token_type="leonardo"
+                    ),
+                )
 
             def _run_once(token: str):
                 source_image_ids = [

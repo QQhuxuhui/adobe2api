@@ -228,6 +228,76 @@ def build_generate_payload(
     }
 
 
+# --- 图生图（omni edit）---
+# 参数结构取自 Leonardo 前端真实构造并经线上验证：必须带 omni_edit，且**不能**混入
+# 文生图参数(style_ids/modelId/guidance_scale/num_inference_steps/negative_prompt/
+# dimensions)，否则上游一律拒绝。参考图强度只接受 LOW/MID/HIGH。
+def UPLOAD_INIT_IMAGE_QUERY(extension: str = "png") -> Dict[str, Any]:
+    ext = (str(extension or "png").lower().lstrip(".") or "png")
+    return {
+        "operationName": "CreateUploadInitImage",
+        "variables": {},
+        "query": (
+            "mutation CreateUploadInitImage { uploadInitImage(arg1: {extension: \"%s\"}) "
+            "{ id url fields key __typename } }" % ext
+        ),
+    }
+
+
+def parse_init_image_upload(resp: Dict[str, Any]) -> Dict[str, Any]:
+    node = ((resp or {}).get("data") or {}).get("uploadInitImage") or {}
+    image_id = str(node.get("id") or "").strip()
+    url = str(node.get("url") or "").strip()
+    if not image_id or not url:
+        raise LeonardoError("uploadInitImage returned no upload target")
+    try:
+        fields = json.loads(node.get("fields") or "{}")
+    except (TypeError, ValueError) as exc:
+        raise LeonardoError("uploadInitImage returned malformed fields") from exc
+    return {"id": image_id, "url": url, "fields": fields, "key": node.get("key") or ""}
+
+
+def build_edit_payload(
+    prompt: str,
+    model_slug: str,
+    width: int,
+    height: int,
+    init_image_ids: List[str],
+    quantity: int = 1,
+    strength: str = "MID",
+) -> Dict[str, Any]:
+    ids = [str(i).strip() for i in (init_image_ids or []) if str(i).strip()]
+    if not ids:
+        raise ValueError("init_image_ids is required for image edit")
+    return {
+        "operationName": "Generate",
+        "variables": {
+            "request": {
+                "model": model_slug,
+                "parameters": {
+                    "omni_edit": True,
+                    "prompt": (prompt or "").strip(),
+                    "prompt_enhance": "OFF",
+                    "quantity": max(1, min(4, int(quantity))),
+                    "guidances": {
+                        "image_reference": [
+                            {
+                                "image": {"id": image_id, "type": "UPLOADED"},
+                                "strength": strength,
+                            }
+                            for image_id in ids
+                        ]
+                    },
+                    "width": int(width),
+                    "height": int(height),
+                },
+                "public": True,
+            }
+        },
+        "query": _GENERATE_QUERY,
+    }
+
+
 def parse_generation_id(resp: Dict[str, Any]) -> str:
     gen_id = (((resp or {}).get("data") or {}).get("generate") or {}).get("generationId")
     if gen_id:
@@ -436,6 +506,55 @@ class LeonardoClient:
         # available = 出图可用额度；apiCredit/streamTokens 是另一通道，出图扣不到，
         # 单列出来供页面区分展示，绝不能并入 available（否则余额显示会严重虚高）。
         return credit_breakdown(details)
+
+    def upload_init_image(
+        self,
+        token: str,
+        image_bytes: bytes,
+        extension: str = "png",
+        deadline: Optional[float] = None,
+    ) -> str:
+        """上传参考图：申请预签名地址 → POST 到 S3 → 返回 init image id。"""
+        up = parse_init_image_upload(
+            self._call(token, UPLOAD_INIT_IMAGE_QUERY(extension), deadline=deadline)
+        )
+        files = {k: (None, str(v)) for k, v in (up["fields"] or {}).items()}
+        files["file"] = (f"image.{extension}", image_bytes, f"image/{extension}")
+        try:
+            resp = requests.post(up["url"], files=files, timeout=120)
+        except Exception as exc:  # noqa: BLE001 - 传输失败统一转领域错误
+            raise LeonardoError(f"init image upload failed: {exc}") from exc
+        if getattr(resp, "status_code", 0) not in (200, 201, 204):
+            raise LeonardoError(
+                f"init image upload rejected: HTTP {getattr(resp, 'status_code', '?')}"
+            )
+        return up["id"]
+
+    def create_edit_generation(
+        self,
+        token: str,
+        prompt: str,
+        model_slug: str,
+        width: int,
+        height: int,
+        init_image_ids: List[str],
+        quantity: int = 1,
+        deadline: Optional[float] = None,
+        on_cost=None,
+    ) -> str:
+        payload = build_edit_payload(
+            prompt, model_slug, width, height, init_image_ids, quantity
+        )
+        response = self._call(token, payload, deadline=deadline)
+        try:
+            gen_id = parse_generation_id(response)
+        except LeonardoError as exc:
+            raise LeonardoGraphQLError(str(exc), operation="Generate") from exc
+        if on_cost is not None:
+            cost = parse_generation_cost(response)
+            if cost is not None:
+                on_cost(cost)
+        return gen_id
 
     def create_generation(
         self,

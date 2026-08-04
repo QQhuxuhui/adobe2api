@@ -114,6 +114,92 @@ def clamp_quantity(n) -> int:
     return max(1, min(4, value))
 
 
+def _extension_from_mime(mime: str) -> str:
+    ext = str(mime or "").split("/")[-1].split(";")[0].strip().lower()
+    return {"jpg": "jpeg"}.get(ext, ext) or "png"
+
+
+def edit_images(
+    client,
+    token: str,
+    *,
+    prompt: str,
+    model_slug: str,
+    model_id: str,
+    input_images,
+    aspect_ratio: Optional[str] = None,
+    size: Optional[str] = None,
+    output_resolution: str = "2K",
+    timeout: float = 300,
+    poll_interval: int = 4,
+    deadline: Optional[float] = None,
+    now=time.time,
+) -> Dict[str, Any]:
+    """Leonardo 图生图：上传参考图 → omni edit 生成。
+
+    输出尺寸沿用文生图的实测尺寸表（同模型同比例）。
+    """
+    from core.leonardo_client import aspect_to_size
+
+    images = list(input_images or [])
+    if not images:
+        raise LeonardoError("edit requires at least one input image")
+
+    aspect = to_aspect(size=size, aspect_ratio=aspect_ratio)
+    wh = aspect_to_size(aspect, model_slug=model_slug, output_resolution=output_resolution)
+    if wh is None:
+        raise LeonardoError(
+            f"aspect ratio {aspect} is not supported by model {model_slug}"
+        )
+    width, height = wh
+
+    upload_kwargs = {"deadline": deadline} if deadline is not None else {}
+    init_ids = [
+        client.upload_init_image(
+            token, image_bytes, extension=_extension_from_mime(mime), **upload_kwargs
+        )
+        for image_bytes, mime, *_ in images
+    ]
+
+    cost_holder: Dict[str, Any] = {}
+    balance_before = _read_balance(client, token, deadline)
+    create_kwargs = {"on_cost": lambda v: cost_holder.__setitem__("credit_cost", v)}
+    if deadline is not None:
+        create_kwargs["deadline"] = deadline
+    gen_id = client.create_edit_generation(
+        token, prompt, model_slug, width, height, init_ids, **create_kwargs
+    )
+    try:
+        wait_kwargs = {"timeout": timeout, "poll_interval": poll_interval}
+        if deadline is not None:
+            wait_kwargs["deadline"] = deadline
+        result = client.wait_for_completion(token, gen_id, **wait_kwargs)
+    except LeonardoError as exc:
+        raise LeonardoGenerationError(str(exc)) from exc
+    if not result.get("success"):
+        raise LeonardoGenerationError(str(result.get("error") or "generation failed"))
+
+    credit_cost = cost_holder.get("credit_cost")
+    credit_cost_source = "upstream" if credit_cost is not None else None
+    if credit_cost is None:
+        measured = _measure_cost(client, token, balance_before, deadline)
+        if measured is not None:
+            credit_cost, credit_cost_source = measured, "measured"
+
+    return {
+        "created": int(now()),
+        "data": [{"url": url} for url in (result.get("images") or [])],
+        "provider": {
+            "generation_id": gen_id,
+            "aspect_ratio": aspect,
+            "model_id": model_id,
+            "init_image_ids": init_ids,
+            "credit_cost": credit_cost,
+            "credit_cost_source": credit_cost_source,
+        },
+    }
+
+
 def _read_balance(client, token: str, deadline) -> Optional[int]:
     """读出图可用额度；余额查询不消耗积分。任何失败都不得影响出图。"""
     reader = getattr(client, "get_credits", None)
