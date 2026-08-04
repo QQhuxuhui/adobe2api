@@ -19,5 +19,8 @@ leonardo_auth.json
 browser_profile/
 canva_login_check.png
 
+# 会话记录导出（含真实 session cookie / API key，绝不提交）
+/20??-??-??-*.txt
+
 # 部署密钥
 .env
