@@ -21,6 +21,14 @@ _GRAPHQL_QUOTA_REJECTION_CODES = {
     "quota-exhausted",
     "resource-exhausted",
 }
+# Generate 出错默认按「可能已受理」处理(不可重试，防重复扣费)；下列措辞是上游
+# **明确未受理**的拒绝——没建生成任务、不扣积分，可安全重试。
+# "Pending generations limit exceeded" = 账号同时处理中的任务数超上限(并发限制)。
+_SAFE_GENERATE_REJECTIONS = (
+    "pending generations limit",
+    "too many pending",
+    "rate limit",
+)
 _SIZE_TO_ASPECT = {
     "1024x1024": "1:1", "512x512": "1:1", "256x256": "1:1",
     "1792x1024": "16:9", "1536x1024": "16:9",
@@ -53,6 +61,10 @@ def classify_leonardo_error(exc: Exception) -> str:
             return "auth"
         if exc.codes & _GRAPHQL_QUOTA_REJECTION_CODES:
             return "quota"
+        # 并发上限是「明确未受理」的拒绝：上游没建生成任务、不扣积分，可安全重试。
+        # 其余语义不明的 Generate 错误仍按不可重试处理（可能已受理并扣费）。
+        if any(kw in str(exc).lower() for kw in _SAFE_GENERATE_REJECTIONS):
+            return "temp"
         return "unsafe"
     message = str(exc).lower()
     # HTTP 状态优先(网关拒绝，语义明确)

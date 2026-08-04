@@ -307,6 +307,33 @@ def test_classify_leonardo_error():
     assert c(LeonardoError("invalid model requested")) == "temp"
 
 
+def test_pending_limit_is_retryable_not_unsafe():
+    """并发上限是「明确未受理」的拒绝：不扣积分，可安全重试。
+
+    Generate 出错默认按 unsafe(不可重试 500)处理是为了防重复扣费，但这条错误
+    上游根本没建生成任务，按 unsafe 处理会让下游白白拿到 500。
+    """
+    from core.leonardo_client import LeonardoGraphQLError
+    from core.leonardo_generation import classify_leonardo_error
+
+    exc = LeonardoGraphQLError(
+        "Pending generations limit exceeded", operation="Generate"
+    )
+    assert classify_leonardo_error(exc) == "temp"
+    mapped = _map_leonardo_error(exc)
+    assert mapped.status_code == 503  # 可重试
+
+
+def test_other_generate_errors_stay_unsafe():
+    # 语义不明的 Generate 错误仍按不可重试处理（可能已受理并扣费）
+    from core.leonardo_client import LeonardoGraphQLError
+    from core.leonardo_generation import classify_leonardo_error
+
+    assert classify_leonardo_error(
+        LeonardoGraphQLError("An error occurred.", operation="Generate")
+    ) == "unsafe"
+
+
 def test_temp_error_is_retryable_has_status():
     # #1(b)：temp 必须带可重试 status_code，否则 should_retry_temporary_error → False
     from core.leonardo_client import LeonardoError
