@@ -60,11 +60,15 @@ FastAPI 同步接口在线程池并发运行,导入/删除/状态回报/余额�
 - `status_view() -> {logins:[{id,email,status,fail_count,last_error_kind,updated_at,last_attempt_at}], count, yescaptcha_balance, balance_at, thresholds:{fail_count, yescaptcha_balance}}`(**无密码**)。
   阈值取后端模块常量(`FAIL_ALERT_THRESHOLD=3`、`BALANCE_ALERT_THRESHOLD=1000`),**日志告警与前端共用同一来源**,避免只改一边。
 - `remove(id) -> {removed,count}`。
-- `report(id, status, last_error_kind=None, balance=None) -> None`:一次事务(只 save 一次)。**固定状态转换**:
-  - `ok` → `fail_count=0`、**`last_error_kind=None`(显式清旧错,避免恢复后还挂 password/captcha)**;
+- `report(id, credential_rev, status, last_error_kind=None, balance=None) -> {updated, reason?}`:一次事务(只 save 一次)。
+  **陈旧回报保护(防 TOCTOU)**:refresher 用旧 rev 登录期间管理员改了密码(rev+1、pending),旧任务的迟到回报**不得**
+  覆盖新 pending——仅当 `credential_rev == 该账号当前 rev` 才更新账号状态,否则返回 `{updated:false, reason:"stale_revision"}`。
+  **固定状态转换**(rev 匹配时):
+  - `ok` → `fail_count=0`、**`last_error_kind=None`(显式清旧错)**;
   - `login_required` → `fail_count+=1`、`last_error_kind=<新错误>`;
   - (`pending` 只由导入 / 改密码产生,不经 report。)
-  给了 `balance` 就更新 `yescaptcha_balance`/`balance_at`(float);并做阈值跨越告警日志(见 ④)。
+  **余额与账号 rev 无关**:给了 `balance` 就更新 `yescaptcha_balance`/`balance_at`(float),**即使 rev 陈旧也接收**;
+  并做阈值跨越告警日志(见 ④)。
 
 ## ② 端点
 
@@ -75,12 +79,12 @@ FastAPI 同步接口在线程池并发运行,导入/删除/状态回报/余额�
 
 **refresh-key 端点**(`leonardo_tokens.py`,`X-Leonardo-Refresh-Key` 鉴权):
 - `GET  /api/v1/tokens/leonardo/logins` → `{logins: list_for_refresher()}`
-- `POST /api/v1/tokens/leonardo/login/report` body `{id,status,last_error_kind?,balance?}` → `report`
+- `POST /api/v1/tokens/leonardo/login/report` body `{id,credential_rev,status,last_error_kind?,balance?}` → `report`(返回 `{updated,reason?}`)
 
 ## ③ refresher
 
 - `Adobe2ApiCookieProvider`:加 `fetch_logins()`(GET `.../logins`,返回含 password+credential_rev)、
-  `report_login(id,status,last_error_kind=None,balance=None)`(POST `.../login/report`)。网络/HTTP 错误
+  `report_login(id,credential_rev,status,last_error_kind=None,balance=None)`(POST `.../login/report`)。网络/HTTP 错误
   归为可重试、**不打断刷新主流程**;登录端点拉取失败**不得影响 cookie 账号继续刷新**。
 - `list_cookies()` 登录账号来源(**不做无条件 union**,否则同邮箱既有存储 UUID 又有 env 哈希 ID → 两个 context
   → 会话轮换污染,违反"每账号一 context"`adapters.py:205`):
@@ -94,8 +98,9 @@ FastAPI 同步接口在线程池并发运行,导入/删除/状态回报/余额�
   并 `source.drop_context(cid)` → 本轮立即重登验证新密码。**cookie 账号不走此逻辑**(其指纹变化是正常轮换,清了会误刷)。
 - `PlaywrightSessionSource.drop_context(cid)`:关闭并移除 `self._accounts[cid]`。**删除账号回收**:被删 cid 不再出现在
   list → service prune 阶段对缺席 cid 调 `drop_context` → 避免频繁导入/删除积累 context。
-- `_fetch_token_login`:成功 → `report_login(id,"ok",balance=bal)`;失败按异常映射 `last_error_kind`
-  → `report_login(id,"login_required",kind,bal)`。fail_count 全由存储维护,refresher 不记忆计数。
+- `_fetch_token_login(cid, email, password, credential_rev)`(rev 从 fingerprint `LOGIN_MARKER:rev` 解出):
+  成功 → `report_login(id, rev, "ok", balance=bal)`;失败按异常映射 → `report_login(id, rev, "login_required", kind, bal)`。
+  fail_count 全由存储维护;rev 陈旧时存储拒绝更新账号状态(仍收余额)。
 - 余额:**每次登录尝试都独立调一次 `getBalance`**(与验证码成功/失败无关——余额耗尽时 `createTask` 恰好会失败,
   正是此刻更要查到低余额、触发告警);`getBalance` 自身失败则 balance 传 `None`、保留旧值。随 `report_login` 上报。
 
@@ -108,28 +113,31 @@ FastAPI 同步接口在线程池并发运行,导入/删除/状态回报/余额�
   `last_error_kind` + 删除钮(调 DELETE)。
 - 顶部:**YesCaptcha 余额**(`< 阈值` 红字 + "余额偏低,请充值")。
 - **状态获取时机**:不只弹窗打开——**页面加载 + Token 列表刷新时**一并拉 `login/status`(否则是查询、不像告警)。
-- 阈值(前端常量,易改):`fail_count ≥ 3` 红;`balance < 1000` 红(YesCaptcha 单位=积分,1 元 = 1000 积分,
-  <1000 约剩几十次解码)。
+- 阈值:前端**只读 `status_view` 返回的 `data.thresholds`**(不再保留独立常量),字段缺失时才用兼容默认
+  `{fail_count:3, yescaptcha_balance:1000}`。红标:`fail_count ≥ thresholds.fail_count`;`balance < thresholds.yescaptcha_balance`
+  (YesCaptcha 单位=积分,1 元 = 1000 积分)。
 
 **日志告警**(在存储 `report()` 内,**仅状态跨阈值时记一行,避免每次 report 刷屏**):
-- 某账号 `fail_count` 首次达到 3(连续登录失败)
-- 失败账号恢复 `ok`
-- 余额首次跌破阈值
-- 余额恢复到阈值以上
+- 某账号 `fail_count` 首次达到 `FAIL_ALERT_THRESHOLD`(连续登录失败)。
+- **仅当旧 `fail_count ≥ 阈值` 后恢复 `ok`** 才记恢复(一两次失败后恢复不记告警)。
+- 余额**跌破阈值**(含**首次取得余额时即已低于阈值**,也记一次低余额告警)。
+- 余额从低于恢复到阈值以上。
+- **未取得新余额(`balance=None`)时不改变已有告警状态**(不误报恢复)。
 
 ## ⑤ 请求模型与校验(Pydantic)
 
 - `POST /api/v1/leonardo/login`:独立模型 `{text: str}`,限制长度(如 ≤ 200KB,防超大 body)。
-- `POST .../login/report`:`{id:str, status:Literal["ok","login_required"], last_error_kind:Optional[Literal["password","captcha","proxy","upstream"]], balance:Optional[float]}`;
-  校验 status/last_error_kind 枚举、balance 为有限非负数(YesCaptcha 官方为 Decimal → 用 float/Decimal,不用 int)。
+- `POST .../login/report`:`{id:str, credential_rev:int, status:Literal["ok","login_required"], last_error_kind:Optional[Literal["password","captcha","proxy","upstream"]], balance:Optional[float]}`;
+  **条件校验**(Pydantic model_validator):`login_required` **必须**带 `last_error_kind`;`ok` **必须**省略/为 null。
+  校验枚举、`credential_rev` 非负整数、balance 有限非负(YesCaptcha 官方为 Decimal → 用 float/Decimal,不用 int);存储层再次强制 `ok` 清空旧错误。
 - **密码不出现在管理端响应、`status_view`、日志、导出中**;refresh-key `/logins` 因 refresher 登录**必须**返回密码
   (属内部信任通道);`[leo-login]` 只打邮箱前缀。
 
 ## 数据流
 
 导入(admin)→ `LeonardoLoginStore` → refresher `fetch_logins`(含 rev)→ 登录/续期 → `report_login`
-(status + last_error_kind + balance)→ store 一次事务更新 → 后台 `login/status` 显示。改密码 → rev+1 →
-refresher 下轮清 _known/context → 立即重登验证。
+(id + **rev** + status + last_error_kind + balance)→ store 一次事务更新(**rev 不匹配则拒改账号状态、仍收余额**)
+→ 后台 `login/status` 显示。改密码 → rev+1 → refresher 下轮清 _known/context → 立即重登验证。
 
 ## 错误处理
 
@@ -156,10 +164,13 @@ refresher 下轮清 _known/context → 立即重登验证。
 - 验证码失败(createTask 失败)**仍上报低余额**(getBalance 独立于 solve)。
 - `report("ok")` **清空** 旧 `last_error_kind`;`login_required` 累加 fail_count。
 - 端点返回**空列表**(成功但无账号)→ **不回退 env**(空是有效成功,非失败)。
+- **陈旧 rev 回报**:改密码后(rev=2、pending),用 rev=1 report → 返回 `stale_revision`、不改 status/fail_count;但**余额仍被接收**。
+- report 条件校验:`login_required` 缺 `last_error_kind` → 422;`ok` 带 `last_error_kind` → 422。
+- 告警日志:仅 `fail_count` 跨 3、仅旧≥3 后恢复、首次余额已低于阈值、`balance=None` 不改告警态。
 
 ## 部署
 
-- adobe2api 改了 routes + 存储 + 前端 → 构建 v52;refresher 改了 adapters/provider → v10。
+- adobe2api 改了 routes + 存储 + 前端 → 构建 v52;refresher 改了 **adapters/provider + service.py**(凭据 rev 清 _known/context 的 gate 逻辑在 service)→ v10。
 - **安全顺序**(端点成功但列表为空**不回退 env**,故必须先导入再升级 refresher,否则账号池瞬时清空):
   ①部署 adobe2api v52 → ②refresher **保持 v9 运行** → ③后台导入并确认账号入库 → ④部署 refresher v10 →
   ⑤清 .env 里 `LEONARDO_LOGIN_ACCOUNTS`。`--no-deps` 单独重建;`config/` 已持久化,无需新 volume。
