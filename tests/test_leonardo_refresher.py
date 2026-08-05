@@ -547,7 +547,19 @@ class _BrowserPage:
         self.fetch_result = fetch_result
         self.goto_calls = []
         self.evaluate_calls = []
+        self.route_calls = []
+        self.unroute_calls = []
+        self.request_handlers = []
         self.closed = False
+
+    def on(self, event, handler):
+        self.request_handlers.append((event, handler))
+
+    def route(self, pattern, handler):
+        self.route_calls.append(pattern)
+
+    def unroute(self, pattern):
+        self.unroute_calls.append(pattern)
 
     def goto(self, url, **kwargs):
         self.goto_calls.append({"url": url, **kwargs})
@@ -1068,3 +1080,197 @@ def test_runtime_closes_remaining_resources_when_one_close_fails():
         )
 
     assert events == ["source.close", "sink.close", "health.close"]
+
+
+# ---- 自动登录（email/password + YesCaptcha 解 Turnstile 铸新会话）----
+
+from leonardo_refresher.adapters import LOGIN_MARKER
+from leonardo_refresher.config import playwright_proxy, _parse_login_accounts
+
+
+def test_config_parses_login_accounts_json():
+    accs = _parse_login_accounts('[{"email":"a@b.co","password":"pw1"},{"email":"c@d.co","password":"pw2"}]')
+    assert accs == (("a@b.co", "pw1"), ("c@d.co", "pw2"))
+    assert _parse_login_accounts("") == ()
+    assert _parse_login_accounts("not json") == ()
+    # 缺字段的条目跳过
+    assert _parse_login_accounts('[{"email":"x@y.z"}]') == ()
+
+
+def test_playwright_proxy_splits_auth():
+    assert playwright_proxy("http://user:pass@1.2.3.4:7260") == {
+        "server": "http://1.2.3.4:7260", "username": "user", "password": "pass"}
+    assert playwright_proxy("http://1.2.3.4:8080") == {"server": "http://1.2.3.4:8080"}
+    assert playwright_proxy("") is None
+
+
+def _login_config(**kw):
+    base = dict(
+        adobe2api_base_url="http://adobe2api:6001", refresh_key="k", proxy="",
+        account_label="Primary", refresh_interval_seconds=3000,
+        safety_margin_seconds=600, min_interval_seconds=60, poll_interval_seconds=15,
+        login_accounts=(("a@b.co", "pw"),), yescaptcha_key="yc-key",
+    )
+    base.update(kw)
+    return RefresherConfig(**base)
+
+
+class _LoginCtx:
+    """模拟登录用上下文：未登录时 get-session 返回 null，signin 后种下会话 cookie。"""
+    def __init__(self):
+        self.logged_in = False
+        self.init_scripts = []
+        self.closed = False
+
+    def add_init_script(self, s):
+        self.init_scripts.append(s)
+
+    def clear_cookies(self):
+        pass
+
+    def add_cookies(self, c):
+        pass
+
+    def cookies(self, *a, **k):
+        if not self.logged_in:
+            return []
+        return [
+            {"name": "__Secure-better-auth.session_token", "value": "tok.sig"},
+            {"name": "__Secure-better-auth.session_data.0", "value": "p0"},
+            {"name": "__Secure-better-auth.session_data.1", "value": "p1"},
+        ]
+
+    def new_page(self):
+        return _LoginPage(self)
+
+    def close(self):
+        self.closed = True
+
+
+class _LoginPage:
+    def __init__(self, ctx):
+        self.ctx = ctx
+
+    def on(self, e, h):
+        pass
+
+    def route(self, p, h):
+        pass
+
+    def unroute(self, p):
+        pass
+
+    def goto(self, u, **k):
+        pass
+
+    def evaluate(self, expr, arg=None):
+        if "sign-in/email" in expr:  # _SIGNIN_SCRIPT → 模拟登录成功
+            self.ctx.logged_in = True
+            return {"status": 200, "body": "{}"}
+        # _SESSION_FETCH_SCRIPT
+        if self.ctx.logged_in:
+            return {"status": 200, "content_type": "application/json",
+                    "body": json.dumps({"session": {"accessToken": "fresh-jwt"}})}
+        return {"status": 200, "content_type": "application/json", "body": "null"}
+
+    def close(self):
+        pass
+
+
+class _LoginBrowser:
+    def __init__(self):
+        self.contexts = []
+        self.closed = False
+
+    def new_context(self, **k):
+        c = _LoginCtx()
+        self.contexts.append(c)
+        return c
+
+    def close(self):
+        self.closed = True
+
+
+class _LoginChromium:
+    def __init__(self, browser):
+        self.browser = browser
+        self.calls = []
+
+    def launch(self, **k):
+        self.calls.append(k)
+        return self.browser
+
+
+class _LoginPlaywright:
+    def __init__(self, browser):
+        self.chromium = _LoginChromium(browser)
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+
+
+class _EmptyProvider:
+    def fetch_all(self):
+        return []
+
+
+def _login_source(config=None):
+    browser = _LoginBrowser()
+    pw = _LoginPlaywright(browser)
+    src = PlaywrightSessionSource(
+        config=config or _login_config(),
+        cookie_provider=_EmptyProvider(),
+        playwright_factory=lambda: pw,
+    )
+    return src, pw, browser
+
+
+def test_login_account_appears_in_list_cookies():
+    src, _, _ = _login_source()
+    entries = src.list_cookies()
+    login = [e for e in entries if e[2] == LOGIN_MARKER]
+    assert len(login) == 1
+    cid, cstr, fp = login[0]
+    assert cid.startswith("login:")
+    assert cstr == "a@b.co\npw"  # email\npassword
+
+
+def test_login_account_logs_in_then_returns_token(monkeypatch):
+    src, pw, browser = _login_source()
+    monkeypatch.setattr(src, "_solve_turnstile", lambda sk: "turnstile-tok")
+    src.open()
+    cid, cstr, fp = [e for e in src.list_cookies() if e[2] == LOGIN_MARKER][0]
+    token = src.fetch_token_for(cid, cstr, fp)
+    assert token == "fresh-jwt"                 # 首次 get-session=null→登录→再取成功
+    assert browser.contexts[0].logged_in is True
+
+
+def test_login_account_reuses_live_session_without_solving(monkeypatch):
+    src, pw, browser = _login_source()
+    # 让上下文一开始就"已登录"（会话仍活），则不应触发解码/登录
+    calls = {"solve": 0}
+    monkeypatch.setattr(src, "_solve_turnstile", lambda sk: calls.__setitem__("solve", calls["solve"] + 1) or "t")
+    src.open()
+    cid, cstr, fp = [e for e in src.list_cookies() if e[2] == LOGIN_MARKER][0]
+    src._accounts[cid] = {"context": browser.new_context(), "fp": LOGIN_MARKER}
+    src._accounts[cid]["context"].logged_in = True
+    token = src.fetch_token_for(cid, cstr, fp)
+    assert token == "fresh-jwt"
+    assert calls["solve"] == 0                  # 会话活着 → 不解码不登录
+
+
+def test_login_failure_when_turnstile_unsolved(monkeypatch):
+    src, _, _ = _login_source()
+    monkeypatch.setattr(src, "_solve_turnstile", lambda sk: None)  # 解码失败
+    src.open()
+    cid, cstr, fp = [e for e in src.list_cookies() if e[2] == LOGIN_MARKER][0]
+    with pytest.raises(LoginRequiredError):
+        src.fetch_token_for(cid, cstr, fp)
+
+
+def test_login_source_uses_authenticated_proxy():
+    cfg = _login_config(proxy="http://u:p@9.9.9.9:7000")
+    src, pw, _ = _login_source(config=cfg)
+    src.open()
+    assert pw.chromium.calls[0]["proxy"] == {"server": "http://9.9.9.9:7000", "username": "u", "password": "p"}

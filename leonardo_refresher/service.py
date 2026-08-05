@@ -8,6 +8,10 @@ from typing import Callable
 from leonardo_refresher.config import RefresherConfig
 
 MAX_BROWSER_CONTROL_FAILURES = 3
+# 失效账号(掉登录/坏 token)的最短重试间隔：避免死号每 15s 各自硬刷一次浏览器，
+# 既降负荷，也减少机房 IP 高频请求进一步触发上游风控。瞬时错误(网络/代理/浏览器控制)
+# 不退避，仍每轮重试。
+FAILURE_BACKOFF_SECONDS = 120
 
 
 class BrowserControlUnavailableError(RuntimeError):
@@ -187,6 +191,8 @@ class RefresherService:
         self.now = now
         # fingerprint -> 已知 token 过期时间；决定某账号是否需要再刷
         self._known = {}
+        # cid -> 最早可再次尝试的时间戳；失效账号退避，避免每 15s 猛刷
+        self._retry_after = {}
         self._browser_control_this_pass = False
 
     def run_once(self) -> int:
@@ -206,6 +212,7 @@ class RefresherService:
             self.state.set_global_error("cookie_required")
             self.state.prune(set())
             self._known.clear()
+            self._retry_after.clear()
             return self.config.poll_interval_seconds
 
         self.state.set_global_error(None)
@@ -214,12 +221,19 @@ class RefresherService:
         for cid in list(self._known):
             if cid not in present:
                 self._known.pop(cid, None)
+        for cid in list(self._retry_after):
+            if cid not in present:
+                self._retry_after.pop(cid, None)
 
         now = int(self.now())
         for cid, cookie_str, fingerprint in cookies:
             known_exp = self._known.get(cid)
-            # 新账号，或距过期不足安全边界 → 需要刷新；否则跳过（不跑浏览器）
+            # 已健康且距过期还足够 → 跳过（不跑浏览器）
             if known_exp is not None and (known_exp - now) >= self.config.safety_margin_seconds:
+                continue
+            # 失效账号退避：掉登录/坏 token 的账号在退避期内不重试，避免每 15s 猛刷
+            retry_at = self._retry_after.get(cid)
+            if retry_at is not None and now < retry_at:
                 continue
             self._refresh_one(cid, cookie_str, fingerprint)
 
@@ -229,11 +243,13 @@ class RefresherService:
         try:
             token = self.source.fetch_token_for(cid, cookie_str, fingerprint)
         except CookieRequiredError:
+            self._retry_after[cid] = int(self.now()) + FAILURE_BACKOFF_SECONDS
             self.state.mark_account_failure(
                 cid, state="login_required",
                 session_state="login_required", error_kind="cookie_required")
             return
         except LoginRequiredError:
+            self._retry_after[cid] = int(self.now()) + FAILURE_BACKOFF_SECONDS
             self.state.mark_account_failure(
                 cid, state="login_required",
                 session_state="login_required", error_kind="login_required")
@@ -259,6 +275,7 @@ class RefresherService:
         try:
             claims = decode_id_token(token)
         except ValueError:
+            self._retry_after[cid] = int(self.now()) + FAILURE_BACKOFF_SECONDS
             self.state.mark_account_failure(
                 cid, state="login_required",
                 session_state="login_required", error_kind="invalid_token")
@@ -285,6 +302,7 @@ class RefresherService:
             return
 
         self._known[cid] = exp
+        self._retry_after.pop(cid, None)
         self.state.mark_account_healthy(cid, now=int(self.now()), exp=exp)
 
     def run_forever(self, stop_event) -> None:

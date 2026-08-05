@@ -1,6 +1,8 @@
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Mapping, Optional
+from urllib.parse import urlparse
 
 
 def _read_int(
@@ -13,6 +15,49 @@ def _read_int(
         return int(str(raw).strip())
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be an integer") from exc
+
+
+def playwright_proxy(proxy: str):
+    """把 `http://user:pass@host:port` 解析成 Playwright 的 proxy dict。
+
+    Playwright 要求 server 不含凭据、username/password 单列;住宅代理带认证时必须拆开。
+    留空返回 None（直连）。解析失败退化为 {"server": 原串}。
+    """
+    proxy = str(proxy or "").strip()
+    if not proxy:
+        return None
+    try:
+        u = urlparse(proxy if "://" in proxy else "http://" + proxy)
+        if not u.hostname:
+            return {"server": proxy}
+        scheme = u.scheme or "http"
+        server = f"{scheme}://{u.hostname}" + (f":{u.port}" if u.port else "")
+        cfg = {"server": server}
+        if u.username:
+            cfg["username"] = u.username
+        if u.password:
+            cfg["password"] = u.password
+        return cfg
+    except Exception:  # noqa: BLE001
+        return {"server": proxy}
+
+
+def _parse_login_accounts(raw: str):
+    """LEONARDO_LOGIN_ACCOUNTS：JSON 数组 [{"email","password"}, ...] → ((email,password),...)。"""
+    raw = str(raw or "").strip()
+    if not raw:
+        return ()
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return ()
+    accs = []
+    for it in data if isinstance(data, list) else []:
+        email = str((it or {}).get("email") or "").strip()
+        password = str((it or {}).get("password") or "")
+        if email and password:
+            accs.append((email, password))
+    return tuple(accs)
 
 
 @dataclass(frozen=True)
@@ -31,6 +76,15 @@ class RefresherConfig:
     health_host: str = "0.0.0.0"
     health_port: int = 8080
     profile_dir: str = "/profile"
+    # 自动登录（复制会话 ~2.5h 被上游作废的真解）：email/password 账号，refresher 用
+    # 住宅代理+YesCaptcha 解 Turnstile 直接铸新会话，掉线自动重登。留空则只走 cookie 上传模式。
+    login_accounts: tuple = ()
+    yescaptcha_key: str = field(default="", repr=False)
+    turnstile_sitekey: str = "0x4AAAAAAAjpS3rLKnsHyb79"
+    login_url: str = "https://app.leonardo.ai/auth/login"
+
+    def playwright_proxy(self):
+        return playwright_proxy(self.proxy)
 
     @classmethod
     def from_env(
@@ -90,4 +144,14 @@ class RefresherConfig:
             health_host=str(source.get("HEALTH_HOST", "0.0.0.0") or "0.0.0.0").strip(),
             health_port=health_port,
             profile_dir=str(source.get("PROFILE_DIR", "/profile") or "/profile").strip(),
+            login_accounts=_parse_login_accounts(source.get("LEONARDO_LOGIN_ACCOUNTS", "")),
+            yescaptcha_key=str(source.get("YESCAPTCHA_CLIENT_KEY", "") or "").strip(),
+            turnstile_sitekey=str(
+                source.get("LEONARDO_TURNSTILE_SITEKEY", "0x4AAAAAAAjpS3rLKnsHyb79")
+                or "0x4AAAAAAAjpS3rLKnsHyb79"
+            ).strip(),
+            login_url=str(
+                source.get("LEONARDO_LOGIN_URL", "https://app.leonardo.ai/auth/login")
+                or "https://app.leonardo.ai/auth/login"
+            ).strip(),
         )
