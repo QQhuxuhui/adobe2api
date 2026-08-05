@@ -30,6 +30,7 @@
           <button id="openAddTokenModalBtn">添加 Token</button>
           <button id="openCookieImportBtn" class="secondary">导入 Cookie</button>
           <button id="openLeoCookieBtn" class="secondary">导入 Leonardo Cookie</button>
+          <button id="openLeoLoginBtn" class="secondary">导入 Leonardo 账号</button>
         </div>
       </section>
 
@@ -449,6 +450,28 @@
         </div>
         <span id="leoCookieMsg" class="msg"></span>
         <p id="leoCookieStatus" class="help" style="white-space: pre-line;"></p>
+      </div>
+    </div>
+  </div>
+
+  <div id="leoLoginModal" class="dialog-modal" aria-hidden="true">
+    <div class="dialog-card" role="dialog" aria-modal="true" aria-label="导入 Leonardo 账号">
+      <div class="list-head" style="margin-bottom: 10px;">
+        <h2>导入 Leonardo 账号</h2>
+        <button id="leoLoginCloseBtn" class="secondary small" type="button">关闭</button>
+      </div>
+      <div class="config-form">
+        <div class="form-group">
+          <label for="leoLoginInput">粘贴登录账号（每行一条）</label>
+          <textarea id="leoLoginInput" rows="7" placeholder="邮箱:密码，每行一条"></textarea>
+          <p class="help">格式 <code>邮箱:密码</code>，按<b>首个冒号</b>分隔（密码可含冒号/空格）。提交后 refresher 自动登录铸会话入池；<b>密码只上行，不会在任何状态响应里回显</b>。</p>
+        </div>
+        <div id="leoLoginBalance" class="help"></div>
+        <div class="actions">
+          <button id="leoLoginSubmitBtn" class="secondary">导入</button>
+        </div>
+        <span id="leoLoginMsg" class="msg"></span>
+        <p id="leoLoginStatus" class="help" style="white-space: pre-line;"></p>
       </div>
     </div>
   </div>

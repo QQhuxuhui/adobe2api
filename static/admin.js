@@ -131,7 +131,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       tokenLoadGate,
       () => fetchTokenList(fetch),
       {
-        onSuccess: ({ tokens, summary }) => renderTable(tokens, summary),
+        onSuccess: ({ tokens, summary }) => {
+          renderTable(tokens, summary);
+          // Token 列表刷新时一并同步 Leonardo 登录账号状态/余额告警。
+          if (typeof refreshLeoLoginStatus === "function") refreshLeoLoginStatus();
+        },
         onFailure: (err) => {
           console.error(err);
           latestTokens = [];
@@ -699,6 +703,149 @@ document.addEventListener("DOMContentLoaded", async () => {
         if (leoCookieMsg) leoCookieMsg.textContent = `失败：${err}`;
       } finally {
         leoCookieSubmitBtn.disabled = false;
+      }
+    });
+  }
+
+  // --- 导入 Leonardo 账号（自动登录铸会话；与 Cookie 导入并列的另一套入池方式）---
+  const openLeoLoginBtn = document.getElementById("openLeoLoginBtn");
+  const leoLoginModal = document.getElementById("leoLoginModal");
+  const leoLoginCloseBtn = document.getElementById("leoLoginCloseBtn");
+  const leoLoginInput = document.getElementById("leoLoginInput");
+  const leoLoginSubmitBtn = document.getElementById("leoLoginSubmitBtn");
+  const leoLoginMsg = document.getElementById("leoLoginMsg");
+  const leoLoginStatus = document.getElementById("leoLoginStatus");
+  const leoLoginBalance = document.getElementById("leoLoginBalance");
+
+  async function refreshLeoLoginStatus() {
+    if (!leoLoginStatus) return;
+    try {
+      const res = await fetch("/api/v1/leonardo/login/status");
+      if (!res.ok) return;
+      const data = await res.json();
+      // 阈值只读后端；缺失时才用兼容默认。
+      const th = data.thresholds || { fail_count: 3, yescaptcha_balance: 1000 };
+      const failThreshold = Number(th.fail_count) || 3;
+      const balThreshold = Number(th.yescaptcha_balance) || 1000;
+      const bal = data.yescaptcha_balance;
+      if (leoLoginBalance) {
+        const low = bal != null && bal < balThreshold;
+        leoLoginBalance.textContent = `YesCaptcha 余额：${bal == null ? "未知" : bal}${low ? "（余额偏低，请尽快充值）" : ""}`;
+        leoLoginBalance.style.color = low ? "#c0392b" : "";
+        leoLoginBalance.style.fontWeight = low ? "600" : "";
+      }
+      const list = Array.isArray(data.logins) ? data.logins : [];
+      leoLoginStatus.innerHTML = "";
+      if (!list.length) {
+        leoLoginStatus.textContent = "当前未导入登录账号。";
+        return;
+      }
+      const head = document.createElement("div");
+      head.style.marginBottom = "6px";
+      head.textContent = `已导入 ${list.length} 个 Leonardo 登录账号（新导入约 15 秒内自动登录入池）：`;
+      leoLoginStatus.appendChild(head);
+      list.forEach((a) => {
+        const row = document.createElement("div");
+        row.style.display = "flex";
+        row.style.alignItems = "center";
+        row.style.gap = "8px";
+        row.style.margin = "2px 0";
+        const failing =
+          a.status === "login_required" || (a.fail_count || 0) >= failThreshold;
+        const parts = [a.email, a.status];
+        if (a.fail_count) parts.push(`失败${a.fail_count}`);
+        if (a.last_error_kind) parts.push(a.last_error_kind);
+        const span = document.createElement("span");
+        span.textContent = parts.join(" · ");
+        span.style.color = failing
+          ? "#c0392b"
+          : a.status === "ok"
+            ? "#27ae60"
+            : "#888";
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "danger";
+        btn.textContent = "删除";
+        btn.style.padding = "1px 8px";
+        btn.addEventListener("click", () => removeLeoLogin(a.id, btn));
+        row.appendChild(span);
+        row.appendChild(btn);
+        leoLoginStatus.appendChild(row);
+      });
+    } catch (err) {
+      /* 状态展示失败不影响导入 */
+    }
+  }
+
+  async function removeLeoLogin(id, btn) {
+    if (!id) return;
+    if (!window.confirm("确定删除这个 Leonardo 登录账号？")) return;
+    if (btn) btn.disabled = true;
+    try {
+      const res = await fetch(
+        `/api/v1/leonardo/login/${encodeURIComponent(id)}`,
+        { method: "DELETE" }
+      );
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        window.alert(d.detail || `删除失败（HTTP ${res.status}）`);
+        if (btn) btn.disabled = false;
+        return;
+      }
+      refreshLeoLoginStatus();
+    } catch (err) {
+      window.alert("删除失败");
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  if (openLeoLoginBtn) {
+    openLeoLoginBtn.addEventListener("click", () => {
+      openDialog(leoLoginModal);
+      if (leoLoginMsg) leoLoginMsg.textContent = "";
+      refreshLeoLoginStatus();
+      if (leoLoginInput) leoLoginInput.focus();
+    });
+  }
+  if (leoLoginCloseBtn) {
+    leoLoginCloseBtn.addEventListener("click", () => closeDialog(leoLoginModal));
+  }
+  if (leoLoginModal) {
+    leoLoginModal.addEventListener("click", (event) => {
+      if (event.target === leoLoginModal) closeDialog(leoLoginModal);
+    });
+  }
+  if (leoLoginSubmitBtn) {
+    leoLoginSubmitBtn.addEventListener("click", async () => {
+      const raw = (leoLoginInput?.value || "").trim();
+      if (!raw) {
+        if (leoLoginMsg) leoLoginMsg.textContent = "请先粘贴账号（邮箱:密码）";
+        return;
+      }
+      leoLoginSubmitBtn.disabled = true;
+      if (leoLoginMsg) leoLoginMsg.textContent = "提交中…";
+      try {
+        const res = await fetch("/api/v1/leonardo/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: raw }),
+        });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          if (leoLoginMsg) {
+            leoLoginMsg.textContent = d.detail || `导入失败（HTTP ${res.status}）`;
+          }
+          return;
+        }
+        if (leoLoginInput) leoLoginInput.value = "";
+        if (leoLoginMsg) {
+          leoLoginMsg.textContent = `新增 ${d.added ?? 0}，更新 ${d.updated ?? 0}，跳过 ${d.skipped ?? 0}`;
+        }
+        refreshLeoLoginStatus();
+      } catch (err) {
+        if (leoLoginMsg) leoLoginMsg.textContent = `失败：${err}`;
+      } finally {
+        leoLoginSubmitBtn.disabled = false;
       }
     });
   }
@@ -2177,5 +2324,6 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Init
   loadTokens();
   loadConfig();
+  refreshLeoLoginStatus();
   renderLogsPagination();
 });
