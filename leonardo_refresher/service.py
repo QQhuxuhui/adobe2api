@@ -214,21 +214,26 @@ class RefresherService:
             self.state.set_global_error("unexpected_fetch_error")
             return self.config.poll_interval_seconds
 
+        retain = getattr(self.source, "retain_contexts", None)
         if not cookies:
             self.state.set_global_error("cookie_required")
             self.state.prune(set())
+            # 无账号：以 source 为准回收全部 context（含未追踪 cid），并清本地缓存。
+            if callable(retain):
+                retain(set())
             self._known.clear()
             self._retry_after.clear()
+            self._login_fp.clear()
             return self.config.poll_interval_seconds
 
         self.state.set_global_error(None)
         present = {cid for cid, _, _ in cookies}
         self.state.prune(present)
         drop_context = getattr(self.source, "drop_context", None)
-        # 缺席账号(cookie 或 login)：回收其浏览器 context，再清各缓存。
-        for cid in set(self._known) | set(self._retry_after) | set(self._login_fp):
-            if cid not in present and callable(drop_context):
-                drop_context(cid)
+        # 缺席账号(cookie 或 login)：以 source 为准整体回收其浏览器 context——覆盖本地
+        # _known/_retry_after 从未追踪到的 cid（刷新在入表前就瞬时失败者），杜绝 context 泄漏。
+        if callable(retain):
+            self.source.retain_contexts(present)
         for cid in list(self._known):
             if cid not in present:
                 self._known.pop(cid, None)

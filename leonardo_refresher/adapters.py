@@ -201,7 +201,10 @@ class Adobe2ApiCookieProvider:
     def fetch_logins(self):
         """拉取待自动登录的账号凭据，返回 [{id,email,password,credential_rev}, ...]。
 
-        404/空 → []；网络错误/HTTP≥400/非 JSON → RefreshFetchError 交由上层归入重试。
+        真正的「无账号」是 200 {"logins": []}。404 表示 /logins 路由未部署（旧 adobe2api /
+        滚动升级窗口），不是空账号——落入 HTTP≥400 → RefreshFetchError("logins_http_404")，
+        由 list_cookies 的 except RefreshFetchError → 回退 env，保护 env 登录账号不被误清。
+        网络错误/其余 HTTP≥400/非 JSON 同样 → RefreshFetchError 交由上层重试。
         每项须齐 id+email+password 才纳入；credential_rev 缺省 1。
         """
         try:
@@ -212,8 +215,6 @@ class Adobe2ApiCookieProvider:
             )
         except requests.RequestException as exc:
             raise RefreshFetchError("network") from exc
-        if resp.status_code == 404:
-            return []
         if resp.status_code >= 400:
             raise RefreshFetchError(f"logins_http_{resp.status_code}")
         try:
@@ -401,6 +402,22 @@ class PlaywrightSessionSource:
                 acct["context"].close()
             except Exception:  # noqa: BLE001
                 pass
+
+    def retain_contexts(self, present):
+        """以 source 为准整体回收：关闭并移除 _accounts 中所有不在 present 里的 context。
+
+        比 service 逐 cid 的 drop_context 更彻底——覆盖 service 本地 _known/_retry_after
+        从未追踪到的 cid（如刷新在入表前就瞬时失败的账号），避免删号后其 Playwright
+        context 泄漏。关闭出错吞掉，保证逐条回收不被单个失败打断。"""
+        keep = set(present or ())
+        for cid in list(self._accounts):
+            if cid not in keep:
+                acct = self._accounts.pop(cid, None)
+                if acct:
+                    try:
+                        acct["context"].close()
+                    except Exception:  # noqa: BLE001
+                        pass
 
     def _get_balance(self):
         """查 YesCaptcha 余额（float），无 key/失败 → None。用于随登录结果一并上报。"""

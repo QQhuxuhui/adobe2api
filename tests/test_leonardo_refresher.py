@@ -495,6 +495,31 @@ def test_fetch_logins_returns_list():
     assert session.calls[0]["url"].endswith("/api/v1/tokens/leonardo/logins")
 
 
+def test_fetch_logins_404_raises_route_missing():
+    # 404 = /logins 路由未部署（旧 adobe2api / 滚动升级），非「无账号」→ 抛错交上层回退 env，
+    # 绝不返回 [] 把它当权威空登录源（那样会误清 env 登录账号）。
+    session = _GetSession(response=_GetResponse(status_code=404))
+    p = Adobe2ApiCookieProvider(base_url="http://x", refresh_key="k", session_factory=lambda: session)
+    with pytest.raises(RefreshFetchError) as exc:
+        p.fetch_logins()
+    assert exc.value.kind == "logins_http_404"
+
+
+def test_list_cookies_404_logins_falls_back_to_env():
+    # 端点缺失(404) → fetch_logins 抛 RefreshFetchError → list_cookies 回退 env（保护 env 账号）。
+    session = _GetSession(response=_GetResponse(status_code=404))
+    provider = Adobe2ApiCookieProvider(
+        base_url="http://x", refresh_key="k", session_factory=lambda: session)
+    src = PlaywrightSessionSource(
+        config=_login_config(login_accounts=(("env@x.co", "envpw"),)),
+        cookie_provider=provider,
+        playwright_factory=lambda: _LoginPlaywright(_LoginBrowser()),
+    )
+    login = [e for e in src.list_cookies() if e[2].startswith(LOGIN_MARKER)][0]
+    assert login[1] == "env@x.co\nenvpw"
+    assert login[2] == LOGIN_MARKER  # 裸标记（非 rev 版）
+
+
 def test_report_login_posts_and_swallows_errors():
     session = _PushSession(error=requests.ConnectionError("down"))
     p = Adobe2ApiCookieProvider(base_url="http://x", refresh_key="k", session_factory=lambda: session)
@@ -1505,9 +1530,9 @@ def test_credential_rev_change_clears_known_when_relogin_fails():
 
 
 def test_absent_login_cid_drops_context():
-    """账号被删除 → 下一轮 prune 阶段回收其浏览器 context。"""
+    """账号被删除 → 下一轮 prune 阶段经 retain_contexts 以 source 为准回收其 context。"""
     token = _jwt({"token_use": "id", "sub": "s", "exp": 13600})
-    dropped = []
+    retained = []
 
     class Src:
         def __init__(self):
@@ -1522,7 +1547,10 @@ def test_absent_login_cid_drops_context():
             return token
 
         def drop_context(self, cid):
-            dropped.append(cid)
+            pass  # rev 变化路径才用；本例不触发
+
+        def retain_contexts(self, present):
+            retained.append(set(present))
 
     src = Src()
     service = RefresherService(
@@ -1530,12 +1558,85 @@ def test_absent_login_cid_drops_context():
         config=_config(), now=lambda: 10000,
     )
     service.run_once()
-    assert dropped == []
+    assert retained[-1] == {"i1", "keep"}      # 两账号都在 → 都保留
 
     src.items = [("keep", "cookieK", "fpK")]   # 删掉登录账号 i1
     service.run_once()
-    assert dropped == ["i1"]                    # 缺席登录 cid → context 被回收
+    assert retained[-1] == {"keep"}            # 缺席登录 cid 被 retain 排除（回收）
     assert "i1" not in service._login_fp        # _login_fp 也被 prune
+
+
+def test_untracked_context_pruned_via_retain():
+    """瞬时失败过的 cid 从未进 _known/_retry_after，删号时仍应被 retain_contexts 回收
+    （旧的 tracked-cid drop 循环看不到它，会泄漏 Playwright context）。"""
+    token = _jwt({"token_use": "id", "sub": "s", "exp": 13600})
+
+    class Src:
+        def __init__(self):
+            self.items = [("keep", "cookieK", "fpK")]
+            # ghost：曾建过 context 但从没进 _known/_retry_after
+            self._accounts = {"ghost": object(), "keep": object()}
+            self.closed = []
+
+        def list_cookies(self):
+            return list(self.items)
+
+        def fetch_token_for(self, cid, cookie, fp):
+            return token
+
+        def drop_context(self, cid):
+            self._accounts.pop(cid, None)
+
+        def retain_contexts(self, present):
+            for cid in list(self._accounts):
+                if cid not in present:
+                    self.closed.append(cid)
+                    self._accounts.pop(cid, None)
+
+    src = Src()
+    service = RefresherService(
+        source=src, sink=_TokenSink(), state=RuntimeState(),
+        config=_config(), now=lambda: 10000,
+    )
+    service.run_once()
+    # present={"keep"}；ghost 不在列表、也不在任何 tracked set → retain 回收
+    assert src.closed == ["ghost"]
+    assert "ghost" not in src._accounts
+
+
+def test_empty_cookies_prunes_contexts_and_clears_login_fp():
+    """空列表分支：以 retain_contexts(set()) 回收全部 context，并清 _login_fp。"""
+    calls = []
+
+    class Src:
+        def list_cookies(self):
+            return []
+
+        def retain_contexts(self, present):
+            calls.append(set(present))
+
+    src = Src()
+    service = RefresherService(
+        source=src, sink=_TokenSink(), state=RuntimeState(),
+        config=_config(), now=lambda: 10000,
+    )
+    service._login_fp["stale"] = f"{LOGIN_MARKER}:1"
+    service.run_once()
+    assert calls == [set()]
+    assert service._login_fp == {}
+
+
+def test_retain_contexts_closes_and_pops_absent():
+    """PlaywrightSessionSource.retain_contexts：关闭并移除不在 present 里的 context。"""
+    src, pw, browser = _login_source()
+    src.open()
+    keep_ctx = browser.new_context()
+    drop_ctx = browser.new_context()
+    src._accounts["keep"] = {"context": keep_ctx, "fp": LOGIN_MARKER}
+    src._accounts["drop"] = {"context": drop_ctx, "fp": LOGIN_MARKER}
+    src.retain_contexts({"keep"})
+    assert "drop" not in src._accounts and drop_ctx.closed is True
+    assert "keep" in src._accounts and keep_ctx.closed is False
 
 
 def test_cookie_fingerprint_change_does_not_clear_or_drop():
