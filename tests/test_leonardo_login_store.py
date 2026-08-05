@@ -37,3 +37,27 @@ def test_concurrent_saves_do_not_corrupt(store):
     threads = [threading.Thread(target=worker, args=(n,)) for n in range(5)]
     [t.start() for t in threads]; [t.join() for t in threads]
     assert len(store.list_for_refresher()) == 100
+
+def test_import_parses_first_colon_and_no_strip(store):
+    out = store.import_lines("a@b.co:pa:ss word \nC@D.co : pw2\n")
+    assert (out["added"], out["skipped"]) == (2, 0)
+    rows = {r["email"]: r for r in store.list_for_refresher()}
+    assert rows["a@b.co"]["password"] == "pa:ss word "   # 首冒号切分、密码不 strip、保留内部冒号与空格
+    assert "c@d.co" in rows                               # email 规范化小写+strip
+
+def test_import_skips_invalid_lines(store):
+    out = store.import_lines("noColonHere\n:emptyEmail\nx@y.z:\n\n  \n")
+    assert out["added"] == 0 and out["skipped"] == 5
+
+def test_reimport_same_password_is_noop(store):
+    store.import_lines("a@b.co:pw")
+    out = store.import_lines("a@b.co:pw")
+    assert out["added"] == 0 and out["updated"] == 0
+    assert store.list_for_refresher()[0]["credential_rev"] == 1
+
+def test_reimport_new_password_bumps_rev_and_resets(store):
+    store.import_lines("a@b.co:pw1")
+    out = store.import_lines("a@b.co:pw2")
+    assert out["updated"] == 1
+    row = store.list_for_refresher()[0]
+    assert row["password"] == "pw2" and row["credential_rev"] == 2
