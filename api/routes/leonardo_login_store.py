@@ -1,4 +1,4 @@
-import json, os, threading, time, uuid
+import json, logging, os, threading, time, uuid
 from pathlib import Path
 
 from core.token_mgr import CONFIG_DIR
@@ -6,6 +6,8 @@ from core.token_mgr import CONFIG_DIR
 FAIL_ALERT_THRESHOLD = 3
 BALANCE_ALERT_THRESHOLD = 1000
 _EMPTY = {"logins": [], "yescaptcha_balance": None, "balance_at": None}
+
+_logger = logging.getLogger("leonardo_login")
 
 
 class LeonardoLoginStore:
@@ -103,6 +105,54 @@ class LeonardoLoginStore:
             data["logins"] = [x for x in data["logins"] if x.get("id") != id]
             self._save(data)
             return {"removed": before - len(data["logins"]), "count": len(data["logins"])}
+
+    def status_view(self) -> dict:
+        with self._lock:
+            data = self._load()
+            return {
+                "logins": [{k: x.get(k) for k in
+                            ("id", "email", "status", "fail_count",
+                             "last_error_kind", "updated_at", "last_attempt_at")}
+                           for x in data["logins"]],
+                "count": len(data["logins"]),
+                "yescaptcha_balance": data.get("yescaptcha_balance"),
+                "balance_at": data.get("balance_at"),
+                "thresholds": {"fail_count": FAIL_ALERT_THRESHOLD,
+                               "yescaptcha_balance": BALANCE_ALERT_THRESHOLD},
+            }
+
+    def report(self, id, credential_rev, status, last_error_kind=None, balance=None) -> dict:
+        with self._lock:
+            data = self._load()
+            # 余额与 rev 无关，先处理
+            if balance is not None:
+                old = data.get("yescaptcha_balance")
+                if (old is None or old >= BALANCE_ALERT_THRESHOLD) and balance < BALANCE_ALERT_THRESHOLD:
+                    _logger.warning("YesCaptcha 余额跌破阈值：%s < %s", balance, BALANCE_ALERT_THRESHOLD)
+                elif old is not None and old < BALANCE_ALERT_THRESHOLD and balance >= BALANCE_ALERT_THRESHOLD:
+                    _logger.warning("YesCaptcha 余额已恢复：%s", balance)
+                data["yescaptcha_balance"] = float(balance)
+                data["balance_at"] = int(time.time())
+            row = next((x for x in data["logins"] if x.get("id") == id), None)
+            if row is None:
+                self._save(data)
+                return {"updated": False, "reason": "unknown_id"}
+            if int(row.get("credential_rev") or 1) != int(credential_rev):
+                self._save(data)
+                return {"updated": False, "reason": "stale_revision"}
+            row["last_attempt_at"] = int(time.time())
+            if status == "ok":
+                if int(row.get("fail_count") or 0) >= FAIL_ALERT_THRESHOLD:
+                    _logger.warning("登录账号 %s 已恢复正常", row["email"])
+                row["status"] = "ok"; row["fail_count"] = 0; row["last_error_kind"] = None
+            else:  # login_required
+                row["fail_count"] = int(row.get("fail_count") or 0) + 1
+                row["status"] = "login_required"; row["last_error_kind"] = last_error_kind
+                if row["fail_count"] == FAIL_ALERT_THRESHOLD:
+                    _logger.warning("登录账号 %s 连续登录失败 %s 次(%s)",
+                                    row["email"], row["fail_count"], last_error_kind)
+            self._save(data)
+            return {"updated": True, "reason": None}
 
     def _with_lock_append(self, entry: dict) -> None:  # 仅测试并发用
         with self._lock:
