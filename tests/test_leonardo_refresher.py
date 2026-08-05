@@ -1290,3 +1290,132 @@ def test_login_source_uses_authenticated_proxy():
     src, pw, _ = _login_source(config=cfg)
     src.open()
     assert pw.chromium.calls[0]["proxy"] == {"server": "http://9.9.9.9:7000", "username": "u", "password": "p"}
+
+
+# ---- 登录源：端点(fetch_logins)优先，env 兜底；rev fingerprint；drop_context；余额上报 ----
+
+
+class _LoginProvOK:
+    """有 fetch_logins 端点、返回一条登录凭据。"""
+    def fetch_all(self):
+        return []
+
+    def fetch_logins(self):
+        return [{"id": "i1", "email": "a@b.co", "password": "pw", "credential_rev": 3}]
+
+
+class _LoginProvFail:
+    def fetch_all(self):
+        return []
+
+    def fetch_logins(self):
+        raise RefreshFetchError("network")
+
+
+class _ReportProv:
+    """记录 report_login 调用（fetch_all 空，无 fetch_logins → env/手工 fingerprint）。"""
+    def __init__(self):
+        self.reports = []
+
+    def fetch_all(self):
+        return []
+
+    def report_login(self, id, credential_rev, status, last_error_kind=None, balance=None):
+        self.reports.append((id, credential_rev, status, last_error_kind, balance))
+
+
+def test_list_cookies_uses_endpoint_login_source():
+    src = PlaywrightSessionSource(
+        config=_login_config(login_accounts=(("env@x.co", "envpw"),)),
+        cookie_provider=_LoginProvOK(),
+        playwright_factory=lambda: _LoginPlaywright(_LoginBrowser()),
+    )
+    entries = src.list_cookies()
+    login = [e for e in entries if e[2].startswith(LOGIN_MARKER)][0]
+    assert login[0] == "i1" and login[2] == f"{LOGIN_MARKER}:3" and login[1] == "a@b.co\npw"
+    # 端点成功(即使只返回一条) → 不并入 env 账号
+    assert not any(e[1].startswith("env@x.co") for e in entries)
+
+
+def test_list_cookies_empty_endpoint_does_not_fall_back_to_env():
+    class _EmptyLogins:
+        def fetch_all(self):
+            return []
+
+        def fetch_logins(self):
+            return []  # 端点成功但空 → 以存储为准，不回退 env
+
+    src = PlaywrightSessionSource(
+        config=_login_config(login_accounts=(("env@x.co", "envpw"),)),
+        cookie_provider=_EmptyLogins(),
+        playwright_factory=lambda: _LoginPlaywright(_LoginBrowser()),
+    )
+    entries = src.list_cookies()
+    assert not any(e[2].startswith(LOGIN_MARKER) for e in entries)
+    assert not any(e[1].startswith("env@x.co") for e in entries)
+
+
+def test_list_cookies_falls_back_to_env_on_fetch_error():
+    src = PlaywrightSessionSource(
+        config=_login_config(login_accounts=(("env@x.co", "envpw"),)),
+        cookie_provider=_LoginProvFail(),
+        playwright_factory=lambda: _LoginPlaywright(_LoginBrowser()),
+    )
+    login = [e for e in src.list_cookies() if e[2].startswith(LOGIN_MARKER)][0]
+    assert login[1] == "env@x.co\nenvpw"
+    assert login[2] == LOGIN_MARKER
+
+
+def test_drop_context_closes_and_removes():
+    src, pw, browser = _login_source()
+    src.open()
+    src._accounts["cid"] = {"context": browser.new_context(), "fp": LOGIN_MARKER}
+    ctx = src._accounts["cid"]["context"]
+    src.drop_context("cid")
+    assert "cid" not in src._accounts and ctx.closed is True
+
+
+def test_drop_context_missing_is_noop():
+    src, _, _ = _login_source()
+    src.drop_context("nope")  # 不抛
+
+
+def test_login_success_reports_ok_with_balance(monkeypatch):
+    prov = _ReportProv()
+    src = PlaywrightSessionSource(
+        config=_login_config(),
+        cookie_provider=prov,
+        playwright_factory=lambda: _LoginPlaywright(_LoginBrowser()),
+    )
+    monkeypatch.setattr(src, "_solve_turnstile", lambda sk: "t")
+    monkeypatch.setattr(src, "_get_balance", lambda: 7.5)
+    src.open()
+    token = src.fetch_token_for("i9", "a@b.co\npw", f"{LOGIN_MARKER}:5")
+    assert token == "fresh-jwt"
+    assert prov.reports == [("i9", 5, "ok", None, 7.5)]  # rev 透传 + 余额上报
+
+
+def test_login_failure_reports_captcha_then_reraises(monkeypatch):
+    prov = _ReportProv()
+    src = PlaywrightSessionSource(
+        config=_login_config(),
+        cookie_provider=prov,
+        playwright_factory=lambda: _LoginPlaywright(_LoginBrowser()),
+    )
+    monkeypatch.setattr(src, "_solve_turnstile", lambda sk: None)  # 解不出 → captcha
+    monkeypatch.setattr(src, "_get_balance", lambda: 2.0)
+    src.open()
+    with pytest.raises(LoginRequiredError):
+        src.fetch_token_for("i9", "a@b.co\npw", f"{LOGIN_MARKER}:5")
+    assert prov.reports == [("i9", 5, "login_required", "captcha", 2.0)]
+
+
+def test_get_balance_reads_yescaptcha(monkeypatch):
+    src, _, _ = _login_source()
+    monkeypatch.setattr(src, "_yc_post", lambda url, payload: {"errorId": 0, "balance": "12.34"})
+    assert src._get_balance() == 12.34
+
+
+def test_get_balance_none_without_key():
+    src, _, _ = _login_source(config=_login_config(yescaptcha_key=""))
+    assert src._get_balance() is None

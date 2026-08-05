@@ -363,16 +363,56 @@ class PlaywrightSessionSource:
     def list_cookies(self):
         """返回待刷新条目 [(id, cookie, fingerprint), ...]。
 
-        含两类：①用户上传的 cookie（fetch_all）；②配置的自动登录账号——以
-        fingerprint=LOGIN_MARKER 标记、cookie 位放 "email\\npassword"，由 fetch_token_for
-        分流到登录路径（掉线自动重登，不入 cookie 存储、不攒垃圾）。
+        含两类：①用户上传的 cookie（fetch_all）；②自动登录账号——以
+        fingerprint=f"{LOGIN_MARKER}:{rev}" 标记、cookie 位放 "email\\npassword"，由
+        fetch_token_for 分流到登录路径（掉线自动重登，不入 cookie 存储、不攒垃圾）。
+
+        登录来源：优先 provider.fetch_logins()——端点成功（含空列表）即以存储为准、
+        不并入 env；仅当 fetch_logins 抛 RefreshFetchError（拉取异常）或 provider 无该
+        方法（旧 fake/无端点）时，回退 env login_accounts（fingerprint 用裸 LOGIN_MARKER）。
         """
         fetch_all = getattr(self._cookie_provider, "fetch_all", None)
         entries = list(fetch_all() if callable(fetch_all) else [])
-        for email, password in getattr(self._config, "login_accounts", ()) or ():
-            cid = "login:" + hashlib.sha256(email.encode("utf-8")).hexdigest()[:12]
-            entries.append((cid, email + "\n" + password, LOGIN_MARKER))
+        logins = None
+        fetch_logins = getattr(self._cookie_provider, "fetch_logins", None)
+        if callable(fetch_logins):
+            try:
+                logins = fetch_logins()  # 成功(含空)以此为准
+            except RefreshFetchError:
+                logins = None            # 拉取异常 → 回退 env
+        if logins is not None:
+            for it in logins:
+                entries.append((
+                    it["id"],
+                    it["email"] + "\n" + it["password"],
+                    f'{LOGIN_MARKER}:{it["credential_rev"]}',
+                ))
+        else:
+            for email, password in getattr(self._config, "login_accounts", ()) or ():
+                cid = "login:" + hashlib.sha256(email.encode("utf-8")).hexdigest()[:12]
+                entries.append((cid, email + "\n" + password, LOGIN_MARKER))
         return entries
+
+    def drop_context(self, cid):
+        """关闭并移除某账号的浏览器上下文（不存在则 no-op）。供后台删号后清理。"""
+        acct = self._accounts.pop(cid, None)
+        if acct:
+            try:
+                acct["context"].close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _get_balance(self):
+        """查 YesCaptcha 余额（float），无 key/失败 → None。用于随登录结果一并上报。"""
+        key = str(self._config.yescaptcha_key or "").strip()
+        if not key:
+            return None
+        try:
+            r = self._yc_post("https://api.yescaptcha.com/getBalance", {"clientKey": key})
+            b = (r or {}).get("balance")
+            return float(b) if b is not None else None
+        except Exception:  # noqa: BLE001
+            return None
 
     def fetch_token(self) -> str:
         """便捷：刷新第一条 cookie（单账号/测试用）。"""
@@ -460,9 +500,10 @@ class PlaywrightSessionSource:
         return acct
 
     def fetch_token_for(self, cookie_id: str, cookie_str: str, fingerprint: str) -> str:
-        if fingerprint == LOGIN_MARKER:
+        if fingerprint.startswith(LOGIN_MARKER):
             email, _, password = str(cookie_str or "").partition("\n")
-            return self._fetch_token_login(cookie_id, email, password)
+            rev = int(fingerprint.split(":", 1)[1]) if ":" in fingerprint else 1
+            return self._fetch_token_login(cookie_id, email, password, rev)
 
         acct = self._ensure_context(cookie_id, None)
         ctx = acct["context"]
@@ -482,12 +523,31 @@ class PlaywrightSessionSource:
             raise RefreshFetchError(kind) from exc
         return self._parse_session(result)
 
-    def _fetch_token_login(self, cookie_id: str, email: str, password: str) -> str:
+    def _fetch_token_login(
+        self, cookie_id: str, email: str, password: str, credential_rev: int = 1
+    ) -> str:
         """自动登录账号：先用上下文里已有会话续期；会话死/首次则登录后再取。
 
-        会话在"服务器 headless + 住宅代理"里原生诞生并始终从同一出口使用，规避
-        "复制会话异地使用被判盗用、~2.5h 被撤销"。登录失败/仍取不到 → LoginRequiredError。
+        成功 → report_login(status="ok", balance=..)；失败(LoginRequiredError /
+        RefreshFetchError) → 先按异常映射 last_error_kind、report_login(status=
+        "login_required", ..) 再**重新抛出原异常**（保持既有 service 行为）。回报本身
+        绝不打断刷新（provider 无 report_login 则安全跳过）。
         """
+        try:
+            token = self._login_cycle(cookie_id, email, password)
+        except (LoginRequiredError, RefreshFetchError) as exc:
+            self._report_login_safe(
+                cookie_id, credential_rev, "login_required",
+                last_error_kind=self._login_error_kind(exc),
+            )
+            raise
+        self._report_login_safe(cookie_id, credential_rev, "ok")
+        return token
+
+    def _login_cycle(self, cookie_id: str, email: str, password: str) -> str:
+        """登录/续期核心流程（不含结果上报）。会话在"服务器 headless + 住宅代理"里
+        原生诞生并始终从同一出口使用，规避"复制会话异地使用被判盗用、~2.5h 被撤销"。
+        登录失败/仍取不到 → LoginRequiredError。"""
         acct = self._ensure_context(cookie_id, LOGIN_MARKER)
         ctx = acct["context"]
         try:
@@ -511,11 +571,39 @@ class PlaywrightSessionSource:
             kind = "proxy" if "proxy" in str(exc).lower() else "network"
             raise RefreshFetchError(kind) from exc
 
+    def _report_login_safe(self, cookie_id, credential_rev, status, last_error_kind=None):
+        """回报一次登录结果（含余额）。provider 无 report_login 或回报本身出错 → 静默跳过，
+        绝不打断刷新。余额仅在确实要上报时才查（避免无端点的旧 fake 触发网络调用）。"""
+        report = getattr(self._cookie_provider, "report_login", None)
+        if not callable(report):
+            return
+        try:
+            report(
+                cookie_id, credential_rev, status,
+                last_error_kind=last_error_kind, balance=self._get_balance(),
+            )
+        except Exception:  # noqa: BLE001 - 回报失败不打断刷新
+            pass
+
+    @staticmethod
+    def _login_error_kind(exc) -> str:
+        """把登录失败异常映射成展示用 last_error_kind（务实即可）：
+        - RefreshFetchError.kind 含 "proxy" → "proxy"，其余 RefreshFetchError → "upstream"；
+        - LoginRequiredError 带 login_kind("captcha"/"password") → 该值；
+        - 其余（登录后仍取不到会话等无法干净区分的情况）→ "upstream"。
+        """
+        if isinstance(exc, RefreshFetchError):
+            return "proxy" if "proxy" in str(getattr(exc, "kind", "")).lower() else "upstream"
+        kind = getattr(exc, "login_kind", None)
+        return kind if kind in ("captcha", "password") else "upstream"
+
     def _login_in_context(self, ctx, email: str, password: str) -> None:
         token = self._solve_turnstile(self._config.turnstile_sitekey)
         if not token:
             print("[leo-login] email=%s turnstile_solve=FAIL" % str(email)[:16], flush=True)
-            raise LoginRequiredError()
+            err = LoginRequiredError()
+            err.login_kind = "captcha"  # Turnstile 解不出
+            raise err
         page = ctx.new_page()
         try:
             page.goto(self._config.login_url, wait_until="domcontentloaded", timeout=60000)
@@ -532,7 +620,9 @@ class PlaywrightSessionSource:
         status = res.get("status") if isinstance(res, dict) else None
         print("[leo-login] email=%s signin_status=%s got_session=%s" % (str(email)[:16], status, got), flush=True)
         if not got:
-            raise LoginRequiredError()
+            err = LoginRequiredError()
+            err.login_kind = "password"  # sign-in 走通但没拿到会话（账号密码错）
+            raise err
 
     @staticmethod
     def _yc_post(url, payload):
