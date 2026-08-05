@@ -15,7 +15,8 @@ Leonardo 的 better-auth 会话约 1.6h 被上游作废;已由 leonardo-refreshe
    含冒号/空格;解析时**不对密码 strip**,只去行尾 `\r\n`)。
 2. 列表显示名称:**邮箱全文**(无需回写 user.name)。
 3. 告警渠道:**后台页面 + 日志**(不加推送)。
-4. 代理:复用现有 `LEONARDO_PROXY`(refresher 已全程走它)。
+4. 代理:复用现有 `LEONARDO_PROXY`——**仅 Chromium(登录 + get-session)走该代理**;YesCaptcha 用
+   `TurnstileTaskProxyless`(其自有 IP),YesCaptcha API 及对 adobe2api 的回报**不走**该代理。
 5. 状态/余额到后台:**方案 A —— refresher 回报**。
 
 ## 架构(镜像现有 Leonardo Cookie 导入)
@@ -56,11 +57,14 @@ FastAPI 同步接口在线程池并发运行,导入/删除/状态回报/余额�
   password=右侧**仅 `rstrip("\r\n")`、不 strip**;email 去重 upsert(密码变→`credential_rev+=1`、`status="pending"`、
   `fail_count=0`);空行 / 无冒号 / 空邮箱 / 空密码 → 计入 skipped、不阻断其它行。
 - `list_for_refresher() -> [{id,email,password,credential_rev}]`(含明文,仅 refresh-key 端点内部用)。
-- `status_view() -> {logins:[{id,email,status,fail_count,last_error_kind,updated_at,last_attempt_at}], count, yescaptcha_balance, balance_at}`(**无密码**)。
+- `status_view() -> {logins:[{id,email,status,fail_count,last_error_kind,updated_at,last_attempt_at}], count, yescaptcha_balance, balance_at, thresholds:{fail_count, yescaptcha_balance}}`(**无密码**)。
+  阈值取后端模块常量(`FAIL_ALERT_THRESHOLD=3`、`BALANCE_ALERT_THRESHOLD=1000`),**日志告警与前端共用同一来源**,避免只改一边。
 - `remove(id) -> {removed,count}`。
-- `report(id, status, last_error_kind=None, balance=None) -> None`:一次事务——按 id 更新
-  `status`/`last_attempt_at`,`login_required`→`fail_count+=1`、`ok`→`fail_count=0`;给了 `last_error_kind`/`balance`
-  就一并更新;并做阈值跨越告警日志(见 ④)。
+- `report(id, status, last_error_kind=None, balance=None) -> None`:一次事务(只 save 一次)。**固定状态转换**:
+  - `ok` → `fail_count=0`、**`last_error_kind=None`(显式清旧错,避免恢复后还挂 password/captcha)**;
+  - `login_required` → `fail_count+=1`、`last_error_kind=<新错误>`;
+  - (`pending` 只由导入 / 改密码产生,不经 report。)
+  给了 `balance` 就更新 `yescaptcha_balance`/`balance_at`(float);并做阈值跨越告警日志(见 ④)。
 
 ## ② 端点
 
@@ -80,8 +84,8 @@ FastAPI 同步接口在线程池并发运行,导入/删除/状态回报/余额�
   归为可重试、**不打断刷新主流程**;登录端点拉取失败**不得影响 cookie 账号继续刷新**。
 - `list_cookies()` 登录账号来源(**不做无条件 union**,否则同邮箱既有存储 UUID 又有 env 哈希 ID → 两个 context
   → 会话轮换污染,违反"每账号一 context"`adapters.py:205`):
-  - 端点成功 → **以存储为准**,按规范化邮箱去重;
-  - 端点拉取失败 → 回退 env `LEONARDO_LOGIN_ACCOUNTS`;
+  - 端点成功(**含空列表**)→ **以存储为准**,按规范化邮箱去重;空列表=无登录账号,**不回退**;
+  - 端点拉取**异常**(网络/HTTP 错误)→ 回退 env `LEONARDO_LOGIN_ACCOUNTS`;
   - cid 用存储 `id`;登录条目 fingerprint 编码 `f"{LOGIN_MARKER}:{credential_rev}"`(承载 rev)。
 - `fetch_token_for`:`fingerprint.startswith(LOGIN_MARKER)` → 走 `_fetch_token_login`(其余 cookie 路径不变)。
 - **凭据变更立即重验(service 侧,仅登录账号)**:现有 gate 在 token 有效期内跳过刷新(`service.py:229`),
@@ -92,7 +96,8 @@ FastAPI 同步接口在线程池并发运行,导入/删除/状态回报/余额�
   list → service prune 阶段对缺席 cid 调 `drop_context` → 避免频繁导入/删除积累 context。
 - `_fetch_token_login`:成功 → `report_login(id,"ok",balance=bal)`;失败按异常映射 `last_error_kind`
   → `report_login(id,"login_required",kind,bal)`。fail_count 全由存储维护,refresher 不记忆计数。
-- 余额:`_solve_turnstile` 成功后调一次 YesCaptcha `getBalance`,随 `report_login` 上报(登录低频,无需定时器)。
+- 余额:**每次登录尝试都独立调一次 `getBalance`**(与验证码成功/失败无关——余额耗尽时 `createTask` 恰好会失败,
+  正是此刻更要查到低余额、触发告警);`getBalance` 自身失败则 balance 传 `None`、保留旧值。随 `report_login` 上报。
 
 ## ④ 后台 UI + 日志告警
 
@@ -115,9 +120,10 @@ FastAPI 同步接口在线程池并发运行,导入/删除/状态回报/余额�
 ## ⑤ 请求模型与校验(Pydantic)
 
 - `POST /api/v1/leonardo/login`:独立模型 `{text: str}`,限制长度(如 ≤ 200KB,防超大 body)。
-- `POST .../login/report`:`{id:str, status:Literal["ok","login_required"], last_error_kind:Optional[str], balance:Optional[int]}`;
-  校验 status 枚举、balance 有限非负整数。
-- **密码绝不出现在任何响应 / 日志 / 导出**;`[leo-login]` 只打邮箱前缀;`status_view` 无密码字段。
+- `POST .../login/report`:`{id:str, status:Literal["ok","login_required"], last_error_kind:Optional[Literal["password","captcha","proxy","upstream"]], balance:Optional[float]}`;
+  校验 status/last_error_kind 枚举、balance 为有限非负数(YesCaptcha 官方为 Decimal → 用 float/Decimal,不用 int)。
+- **密码不出现在管理端响应、`status_view`、日志、导出中**;refresh-key `/logins` 因 refresher 登录**必须**返回密码
+  (属内部信任通道);`[leo-login]` 只打邮箱前缀。
 
 ## 数据流
 
@@ -146,11 +152,17 @@ refresher 下轮清 _known/context → 立即重登验证。
 - 管理端点(仿 `tests/test_admin_leonardo_cookie.py`)。
 - `fetch_logins`/`report_login` round-trip;`list_cookies()` 端点成功走存储、失败回退 env;`drop_context` 被调。
 - refresher 登录路径:rev 变化清 _known+drop_context+立即重登(扩展现有 `_LoginCtx` fake);删除 → prune 掉 context。
+- **并发** import/report/delete(多线程同时打 store,断言不丢数据/不损坏/计数正确)。
+- 验证码失败(createTask 失败)**仍上报低余额**(getBalance 独立于 solve)。
+- `report("ok")` **清空** 旧 `last_error_kind`;`login_required` 累加 fail_count。
+- 端点返回**空列表**(成功但无账号)→ **不回退 env**(空是有效成功,非失败)。
 
 ## 部署
 
 - adobe2api 改了 routes + 存储 + 前端 → 构建 v52;refresher 改了 adapters/provider → v10。
-- 顺序:先 adobe2api(端点就绪)后 refresher;迁移 env 账号;`--no-deps` 单独重建各容器。`config/` 已持久化,无需新 volume。
+- **安全顺序**(端点成功但列表为空**不回退 env**,故必须先导入再升级 refresher,否则账号池瞬时清空):
+  ①部署 adobe2api v52 → ②refresher **保持 v9 运行** → ③后台导入并确认账号入库 → ④部署 refresher v10 →
+  ⑤清 .env 里 `LEONARDO_LOGIN_ACCOUNTS`。`--no-deps` 单独重建;`config/` 已持久化,无需新 volume。
 
 ## 非目标(YAGNI)
 
