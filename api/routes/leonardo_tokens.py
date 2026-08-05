@@ -256,6 +256,25 @@ def read_leonardo_cookie_status() -> dict:
 def build_leonardo_token_router(*, token_manager) -> APIRouter:
     router = APIRouter()
 
+    from api.routes.leonardo_login_store import login_store
+    from api.schemas import LeonardoLoginReportRequest
+
+    @router.get("/api/v1/tokens/leonardo/logins")
+    def get_leonardo_logins(request: Request):
+        _require_refresh_key(request)
+        return {"logins": login_store.list_for_refresher()}
+
+    @router.post("/api/v1/tokens/leonardo/login/report")
+    def report_leonardo_login(req: LeonardoLoginReportRequest, request: Request):
+        _require_refresh_key(request)
+        return login_store.report(
+            req.id,
+            req.credential_rev,
+            req.status,
+            last_error_kind=req.last_error_kind,
+            balance=req.balance,
+        )
+
     @router.post("/api/v1/tokens/leonardo/cookie")
     def upload_leonardo_cookie(
         req: LeonardoCookieUploadRequest,

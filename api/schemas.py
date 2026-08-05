@@ -1,6 +1,7 @@
-from typing import Any, List, Optional
+import math
+from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, Field, StrictInt
+from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 
 
 class GenerateRequest(BaseModel):
@@ -27,6 +28,36 @@ class LeonardoCookieUploadRequest(BaseModel):
     cookie: str = Field(min_length=1, max_length=32768)
     # 轮换回写时带上账号稳定 id，只就地更新该账号那条（指纹会变，按 id 才可靠）
     cookie_id: Optional[str] = None
+
+
+class LeonardoLoginReportRequest(BaseModel):
+    id: str
+    credential_rev: int
+    status: Literal["ok", "login_required"]
+    last_error_kind: Optional[Literal["password", "captcha", "proxy", "upstream"]] = None
+    balance: Optional[float] = None
+
+    @field_validator("credential_rev")
+    @classmethod
+    def _rev_nonneg(cls, v):
+        if v < 0:
+            raise ValueError("credential_rev must be >= 0")
+        return v
+
+    @field_validator("balance")
+    @classmethod
+    def _bal(cls, v):
+        if v is not None and (not math.isfinite(v) or v < 0):
+            raise ValueError("balance must be finite and >= 0")
+        return v
+
+    @model_validator(mode="after")
+    def _err_matches_status(self):
+        if self.status == "login_required" and not self.last_error_kind:
+            raise ValueError("login_required requires last_error_kind")
+        if self.status == "ok" and self.last_error_kind:
+            raise ValueError("ok must not carry last_error_kind")
+        return self
 
 
 class ExportSelectionRequest(BaseModel):
