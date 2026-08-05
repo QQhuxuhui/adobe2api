@@ -13,6 +13,10 @@ MAX_BROWSER_CONTROL_FAILURES = 3
 # 不退避，仍每轮重试。
 FAILURE_BACKOFF_SECONDS = 120
 
+# 登录账号指纹前缀。必须与 adapters.LOGIN_MARKER 保持一致；此处本地定义而非 import，
+# 因为 adapters 反过来 import service（循环 import）。
+_LOGIN_MARKER = "__login__"
+
 
 class BrowserControlUnavailableError(RuntimeError):
     pass
@@ -193,6 +197,8 @@ class RefresherService:
         self._known = {}
         # cid -> 最早可再次尝试的时间戳；失效账号退避，避免每 15s 猛刷
         self._retry_after = {}
+        # 登录账号 cid -> 上次见到的 fingerprint(带 credential_rev)；rev 变→立即重验
+        self._login_fp = {}
         self._browser_control_this_pass = False
 
     def run_once(self) -> int:
@@ -218,15 +224,35 @@ class RefresherService:
         self.state.set_global_error(None)
         present = {cid for cid, _, _ in cookies}
         self.state.prune(present)
+        drop_context = getattr(self.source, "drop_context", None)
+        # 缺席账号(cookie 或 login)：回收其浏览器 context，再清各缓存。
+        for cid in set(self._known) | set(self._retry_after) | set(self._login_fp):
+            if cid not in present and callable(drop_context):
+                drop_context(cid)
         for cid in list(self._known):
             if cid not in present:
                 self._known.pop(cid, None)
         for cid in list(self._retry_after):
             if cid not in present:
                 self._retry_after.pop(cid, None)
+        for cid in list(self._login_fp):
+            if cid not in present:
+                self._login_fp.pop(cid, None)
 
         now = int(self.now())
         for cid, cookie_str, fingerprint in cookies:
+            # 仅登录账号：fingerprint 带 credential_rev，rev 变(或首见)→ 立即重验。
+            # cookie 账号指纹变化＝正常轮换，不走此逻辑(清缓存会导致无谓重刷)。
+            if fingerprint.startswith(_LOGIN_MARKER):
+                prev_fp = self._login_fp.get(cid)
+                if prev_fp is not None and prev_fp != fingerprint:
+                    # credential_rev 变：作废旧 token/退避与旧 context，强制立即重登+重验。
+                    self._known.pop(cid, None)
+                    self._retry_after.pop(cid, None)
+                    if callable(drop_context):
+                        drop_context(cid)
+                self._login_fp[cid] = fingerprint
+                # 首见(prev_fp is None)无需清缓存：_known 本就无此 cid，下方 gate 自然放行重验。
             known_exp = self._known.get(cid)
             # 已健康且距过期还足够 → 跳过（不跑浏览器）
             if known_exp is not None and (known_exp - now) >= self.config.safety_margin_seconds:

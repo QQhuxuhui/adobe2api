@@ -1419,3 +1419,159 @@ def test_get_balance_reads_yescaptcha(monkeypatch):
 def test_get_balance_none_without_key():
     src, _, _ = _login_source(config=_login_config(yescaptcha_key=""))
     assert src._get_balance() is None
+
+
+# ---- service：credential_rev 变化立即重验 + 缺席账号回收 context ----
+
+
+def test_credential_rev_change_forces_relogin():
+    """登录账号 rev 升级 → 清 _known + drop_context → 本轮立即重新 fetch。"""
+    token = _jwt({"token_use": "id", "sub": "s", "exp": 13600})
+    dropped = []
+
+    class Src:
+        def __init__(self):
+            self.rev = 1
+            self.fetch_calls = []
+
+        def list_cookies(self):
+            return [("i1", "a@b.co\npw", f"{LOGIN_MARKER}:{self.rev}")]
+
+        def fetch_token_for(self, cid, cookie, fp):
+            self.fetch_calls.append((cid, fp))
+            return token
+
+        def drop_context(self, cid):
+            dropped.append(cid)
+
+    src = Src()
+    service = RefresherService(
+        source=src, sink=_TokenSink(), state=RuntimeState(),
+        config=_config(), now=lambda: 10000,
+    )
+
+    service.run_once()
+    assert state_state(service) == "healthy"
+    assert len(src.fetch_calls) == 1
+    assert service._known["i1"] == 13600
+    # 首见时也记指纹，但首见不算「变化」→ 不 drop
+    assert dropped == []
+
+    # 同 rev 第二轮：已健康未近过期 → 跳过，不 fetch、不 drop
+    service.run_once()
+    assert len(src.fetch_calls) == 1
+    assert dropped == []
+
+    # rev 升到 2（凭据改）→ 清 _known + drop_context + 本轮重新 fetch
+    src.rev = 2
+    service.run_once()
+    assert dropped == ["i1"]
+    assert len(src.fetch_calls) == 2          # 清缓存后立即重验
+    assert service._login_fp["i1"] == f"{LOGIN_MARKER}:2"
+
+
+def test_credential_rev_change_clears_known_when_relogin_fails():
+    """rev 变化必须真正清空 _known：让重登失败，可直接观测 _known 被清。"""
+    token = _jwt({"token_use": "id", "sub": "s", "exp": 13600})
+
+    class Src:
+        def __init__(self):
+            self.rev = 1
+            self.dropped = []
+
+        def list_cookies(self):
+            return [("i1", "a@b.co\npw", f"{LOGIN_MARKER}:{self.rev}")]
+
+        def fetch_token_for(self, cid, cookie, fp):
+            if self.rev == 1:
+                return token
+            raise LoginRequiredError()  # rev 变后重登失败 → _known 应保持被清
+
+        def drop_context(self, cid):
+            self.dropped.append(cid)
+
+    src = Src()
+    service = RefresherService(
+        source=src, sink=_TokenSink(), state=RuntimeState(),
+        config=_config(), now=lambda: 10000,
+    )
+    service.run_once()
+    assert service._known.get("i1") == 13600
+
+    src.rev = 2
+    service.run_once()
+    assert "i1" not in service._known          # rev 变 → 缓存被清且未回填
+    assert src.dropped == ["i1"]
+
+
+def test_absent_login_cid_drops_context():
+    """账号被删除 → 下一轮 prune 阶段回收其浏览器 context。"""
+    token = _jwt({"token_use": "id", "sub": "s", "exp": 13600})
+    dropped = []
+
+    class Src:
+        def __init__(self):
+            # 保留一个 cookie 账号使列表非空（走正常 prune 路径，非空列表分支）
+            self.items = [("i1", "a@b.co\npw", f"{LOGIN_MARKER}:1"),
+                          ("keep", "cookieK", "fpK")]
+
+        def list_cookies(self):
+            return list(self.items)
+
+        def fetch_token_for(self, cid, cookie, fp):
+            return token
+
+        def drop_context(self, cid):
+            dropped.append(cid)
+
+    src = Src()
+    service = RefresherService(
+        source=src, sink=_TokenSink(), state=RuntimeState(),
+        config=_config(), now=lambda: 10000,
+    )
+    service.run_once()
+    assert dropped == []
+
+    src.items = [("keep", "cookieK", "fpK")]   # 删掉登录账号 i1
+    service.run_once()
+    assert dropped == ["i1"]                    # 缺席登录 cid → context 被回收
+    assert "i1" not in service._login_fp        # _login_fp 也被 prune
+
+
+def test_cookie_fingerprint_change_does_not_clear_or_drop():
+    """cookie 账号指纹变化＝正常轮换：不得清缓存/丢 context（仅 login 走 rev 逻辑）。"""
+    token = _jwt({"token_use": "id", "sub": "s", "exp": 13600})
+    dropped = []
+
+    class Src:
+        def __init__(self):
+            self.fp = "fp1"
+            self.fetch_calls = 0
+
+        def list_cookies(self):
+            return [("c1", "cookie", self.fp)]
+
+        def fetch_token_for(self, cid, cookie, fp):
+            self.fetch_calls += 1
+            return token
+
+        def drop_context(self, cid):
+            dropped.append(cid)
+
+    src = Src()
+    service = RefresherService(
+        source=src, sink=_TokenSink(), state=RuntimeState(),
+        config=_config(), now=lambda: 10000,
+    )
+    service.run_once()
+    assert src.fetch_calls == 1
+
+    src.fp = "fp2"                              # cookie 重导，指纹变
+    service.run_once()
+    # 已健康且未近过期 → 跳过；cookie 指纹变化不触发 drop/清缓存/重 fetch
+    assert src.fetch_calls == 1
+    assert dropped == []
+
+
+def state_state(service) -> str:
+    return service.state.snapshot()["state"]
