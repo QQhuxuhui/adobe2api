@@ -63,7 +63,7 @@ def test_store_pushes_rotated_cookie():
     session = _Session()
     p = _provider(session)
     ok = p.store("__Secure-better-auth.session_token=NEW; __Secure-better-auth.session_data.0=d0")
-    assert ok is True
+    assert ok == "f"  # 成功返回新指纹
     assert len(session.posts) == 1
     post = session.posts[0]
     assert post["url"].endswith("/api/v1/tokens/leonardo/cookie")
@@ -73,7 +73,7 @@ def test_store_pushes_rotated_cookie():
 
 def test_store_ignores_empty_cookie():
     session = _Session()
-    assert _provider(session).store("") is False
+    assert _provider(session).store("") is None
     assert session.posts == []
 
 
@@ -83,4 +83,4 @@ def test_store_never_raises_on_http_error():
             raise RuntimeError("boom")
 
     # 回写失败不得影响本次 token 刷新
-    assert _provider(_Bad()).store("__Secure-better-auth.session_token=x") is False
+    assert _provider(_Bad()).store("__Secure-better-auth.session_token=x") is None

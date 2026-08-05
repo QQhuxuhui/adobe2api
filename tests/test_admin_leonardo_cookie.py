@@ -10,7 +10,7 @@ import pytest
 from api.routes.leonardo_tokens import (
     store_leonardo_cookie,
     read_leonardo_cookie_status,
-    replace_leonardo_cookie,
+    update_leonardo_cookie,
     list_leonardo_cookies,
     remove_leonardo_cookie,
 )
@@ -97,17 +97,22 @@ def test_remove_missing_cookie_is_noop(cookie_dir):
     assert out["removed"] == 0 and out["count"] == 1
 
 
-def test_replace_rotated_cookie_targets_one_account(cookie_dir):
+def test_update_rotated_cookie_by_id_targets_one_account(cookie_dir):
     a = store_leonardo_cookie(_leo_cookie("acctA"))
     store_leonardo_cookie(_leo_cookie("acctB"))
-    # 轮换 A 的 cookie：只替换 A 那条，B 不动
-    out = replace_leonardo_cookie(_leo_cookie("acctA_rotated"), a["fingerprint"])
-    assert out["count"] == 2
+    # 轮换 A 的 cookie：按稳定 id 就地更新，只动 A，B 不受影响，总数不增（不攒垃圾）
+    out = update_leonardo_cookie(a["id"], _leo_cookie("acctA_rotated"))
+    assert out["updated"] == 1 and out["count"] == 2
     cookies = list_leonardo_cookies()
-    assert a["fingerprint"] not in {c["fingerprint"] for c in cookies}  # 旧 A 指纹已换掉
-    tokens = {c["cookie"] for c in cookies}
-    assert any("acctA_rotated" in t for t in tokens)
-    assert any("acctB" in t for t in tokens)
+    a_entry = [c for c in cookies if c["id"] == a["id"]][0]
+    assert "acctA_rotated" in a_entry["cookie"]  # A 那条 cookie 已换、id 不变
+    assert any("acctB" in c["cookie"] for c in cookies)
+
+
+def test_update_unknown_id_is_noop(cookie_dir):
+    store_leonardo_cookie(_leo_cookie("acctA"))
+    out = update_leonardo_cookie("nonexistent", _leo_cookie("x"))
+    assert out["updated"] == 0 and out["count"] == 1  # 找不到 id 不新建
 
 
 def test_status_reports_fingerprint_without_leaking_cookie(cookie_dir):

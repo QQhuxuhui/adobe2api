@@ -119,7 +119,10 @@ class Adobe2ApiCookieProvider:
         return cookie, fingerprint
 
     def fetch_all(self):
-        """多账号：拉取全部已导入 cookie，返回 [(cookie, fingerprint), ...]。空列表＝没导入。"""
+        """多账号：拉取全部已导入 cookie，返回 [(id, cookie, fingerprint), ...]。空＝没导入。
+
+        id 是稳定标识（轮换改指纹但 id 不变），refresher 据此维护每账号独立浏览器上下文。
+        """
         try:
             resp = self._session.get(
                 f"{self._base_url}/api/v1/tokens/leonardo/cookies",
@@ -138,26 +141,25 @@ class Adobe2ApiCookieProvider:
             raise RefreshFetchError("invalid_response") from exc
         out = []
         for item in (data or {}).get("cookies") or []:
+            cid = str((item or {}).get("id") or "").strip()
             cookie = str((item or {}).get("cookie") or "").strip()
             fingerprint = str((item or {}).get("fingerprint") or "").strip()
-            if cookie and fingerprint:
-                out.append((cookie, fingerprint))
+            if cid and cookie and fingerprint:
+                out.append((cid, cookie, fingerprint))
         return out
 
-    def store(self, cookie_str: str, replace_fingerprint: Optional[str] = None) -> bool:
-        """把浏览器里轮换后的会话 cookie 存回 adobe2api。
+    def store(self, cookie_str: str, cookie_id: Optional[str] = None):
+        """回写轮换后的 cookie。带 cookie_id 则按 id 就地更新那条。
 
-        better-auth 会轮换 session token；不回写的话，容器重启时会重新注入那份
-        已作废的原始 cookie，导致 login_required、被迫人工重导账号。
-        回写失败只记为 False，绝不影响本次 token 刷新。
+        成功返回新指纹（str），失败返回 None。refresher 据返回的新指纹判定「已同步」，
+        下一轮就复用上下文里的活 cookie、不再从存储重新注入。
         """
         cookie = str(cookie_str or "").strip()
         if not cookie:
-            return False
+            return None
         payload = {"cookie": cookie}
-        if replace_fingerprint:
-            # 只替换该账号那条，不影响其它账号
-            payload["replace_fingerprint"] = str(replace_fingerprint)
+        if cookie_id:
+            payload["cookie_id"] = str(cookie_id)
         try:
             resp = self._session.post(
                 f"{self._base_url}/api/v1/tokens/leonardo/cookie",
@@ -166,14 +168,27 @@ class Adobe2ApiCookieProvider:
                 timeout=15,
             )
         except Exception:  # noqa: BLE001 - 回写失败不影响刷新主流程
-            return False
-        return int(getattr(resp, "status_code", 0)) < 400
+            return None
+        if int(getattr(resp, "status_code", 0)) >= 400:
+            return None
+        try:
+            return str((resp.json() or {}).get("fingerprint") or "")
+        except Exception:  # noqa: BLE001
+            return ""
 
     def close(self) -> None:
         self._session.close()
 
 
 class PlaywrightSessionSource:
+    """每个账号一个独立浏览器上下文（按稳定 id 索引）。
+
+    关键：上下文一旦建立就保住该账号轮换后的活 cookie（含 Cloudflare 放行 cookie），
+    后续 get-session 直接用上下文里的活值，**不再从存储重新注入**——这就是单账号版本
+    健壮而旧的多账号版本（每轮 clear+重注入共享上下文）会把会话链打断的根因。
+    只有用户重导了新 cookie（指纹与已同步值不同）才重新注入。回写只为重启后恢复。
+    """
+
     def __init__(
         self,
         *,
@@ -185,39 +200,35 @@ class PlaywrightSessionSource:
         self._cookie_provider = cookie_provider
         self._playwright_factory = playwright_factory
         self._playwright = None
-        self._context = None
-        self._page = None
-        self._loaded_fingerprint = None
+        self._browser = None
+        # cookie_id -> {"context": ctx, "fp": 已同步的指纹}
+        self._accounts = {}
 
     def open(self) -> None:
-        if self._context is not None:
+        if self._browser is not None:
             return
         self._playwright = self._playwright_factory()
-        # headless：不做交互登录（登录在本地完成、cookie 上传），容器内无 GUI。
-        # chromium_sandbox=False：Docker+非 root 下开内建沙箱会 "sandboxing failed"。
         launch_kwargs = {
             "headless": True,
             "chromium_sandbox": False,
             "args": list(_ANTIDETECT_ARGS),
             "ignore_default_args": ["--enable-automation"],
-            "user_agent": _ANTIDETECT_UA,
-            "locale": "en-US",
-            "viewport": {"width": 1280, "height": 800},
         }
         if self._config.proxy:  # 空＝直连（proxy={"server":""} 非法）
             launch_kwargs["proxy"] = {"server": self._config.proxy}
-        self._context = self._playwright.chromium.launch_persistent_context(
-            self._config.profile_dir,
-            **launch_kwargs,
-        )
-        self._context.add_init_script(_ANTIDETECT_JS)
-        self._page = (
-            self._context.pages[0]
-            if self._context.pages
-            else self._context.new_page()
-        )
+        self._browser = self._playwright.chromium.launch(**launch_kwargs)
 
-    def _apply_cookies(self, cookie_str: str) -> None:
+    def _new_context(self):
+        ctx = self._browser.new_context(
+            user_agent=_ANTIDETECT_UA,
+            locale="en-US",
+            viewport={"width": 1280, "height": 800},
+        )
+        ctx.add_init_script(_ANTIDETECT_JS)
+        return ctx
+
+    @staticmethod
+    def _apply_cookies_to(ctx, cookie_str: str) -> None:
         cookies = []
         for pair in str(cookie_str or "").split(";"):
             pair = pair.strip()
@@ -226,60 +237,74 @@ class PlaywrightSessionSource:
                 cookies.append(
                     {"name": name.strip(), "value": value.strip(), "url": LEONARDO_HOME_URL}
                 )
-        self._context.clear_cookies()
+        ctx.clear_cookies()
         if cookies:
-            self._context.add_cookies(cookies)
+            ctx.add_cookies(cookies)
 
     def list_cookies(self):
-        """多账号：返回全部已导入 cookie [(cookie, fingerprint), ...]。空＝没导入。"""
+        """多账号：返回全部已导入 cookie [(id, cookie, fingerprint), ...]。空＝没导入。"""
         fetch_all = getattr(self._cookie_provider, "fetch_all", None)
-        if callable(fetch_all):
-            return fetch_all()
-        # 兼容只有单 cookie 的旧 provider
-        provided = self._cookie_provider.fetch()
-        return [provided] if provided else []
+        return fetch_all() if callable(fetch_all) else []
 
-    def _persist_rotated_cookie(self, loaded_cookie: str, fingerprint: str) -> None:
-        """会话 cookie 被上游轮换后回写存储（只替换该账号那条）。"""
+    def fetch_token(self) -> str:
+        """便捷：刷新第一条 cookie（单账号/测试用）。"""
+        cookies = self.list_cookies()
+        if not cookies:
+            raise CookieRequiredError()
+        cid, cookie_str, fingerprint = cookies[0]
+        return self.fetch_token_for(cid, cookie_str, fingerprint)
+
+    def _persist_rotated(self, ctx, cookie_id: str, loaded_cookie: str, acct: dict) -> None:
+        """会话 cookie 被上游轮换后按 id 就地回写存储（供重启恢复）。"""
         store = getattr(self._cookie_provider, "store", None)
         if not callable(store):
             return
         try:
-            current = extract_session_cookie_string(self._context.cookies())
+            current = extract_session_cookie_string(ctx.cookies())
         except Exception:  # noqa: BLE001 - 读取失败不影响刷新
             return
         if not current or current == str(loaded_cookie or "").strip():
             return
-        if store(current, replace_fingerprint=fingerprint):
-            # 该账号存储已更新（指纹变了），置空以便下轮重新注入
-            if fingerprint == self._loaded_fingerprint:
-                self._loaded_fingerprint = None
+        new_fp = store(current, cookie_id=cookie_id)
+        if new_fp:
+            # 存储已同步到轮换后的指纹；标记 acct 已同步，下轮不再重注入、复用上下文活 cookie
+            acct["fp"] = new_fp
 
-    def fetch_token(self) -> str:
-        """单账号：拉第一条 cookie 刷新（向后兼容）。"""
-        provided = self._cookie_provider.fetch()
-        if not provided:
-            raise CookieRequiredError()
-        cookie_str, fingerprint = provided
-        return self.fetch_token_for(cookie_str, fingerprint)
-
-    def fetch_token_for(self, cookie_str: str, fingerprint: str) -> str:
-        if self._context is None:
+    def fetch_token_for(self, cookie_id: str, cookie_str: str, fingerprint: str) -> str:
+        if self._browser is None:
             try:
                 self.open()
             except Exception as exc:
                 self._reset_browser()
                 raise RefreshFetchError("browser_control") from exc
 
+        acct = self._accounts.get(cookie_id)
+        if acct is None:
+            try:
+                acct = {"context": self._new_context(), "fp": None}
+            except Exception as exc:
+                self._reset_browser()
+                raise RefreshFetchError("browser_control") from exc
+            self._accounts[cookie_id] = acct
+        ctx = acct["context"]
+
         try:
-            if fingerprint != self._loaded_fingerprint:
-                self._apply_cookies(cookie_str)
-                self._page.goto(
+            if fingerprint != acct["fp"]:
+                # 新账号 或 用户重导了新 cookie → 从存储 cookie 起步
+                self._apply_cookies_to(ctx, cookie_str)
+                acct["fp"] = fingerprint
+            page = ctx.new_page()
+            try:
+                page.goto(
                     LEONARDO_HOME_URL, wait_until="domcontentloaded", timeout=60000
                 )
-                self._loaded_fingerprint = fingerprint
-            result = self._page.evaluate(_SESSION_FETCH_SCRIPT)
-            self._persist_rotated_cookie(cookie_str, fingerprint)
+                result = page.evaluate(_SESSION_FETCH_SCRIPT)
+            finally:
+                try:
+                    page.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._persist_rotated(ctx, cookie_id, cookie_str, acct)
         except Exception as exc:
             if self._is_browser_control_error(exc):
                 self._reset_browser()
@@ -287,6 +312,10 @@ class PlaywrightSessionSource:
             kind = "proxy" if "proxy" in str(exc).lower() else "network"
             raise RefreshFetchError(kind) from exc
 
+        return self._parse_session(result)
+
+    @staticmethod
+    def _parse_session(result) -> str:
         if not isinstance(result, dict):
             raise RefreshFetchError("invalid_response")
         try:
@@ -300,7 +329,6 @@ class PlaywrightSessionSource:
             raise RefreshFetchError("geo_embargo")
         if status == 401:
             raise LoginRequiredError()
-        # 先判 >=400（CF/nginx 5xx HTML 网关页），再把 200 的 HTML 视为登录页。
         if status >= 400:
             raise RefreshFetchError(f"http_{status}")
         if "text/html" in content_type:
@@ -335,21 +363,26 @@ class PlaywrightSessionSource:
         )
 
     def _reset_browser(self) -> None:
-        context = self._context
+        accounts = self._accounts
+        browser = self._browser
         playwright = self._playwright
-        self._context = None
+        self._accounts = {}
+        self._browser = None
         self._playwright = None
-        self._page = None
-        self._loaded_fingerprint = None
-        if context is not None:
+        for acct in accounts.values():
             try:
-                context.close()
-            except Exception:
+                acct["context"].close()
+            except Exception:  # noqa: BLE001
+                pass
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:  # noqa: BLE001
                 pass
         if playwright is not None:
             try:
                 playwright.stop()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
 
     def close(self) -> None:

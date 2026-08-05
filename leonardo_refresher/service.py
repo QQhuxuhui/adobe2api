@@ -209,33 +209,33 @@ class RefresherService:
             return self.config.poll_interval_seconds
 
         self.state.set_global_error(None)
-        present = {fp for _, fp in cookies}
+        present = {cid for cid, _, _ in cookies}
         self.state.prune(present)
-        for fp in list(self._known):
-            if fp not in present:
-                self._known.pop(fp, None)
+        for cid in list(self._known):
+            if cid not in present:
+                self._known.pop(cid, None)
 
         now = int(self.now())
-        for cookie_str, fingerprint in cookies:
-            known_exp = self._known.get(fingerprint)
+        for cid, cookie_str, fingerprint in cookies:
+            known_exp = self._known.get(cid)
             # 新账号，或距过期不足安全边界 → 需要刷新；否则跳过（不跑浏览器）
             if known_exp is not None and (known_exp - now) >= self.config.safety_margin_seconds:
                 continue
-            self._refresh_one(cookie_str, fingerprint)
+            self._refresh_one(cid, cookie_str, fingerprint)
 
         return self.config.poll_interval_seconds
 
-    def _refresh_one(self, cookie_str: str, fingerprint: str) -> None:
+    def _refresh_one(self, cid: str, cookie_str: str, fingerprint: str) -> None:
         try:
-            token = self.source.fetch_token_for(cookie_str, fingerprint)
+            token = self.source.fetch_token_for(cid, cookie_str, fingerprint)
         except CookieRequiredError:
             self.state.mark_account_failure(
-                fingerprint, state="login_required",
+                cid, state="login_required",
                 session_state="login_required", error_kind="cookie_required")
             return
         except LoginRequiredError:
             self.state.mark_account_failure(
-                fingerprint, state="login_required",
+                cid, state="login_required",
                 session_state="login_required", error_kind="login_required")
             return
         except RefreshFetchError as exc:
@@ -243,16 +243,16 @@ class RefresherService:
                 self._browser_control_this_pass = True
                 self.state.set_browser_ok(False)
                 self.state.mark_account_failure(
-                    fingerprint, state="browser_unavailable",
+                    cid, state="browser_unavailable",
                     session_state="unknown", error_kind="browser_control")
             else:
                 self.state.mark_account_failure(
-                    fingerprint, state="refresh_retrying",
+                    cid, state="refresh_retrying",
                     session_state="unknown", error_kind=exc.kind)
             return
         except Exception:
             self.state.mark_account_failure(
-                fingerprint, state="refresh_retrying",
+                cid, state="refresh_retrying",
                 session_state="unknown", error_kind="unexpected_fetch_error")
             return
 
@@ -260,14 +260,14 @@ class RefresherService:
             claims = decode_id_token(token)
         except ValueError:
             self.state.mark_account_failure(
-                fingerprint, state="login_required",
+                cid, state="login_required",
                 session_state="login_required", error_kind="invalid_token")
             return
 
         exp = int(claims["exp"])
         if exp - int(self.now()) < self.config.safety_margin_seconds:
             self.state.mark_account_failure(
-                fingerprint, state="refresh_retrying",
+                cid, state="refresh_retrying",
                 session_state="authenticated", error_kind="stale_token")
             return
 
@@ -275,17 +275,17 @@ class RefresherService:
             self.sink.push(token, self.config.account_label)
         except TokenPushError as exc:
             self.state.mark_account_failure(
-                fingerprint, state="push_failed",
+                cid, state="push_failed",
                 session_state="authenticated", error_kind=exc.kind)
             return
         except Exception:
             self.state.mark_account_failure(
-                fingerprint, state="push_failed",
+                cid, state="push_failed",
                 session_state="authenticated", error_kind="unexpected_push_error")
             return
 
-        self._known[fingerprint] = exp
-        self.state.mark_account_healthy(fingerprint, now=int(self.now()), exp=exp)
+        self._known[cid] = exp
+        self.state.mark_account_healthy(cid, now=int(self.now()), exp=exp)
 
     def run_forever(self, stop_event) -> None:
         browser_control_failures = 0

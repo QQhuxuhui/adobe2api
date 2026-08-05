@@ -5,6 +5,7 @@ import math
 import os
 import re
 import time
+import uuid
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -39,18 +40,31 @@ def _cookies_path():
     return token_mgr_module.CONFIG_DIR / "leonardo_cookies.json"
 
 
+def _ensure_ids(items: list) -> list:
+    """给每条 cookie 补一个稳定 id：轮换会改指纹，但 id 不变，写回/删除都按 id。"""
+    changed = False
+    for it in items:
+        if not str(it.get("id") or "").strip():
+            it["id"] = uuid.uuid4().hex[:12]
+            changed = True
+    if changed:
+        _save_cookies(items)
+    return items
+
+
 def _load_cookies() -> list:
-    """读多 cookie 列表；不存在时从旧单 cookie 文件迁移。返回 [{cookie,fingerprint,updated_at}]。"""
+    """读多 cookie 列表；不存在时从旧单 cookie 文件迁移。返回 [{id,cookie,fingerprint,updated_at}]。"""
     path = _cookies_path()
     if path.exists():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             items = data.get("cookies") if isinstance(data, dict) else data
-            return [
+            items = [
                 x
                 for x in (items or [])
                 if isinstance(x, dict) and str(x.get("cookie") or "").strip()
             ]
+            return _ensure_ids(items)
         except Exception:  # noqa: BLE001 - 损坏当作空
             return []
     old = _cookie_path()
@@ -58,13 +72,15 @@ def _load_cookies() -> list:
         try:
             d = json.loads(old.read_text(encoding="utf-8"))
             if str(d.get("cookie") or "").strip():
-                return [
-                    {
-                        "cookie": d["cookie"],
-                        "fingerprint": d.get("fingerprint", ""),
-                        "updated_at": d.get("updated_at"),
-                    }
-                ]
+                return _ensure_ids(
+                    [
+                        {
+                            "cookie": d["cookie"],
+                            "fingerprint": d.get("fingerprint", ""),
+                            "updated_at": d.get("updated_at"),
+                        }
+                    ]
+                )
         except Exception:  # noqa: BLE001
             pass
     return []
@@ -155,49 +171,49 @@ def store_leonardo_cookie(raw_cookie: str) -> dict:
             it["cookie"] = cookie
             it["updated_at"] = updated_at
             _save_cookies(items)
-            return {"fingerprint": fingerprint, "updated_at": updated_at, "count": len(items)}
-    items.append({"cookie": cookie, "fingerprint": fingerprint, "updated_at": updated_at})
+            return {"id": it["id"], "fingerprint": fingerprint, "updated_at": updated_at, "count": len(items)}
+    new_id = uuid.uuid4().hex[:12]
+    items.append({"id": new_id, "cookie": cookie, "fingerprint": fingerprint, "updated_at": updated_at})
     _save_cookies(items)
-    return {"fingerprint": fingerprint, "updated_at": updated_at, "count": len(items)}
+    return {"id": new_id, "fingerprint": fingerprint, "updated_at": updated_at, "count": len(items)}
 
 
-def replace_leonardo_cookie(raw_cookie: str, old_fingerprint: str) -> dict:
-    """会话 cookie 被上游轮换后回写：把 old_fingerprint 那条替换成新 cookie。
+def update_leonardo_cookie(cookie_id: str, raw_cookie: str) -> dict:
+    """会话 cookie 被上游轮换后回写：按稳定 id 就地更新那条（指纹随之变化）。
 
-    找不到旧条目则按去重追加。用于 refresher 回写单个账号的轮换 cookie，
-    不影响其它账号。
+    指纹会变、id 不变，所以按 id 定位不会像按指纹那样找不到而追加、攒垃圾。
+    找不到该 id 则不动（返回 updated=0），避免误建重复账号。
     """
+    cid = str(cookie_id or "").strip()
     cookie = extract_better_auth_cookies(raw_cookie)
     fingerprint = hashlib.sha256(cookie.encode("utf-8")).hexdigest()
     updated_at = int(time.time())
     items = _load_cookies()
-    old_fp = str(old_fingerprint or "").strip()
     for it in items:
-        if old_fp and it.get("fingerprint") == old_fp:
+        if it.get("id") == cid:
             it["cookie"] = cookie
             it["fingerprint"] = fingerprint
             it["updated_at"] = updated_at
             _save_cookies(items)
-            return {"fingerprint": fingerprint, "updated_at": updated_at, "count": len(items)}
-    if not any(it.get("fingerprint") == fingerprint for it in items):
-        items.append({"cookie": cookie, "fingerprint": fingerprint, "updated_at": updated_at})
-    _save_cookies(items)
-    return {"fingerprint": fingerprint, "updated_at": updated_at, "count": len(items)}
+            return {"updated": 1, "id": cid, "fingerprint": fingerprint, "count": len(items)}
+    return {"updated": 0, "id": cid, "count": len(items)}
 
 
 def remove_leonardo_cookie(fingerprint: str) -> dict:
-    """按指纹删除一条已导入的 cookie（用于清理刷不出来的失效账号）。
+    """删除一条已导入的 cookie（用于清理刷不出来的失效账号）。
 
-    支持完整指纹或前缀匹配（后台只展示前 12 位）。返回删除条数与剩余数。
+    优先按稳定 id 精确匹配（指纹会随轮换变，按 id 才可靠）；兼容旧的指纹前缀匹配。
+    返回删除条数与剩余数。
     """
-    fp = str(fingerprint or "").strip()
-    if not fp:
+    key = str(fingerprint or "").strip()
+    if not key:
         return {"removed": 0, "count": len(_load_cookies())}
     items = _load_cookies()
     kept = [
         it
         for it in items
-        if not str(it.get("fingerprint") or "").startswith(fp)
+        if it.get("id") != key
+        and not str(it.get("fingerprint") or "").startswith(key)
     ]
     _save_cookies(kept)
     return {"removed": len(items) - len(kept), "count": len(kept)}
@@ -207,6 +223,7 @@ def list_leonardo_cookies() -> list:
     """全部已导入 cookie（含明文，仅供 refresh-key 接口内部使用）。"""
     return [
         {
+            "id": it.get("id", ""),
             "cookie": it.get("cookie", ""),
             "fingerprint": it.get("fingerprint", ""),
             "updated_at": it.get("updated_at"),
@@ -216,10 +233,14 @@ def list_leonardo_cookies() -> list:
 
 
 def read_leonardo_cookie_status() -> dict:
-    """后台展示用的 cookie 状态——只回指纹与时间，绝不回传 cookie 明文。"""
+    """后台展示用的 cookie 状态——只回 id/指纹/时间，绝不回传 cookie 明文。"""
     items = _load_cookies()
     cookies = [
-        {"fingerprint": str(it.get("fingerprint") or ""), "updated_at": it.get("updated_at")}
+        {
+            "id": str(it.get("id") or ""),
+            "fingerprint": str(it.get("fingerprint") or ""),
+            "updated_at": it.get("updated_at"),
+        }
         for it in items
     ]
     return {
@@ -242,9 +263,9 @@ def build_leonardo_token_router(*, token_manager) -> APIRouter:
     ):
         _require_refresh_key(request)
         try:
-            # 带 replace_fingerprint 表示 refresher 回写某账号轮换后的 cookie
-            if req.replace_fingerprint:
-                return replace_leonardo_cookie(req.cookie, req.replace_fingerprint)
+            # 带 cookie_id 表示 refresher 回写某账号轮换后的 cookie（按 id 就地更新）
+            if req.cookie_id:
+                return update_leonardo_cookie(req.cookie_id, req.cookie)
             return store_leonardo_cookie(req.cookie)
         except ValueError:
             raise HTTPException(

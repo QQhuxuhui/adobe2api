@@ -620,7 +620,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         btn.className = "danger";
         btn.textContent = "删除";
         btn.style.padding = "1px 8px";
-        btn.addEventListener("click", () => removeLeoCookie(c.fingerprint, btn));
+        btn.addEventListener("click", () => removeLeoCookie(c.id || c.fingerprint, btn));
         row.appendChild(span);
         row.appendChild(btn);
         leoCookieStatus.appendChild(row);
