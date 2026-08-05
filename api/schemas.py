@@ -1,7 +1,14 @@
 import math
-from typing import Any, List, Literal, Optional
+from typing import Annotated, Any, List, Literal, Optional
 
-from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictInt,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 
 class GenerateRequest(BaseModel):
@@ -58,6 +65,11 @@ class LeonardoLoginReportRequest(BaseModel):
         if self.status == "ok" and self.last_error_kind:
             raise ValueError("ok must not carry last_error_kind")
         return self
+
+
+class LeonardoLoginImportRequest(BaseModel):
+    # 每行 email:password；限长防止超大 body（超长 → 422）
+    text: Annotated[str, StringConstraints(max_length=200_000)]
 
 
 class ExportSelectionRequest(BaseModel):

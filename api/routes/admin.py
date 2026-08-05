@@ -14,6 +14,7 @@ from api.schemas import (
     AdminLoginRequest,
     ConfigUpdateRequest,
     ExportSelectionRequest,
+    LeonardoLoginImportRequest,
     ProxyTestRequest,
     RefreshCookieBatchImportRequest,
     RefreshCookieImportRequest,
@@ -883,6 +884,31 @@ def build_admin_router(
             **saved,
             "message": "已保存；refresher 约 15 秒内自动取新 token 入池（支持多账号，不覆盖已导入的）",
         }
+
+    @router.post("/api/v1/leonardo/login")
+    def leonardo_login_import(req: LeonardoLoginImportRequest, request: Request):
+        """后台「导入 Leonardo 登录账号」（每行 email:password，交给 refresher 自动登录）。"""
+        require_admin_auth(request)
+        from api.routes.leonardo_login_store import login_store
+
+        return {"status": "ok", **login_store.import_lines(req.text)}
+
+    @router.get("/api/v1/leonardo/login/status")
+    def leonardo_login_status(request: Request):
+        require_admin_auth(request)
+        from api.routes.leonardo_login_store import login_store
+
+        return login_store.status_view()
+
+    @router.delete("/api/v1/leonardo/login/{login_id}")
+    def leonardo_login_remove(login_id: str, request: Request):
+        require_admin_auth(request)
+        from api.routes.leonardo_login_store import login_store
+
+        result = login_store.remove(login_id)
+        if not result.get("removed"):
+            raise HTTPException(status_code=404, detail="未找到该登录账号")
+        return {"status": "ok", **result}
 
     @router.post("/api/v1/refresh-profiles/import-cookie-batch")
     def refresh_profiles_import_cookie_batch(
