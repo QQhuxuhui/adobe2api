@@ -198,6 +198,57 @@ class Adobe2ApiCookieProvider:
         except Exception:  # noqa: BLE001
             return ""
 
+    def fetch_logins(self):
+        """拉取待自动登录的账号凭据，返回 [{id,email,password,credential_rev}, ...]。
+
+        404/空 → []；网络错误/HTTP≥400/非 JSON → RefreshFetchError 交由上层归入重试。
+        每项须齐 id+email+password 才纳入；credential_rev 缺省 1。
+        """
+        try:
+            resp = self._session.get(
+                f"{self._base_url}/api/v1/tokens/leonardo/logins",
+                headers={"X-Leonardo-Refresh-Key": self._refresh_key},
+                timeout=15,
+            )
+        except requests.RequestException as exc:
+            raise RefreshFetchError("network") from exc
+        if resp.status_code == 404:
+            return []
+        if resp.status_code >= 400:
+            raise RefreshFetchError(f"logins_http_{resp.status_code}")
+        try:
+            data = resp.json()
+        except (TypeError, ValueError) as exc:
+            raise RefreshFetchError("invalid_response") from exc
+        out = []
+        for x in (data or {}).get("logins") or []:
+            if x.get("id") and x.get("email") and x.get("password"):
+                out.append({
+                    "id": str(x["id"]),
+                    "email": str(x["email"]),
+                    "password": str(x["password"]),
+                    "credential_rev": int(x.get("credential_rev") or 1),
+                })
+        return out
+
+    def report_login(self, id, credential_rev, status, last_error_kind=None, balance=None):
+        """回报一次自动登录结果（成功/失败/余额）。回报失败绝不打断刷新主流程。"""
+        try:
+            self._session.post(
+                f"{self._base_url}/api/v1/tokens/leonardo/login/report",
+                headers={"X-Leonardo-Refresh-Key": self._refresh_key},
+                json={
+                    "id": id,
+                    "credential_rev": int(credential_rev),
+                    "status": status,
+                    "last_error_kind": last_error_kind,
+                    "balance": balance,
+                },
+                timeout=15,
+            )
+        except Exception:  # noqa: BLE001 - 回报失败不打断刷新
+            pass
+
     def close(self) -> None:
         self._session.close()
 

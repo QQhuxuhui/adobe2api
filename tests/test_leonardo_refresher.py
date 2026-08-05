@@ -487,6 +487,22 @@ def test_cookie_provider_network_error_is_retryable():
     assert exc_info.value.kind == "network"
 
 
+def test_fetch_logins_returns_list():
+    session = _GetSession(response=_GetResponse(payload={"logins": [
+        {"id": "i1", "email": "a@b.co", "password": "pw", "credential_rev": 2}]}))
+    p = Adobe2ApiCookieProvider(base_url="http://x", refresh_key="k", session_factory=lambda: session)
+    assert p.fetch_logins() == [{"id": "i1", "email": "a@b.co", "password": "pw", "credential_rev": 2}]
+    assert session.calls[0]["url"].endswith("/api/v1/tokens/leonardo/logins")
+
+
+def test_report_login_posts_and_swallows_errors():
+    session = _PushSession(error=requests.ConnectionError("down"))
+    p = Adobe2ApiCookieProvider(base_url="http://x", refresh_key="k", session_factory=lambda: session)
+    p.report_login("i1", 2, "ok", balance=5.0)  # 不抛
+    assert session.calls[0]["json"] == {"id": "i1", "credential_rev": 2, "status": "ok",
+                                        "last_error_kind": None, "balance": 5.0}
+
+
 def test_token_sink_ignores_environment_proxy_and_sends_scoped_key():
     session = _PushSession(response=_PushResponse(payload={"status": "created"}))
     sink = Adobe2ApiTokenSink(
