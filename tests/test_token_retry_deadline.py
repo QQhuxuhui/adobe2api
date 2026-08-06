@@ -675,3 +675,71 @@ def test_admin_rejects_boolean_deadline():
 
     assert response.status_code == 422
     assert config.data["gemini_native_deadline_seconds"] == 500
+
+
+# --- 换号预算（第二道保险，deadline 是主保险） ---
+
+
+def test_rotation_budget_caps_account_switches(retry_env, monkeypatch):
+    """号池很大时，光是挨个试过去就能把整个预算烧光。
+
+    删掉这段守卫的话，单请求会退化成「把死号池全量试一遍」——
+    正是事故里 attempt=7 的现象。
+    """
+    tokens, _client = retry_env
+    tokens.tokens = [f"token-{i}" for i in range(10)]
+    monkeypatch.setattr(app_module, "_rotation_max_accounts", lambda op: 3)
+
+    with pytest.raises(Exception):
+        app_module._run_with_token_retries(
+            request=make_request(),
+            operation_name="images.edits",
+            run_once=lambda token: (_ for _ in ()).throw(
+                QuotaExhaustedError("quota exhausted")
+            ),
+            set_request_error_detail=lambda *args, **kwargs: "ERR-TEST",
+        )
+
+    assert tokens.selection_calls == 3, (
+        f"上限 3 就该只试 3 个账号，实际 {tokens.selection_calls}"
+    )
+    assert tokens.exhausted, "被试过的账号仍然要出池"
+
+
+def test_rotation_budget_off_by_default(retry_env, monkeypatch):
+    """未配置上限的 operation 行为不变：试到池子空为止。"""
+    tokens, _client = retry_env
+    tokens.tokens = [f"token-{i}" for i in range(4)]
+    monkeypatch.setattr(app_module, "_rotation_max_accounts", lambda op: 0)
+
+    with pytest.raises(Exception):
+        app_module._run_with_token_retries(
+            request=make_request(),
+            operation_name="chat.completions",
+            run_once=lambda token: (_ for _ in ()).throw(
+                QuotaExhaustedError("quota exhausted")
+            ),
+            set_request_error_detail=lambda *args, **kwargs: "ERR-TEST",
+        )
+
+    assert tokens.selection_calls == 5, "4 个账号全试完，第 5 次拿不到号才退出"
+
+
+def test_non_retryable_quota_stops_immediately(retry_env, monkeypatch):
+    """轮询阶段的配额耗尽：上游已受理并计费，换号重跑会再扣一次费。"""
+    tokens, _client = retry_env
+    tokens.tokens = [f"token-{i}" for i in range(5)]
+    monkeypatch.setattr(app_module, "_rotation_max_accounts", lambda op: 0)
+
+    with pytest.raises(Exception):
+        app_module._run_with_token_retries(
+            request=make_request(),
+            operation_name="images.edits",
+            run_once=lambda token: (_ for _ in ()).throw(
+                QuotaExhaustedError("quota exhausted", retryable=False)
+            ),
+            set_request_error_detail=lambda *args, **kwargs: "ERR-TEST",
+        )
+
+    assert tokens.selection_calls == 1, "不可重试就只能试一个账号"
+    assert tokens.exhausted, "但账号仍然要出池——池子该干净还是要干净"
