@@ -2,12 +2,13 @@ import json
 import base64
 import copy
 import logging
+import math
 import os
 import threading
 import time
 import uuid
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Dict
 
@@ -38,6 +39,60 @@ class TokenLease:
         self.leased = leased
 
 
+def retire_account_for_quota(
+    manager,
+    *,
+    account_key: str = "",
+    token: str = "",
+    token_id: str = "",
+    operation_name: str = "",
+) -> bool:
+    """配额耗尽 → 整个账号出池。三条生成链路共用。
+
+    配额是账号级的，而一个账号可能有多行 token（手动导入一行、自动刷新一行）；
+    只标一行的话另一行照样会被选中，死号就一直留在调度池里被反复撞。
+
+    账号键优先用调用方手里稳定的那个：app 侧是租约的 account_key，后台循环是
+    请求前保存的 token_id。都拿不到才回落到 token 值反查——请求在飞期间 cookie
+    刷新可能已经换掉 token 值，反查会落空，所以它只是兜底而不是主路径。
+
+    manager 由调用方传入（测试会注入 Fake），不直接用模块级单例。
+    """
+    key = str(account_key or "").strip()
+    if not key:
+        resolver = getattr(manager, "account_key_for_id", None)
+        if callable(resolver):
+            try:
+                key = str(resolver(token_id, fallback_value=token) or "").strip()
+            except TypeError:
+                # 老签名/测试桩没有 fallback_value 形参
+                key = str(resolver(token_id) or "").strip()
+    retire = getattr(manager, "report_account_exhausted", None)
+    if key and callable(retire) and retire(key):
+        return True
+
+    # 拿着旧 key 没命中任何行：请求在飞期间自动刷新可能给该行补上了 account_id，
+    # 而 _account_key 是 account_id 优先 —— 键变了，租约里那个已经是旧的。
+    # 用稳定的 token_id（刷新只改值不换 id）重新解析一次再试。
+    if callable(retire):
+        resolver = getattr(manager, "account_key_for_id", None)
+        if callable(resolver):
+            try:
+                fresh = str(resolver(token_id, fallback_value=token) or "").strip()
+            except TypeError:
+                fresh = str(resolver(token_id) or "").strip()
+            if fresh and fresh != key and retire(fresh):
+                return True
+    manager.report_exhausted(token)
+    if not key:
+        logger.warning(
+            "quota exhausted but account key unresolved (operation=%s); "
+            "fell back to token-value retirement",
+            operation_name or "-",
+        )
+    return False
+
+
 # acquire_lease 的结果原因
 LEASE_OK = "ok"
 LEASE_NO_TOKEN = "no_token"      # 该请求可用的账号已试完/池里没有该类型
@@ -63,6 +118,11 @@ class TokenManager:
         self._inflight: Dict[str, int] = {}
         self._gate_cond = threading.Condition(self._lock)
         self._waiters = 0
+        # 账号级配额事件版本号：account_key -> 单调递增整数，每次「配额耗尽」+1。
+        # 余额刷新用它定序——余额请求发起前读一次，落盘时版本没变才允许复活账号。
+        # 不能用时间戳代替：余额的 updated_at 是秒级的 int(time.time())，
+        # 与耗尽事件同秒时无法比较先后。
+        self._quota_epochs: Dict[str, int] = {}
         self._unreadable_data_file: Optional[Path] = None
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         self.load()
@@ -85,6 +145,7 @@ class TokenManager:
                         t.setdefault("error_until", 0)
                         # 老库没有这个字段：视为「从未用过」，重启后先轮到它们
                         t.setdefault("last_used_at", 0)
+                    self._rebuild_quota_epochs_locked()
                     if source == LEGACY_DATA_FILE and not DATA_FILE.exists():
                         self.save()
                     self._unreadable_data_file = None
@@ -213,8 +274,12 @@ class TokenManager:
 
             if target is not None:
                 target["value"] = value
-                target["status"] = "active"
-                target["fails"] = 0
+                # exhausted 是账号配额耗尽，与 token 新旧无关：cookie 刷新不得复活它，
+                # 否则每个刷新周期都会把死号重新送回池子里挨撞。
+                # 复活只走余额驱动那条路（set_credits_and_maybe_revive）。
+                if target.get("status") != "exhausted":
+                    target["status"] = "active"
+                    target["fails"] = 0
                 # 刷新只换了 token 值，账号没变；限流是账号级的，正在冷却中就别清零，
                 # 否则一次自动刷新会把 429 冷却窗口悄悄抹掉。已过期的照常归零。
                 if float(target.get("error_until") or 0) <= now_ts:
@@ -230,10 +295,23 @@ class TokenManager:
                 self.save()
                 return dict(target)
 
+            # 同账号已经因为配额耗尽出池的话，新建的行必须继承这个终态：
+            # 否则 profile 第一次推 token 就凭空造出一行 active，
+            # 把整个死账号重新放回调度池。
+            account_status = "active"
+            if account_id:
+                for t in self.tokens:
+                    if (
+                        str(t.get("account_id") or "").strip() == account_id
+                        and t.get("status") == "exhausted"
+                    ):
+                        account_status = "exhausted"
+                        break
+
             new_token = {
                 "id": uuid.uuid4().hex[:8],
                 "value": value,
-                "status": "active",
+                "status": account_status,
                 "fails": 0,
                 "added_at": now_ts,
                 "updated_at": now_ts,
@@ -313,10 +391,14 @@ class TokenManager:
 
             now_ts = time.time()
             profile_name = str(label or "").strip() or aid
+            # 和 upsert_auto_refresh_token 同一条规矩：刷新只换 token 值，
+            # 不复活配额耗尽的账号——否则每个刷新周期都把死号送回池子里挨撞。
+            # 复活只走余额驱动那条路（set_credits_and_maybe_revive）。
+            keeps_exhausted = target is not None and target.get("status") == "exhausted"
             desired = {
                 "value": token_value,
-                "status": "active",
-                "fails": 0,
+                "status": "exhausted" if keeps_exhausted else "active",
+                "fails": target.get("fails", 0) if keeps_exhausted else 0,
                 "error_until": 0,
                 "type": "leonardo",
                 "source": "leonardo_refresher",
@@ -466,6 +548,64 @@ class TokenManager:
             or str(t.get("refresh_profile_id") or "").strip()
             or str(t.get("value") or "").strip()
         )
+
+    # 下面三个解析器只在选号路径上被调用，而选号是持锁的热路径：
+    # 任何一次 float()/int() 抛异常都会把整个选号打挂，所以脏数据一律降级为
+    # 「没有可用缓存」而不是异常。NaN/Infinity 同样按无效处理。
+    @staticmethod
+    def _quota_epoch_value(value) -> Optional[int]:
+        """配额版本号；缺失或脏数据返回 None（注意 0 是合法版本，不能当空）。"""
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _credits_available_value(row: Dict) -> Optional[float]:
+        """可用余额；缺失或脏数据（含 NaN/Inf）返回 None = 无从判断。"""
+        raw = row.get("credits_available")
+        if raw is None or raw == "":
+            return None
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) else None
+
+    @staticmethod
+    def _credits_updated_at(row: Dict) -> float:
+        """余额快照时间；脏数据一律当作 0（= 无缓存）。"""
+        try:
+            parsed = float(row.get("credits_updated_at") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return parsed if math.isfinite(parsed) else 0.0
+
+    @staticmethod
+    def _parse_credits_until(value) -> Optional[float]:
+        """availableUntil → epoch 秒。
+
+        这个字段是 Adobe 的 availableUntil 原样透传，通常是 ISO 日期字符串
+        （前端直接拿去 new Date()），直接 float() 会抛 ValueError。
+        解析不出来返回 None，由调用方当作「无法判断周期」放行。
+        """
+        if value is None or value == "":
+            return None
+        try:
+            parsed = float(value)
+            return parsed if math.isfinite(parsed) else None
+        except (TypeError, ValueError):
+            pass
+        try:
+            parsed_date = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed_date.tzinfo is None:
+                parsed_date = parsed_date.replace(tzinfo=timezone.utc)
+            timestamp = parsed_date.timestamp()
+            return timestamp if math.isfinite(timestamp) else None
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
 
     @staticmethod
     def _cooldown_seconds() -> float:
@@ -837,21 +977,148 @@ class TokenManager:
                 )
             return items
 
-    def report_exhausted(self, value: str):
+    def _rebuild_quota_epochs_locked(self) -> None:
+        """从落盘的 quota_epoch 重建内存版本号。进程重启后继续单调递增。"""
+        epochs: Dict[str, int] = {}
+        for t in self.tokens:
+            if not isinstance(t, dict):
+                continue
+            epoch = self._quota_epoch_value(t.get("quota_epoch"))
+            if epoch is None:
+                continue
+            key = self._account_key(t)
+            if epoch > epochs.get(key, 0):
+                epochs[key] = epoch
+        self._quota_epochs = epochs
+
+    def _find_account_key_locked(self, value: str) -> str:
+        target = self._find_by_value_locked(value)
+        return self._account_key(target) if target is not None else ""
+
+    def _find_by_value_locked(self, value: str) -> Optional[Dict]:
+        wanted = str(value or "").strip()
+        if not wanted:
+            return None
+        for t in self.tokens:
+            if str(t.get("value") or "").strip() == wanted:
+                return t
+        return None
+
+    def account_key_for_id(self, tid: str, fallback_value: str = "") -> str:
+        """按稳定 token id 读账号键；id 查不到时回落到 token 值反查。
+
+        调用方拿到空串意味着「认不出这是哪个账号」，必须当作出池失败记日志，
+        不能静默跳过——那正是死号留在池里被反复撞的老问题。
+        """
+        key = str(tid or "").strip()
         with self._lock:
+            target = None
+            if key:
+                target = next((t for t in self.tokens if str(t.get("id") or "") == key), None)
+            if target is None:
+                target = self._find_by_value_locked(fallback_value)
+            return self._account_key(target) if target is not None else ""
+
+    def quota_epoch(self, account_key: str) -> int:
+        """读账号当前的配额事件版本号。余额请求发起前调用，落盘时用它比对。"""
+        with self._lock:
+            return self._quota_epochs.get(str(account_key or "").strip(), 0)
+
+    def report_account_exhausted(self, account_key: str) -> bool:
+        """整个账号按配额出池。
+
+        必须按账号而不是按 token 值：同一账号可能有多行 token（手动导入一行、
+        自动刷新一行），只标一行的话另一行照样会被选中。调用方传 lease.account_key
+        或 account_key_for_id() 的结果，不要用 token 值反查——请求在飞期间
+        cookie 刷新可能已经把 token 值换掉，反查会落空。
+        """
+        key = str(account_key or "").strip()
+        if not key:
+            return False
+        with self._lock:
+            epoch = self._quota_epochs.get(key, 0) + 1
+            self._quota_epochs[key] = epoch
+            touched = False
             for t in self.tokens:
-                if t["value"] == value:
+                if self._account_key(t) == key:
                     t["status"] = "exhausted"
                     t["error_until"] = 0
-            self.save()
+                    t["quota_epoch"] = epoch
+                    touched = True
+            if touched:
+                self.save()
+            return touched
+
+    def report_account_invalid(self, account_key: str) -> bool:
+        """整个账号标记为凭证失效。
+
+        仅供「确认整个账号都不可用」的场景（如账号被封）调用；日常的 401
+        请走 token 值级的 report_invalid，见那里的说明。
+
+        已经 exhausted 的行保持原状：配额耗尽是更强的终态，被降级成 invalid
+        会让 cookie 刷新的守卫失效，把死号洗回池子。
+        """
+        key = str(account_key or "").strip()
+        if not key:
+            return False
+        with self._lock:
+            touched = False
+            for t in self.tokens:
+                if self._account_key(t) != key:
+                    continue
+                if t.get("status") == "exhausted":
+                    continue
+                t["status"] = "invalid"
+                t["error_until"] = 0
+                touched = True
+            if touched:
+                self.save()
+            return touched
+
+    def report_exhausted(self, value: str):
+        """兼容包装：按 token 值反查账号后转调账号级接口。
+
+        锁不可重入，所以先在锁内解析账号键、退出锁再调用。
+        新代码应直接用 report_account_exhausted()。
+        """
+        with self._lock:
+            key = self._find_account_key_locked(value)
+        if not key:
+            logger.warning("report_exhausted: token value not found, account not retired")
+            return
+        self.report_account_exhausted(key)
 
     def report_invalid(self, value: str):
+        """凭证失效：只标这一行，不牵连同账号的其他行。
+
+        粒度和配额出池是**故意不同**的：配额是账号级的额度用完了，
+        而 401 只说明「这个 access token 不能用了」——同账号的手动导入行和
+        自动刷新行持有的是两个不同的 token，一个过期不代表另一个也过期。
+        按账号连坐的话，一行陈旧 token 会把持有新 token 的兄弟行一起打死，
+        整个账号要等到下一轮 cookie 刷新（默认 15h）才可能恢复。
+
+        另外不覆盖 exhausted：配额耗尽是更强的终态，被降级成 invalid 后
+        cookie 刷新的守卫（只认 exhausted）就会失效，死号会被洗回调度池。
+        """
+        wanted = str(value or "").strip()
+        if not wanted:
+            return
         with self._lock:
+            touched = False
             for t in self.tokens:
-                if t["value"] == value:
-                    t["status"] = "invalid"
-                    t["error_until"] = 0
-            self.save()
+                if str(t.get("value") or "").strip() != wanted:
+                    continue
+                if t.get("status") == "exhausted":
+                    continue
+                t["status"] = "invalid"
+                t["error_until"] = 0
+                touched = True
+            if touched:
+                self.save()
+            else:
+                logger.warning(
+                    "report_invalid: no eligible row for this token value"
+                )
 
     def report_rate_limited(
         self, value: str, retry_after: Optional[float] = None

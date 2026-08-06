@@ -21,7 +21,9 @@ from core.adobe_client import (
     QuotaExhaustedError,
     UpstreamTemporaryError,
 )
+from core.config_mgr import config_manager
 from core.leonardo_client import LeonardoClient
+from core.token_mgr import retire_account_for_quota
 from core.leonardo_generation import (
     leonardo_geometry_error,
     pool_prefers_leonardo,
@@ -1513,16 +1515,27 @@ def build_generation_router(
                             output_resolution=output_resolution,
                         )
                     return
-                except quota_error_cls:
-                    token_manager.report_exhausted(token)
+                except quota_error_cls as exc:
+                    retire_account_for_quota(
+                        token_manager,
+                        token=token,
+                        token_id=token_id,
+                        operation_name="images.generate",
+                    )
                     last_error = "Token quota exhausted."
                     last_status_code = 429
-                    retryable = attempt < max_attempts
-                except auth_error_cls:
+                    # 轮询阶段的配额耗尽不重试：上游已受理并计费。
+                    retryable = attempt < max_attempts and bool(
+                        getattr(exc, "retryable", True)
+                    )
+                except auth_error_cls as exc:
                     token_manager.report_invalid(token)
                     last_error = "Token invalid or expired."
                     last_status_code = 401
-                    retryable = attempt < max_attempts
+                    # 轮询阶段的 auth 失败不可重试：上游已受理并计费
+                    retryable = attempt < max_attempts and bool(
+                        getattr(exc, "retryable", True)
+                    )
                 except upstream_temp_error_cls as exc:
                     if int(getattr(exc, "status_code", 0) or 0) == 429:
                         # 账号级限流：冷却这个账号，别让下一个请求立刻又打上去

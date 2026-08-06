@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Callable
 
+from core.token_mgr import retire_account_for_quota
+
 
 logger = logging.getLogger("adobe2api.video_tasks")
 
@@ -571,7 +573,17 @@ def build_video_task_runner(
         tried_identities: set[str] = set()
 
         def token_identity(token: str, meta: dict) -> str:
-            return str(meta.get("refresh_profile_id") or "").strip() or token
+            """本请求的「这个账号试过了」去重键。
+
+            口径必须和 TokenManager._account_key 一致（account_id 优先），
+            否则同一账号的手动导入行和自动刷新行会被当成两个账号重复试，
+            白白多撞一次配额、多花一次上传。
+            """
+            return (
+                str(meta.get("token_account_id") or "").strip()
+                or str(meta.get("refresh_profile_id") or "").strip()
+                or token
+            )
 
         for attempt in range(1, max_attempts + 1):
             token = ""
@@ -700,11 +712,19 @@ def build_video_task_runner(
                     result_url=result_url,
                 )
             except quota_error_cls as exc:
-                token_manager.report_exhausted(token)
+                retire_account_for_quota(
+                    token_manager,
+                    token=token,
+                    token_id=token_id,
+                    operation_name="video.generate",
+                )
                 last_error = VideoTaskExecutionError(
                     str(exc), "quota_exceeded", 429
                 )
-                retryable = attempt < max_attempts
+                # 已提交后才发现配额耗尽的（轮询阶段）不重试：上游已计费。
+                retryable = attempt < max_attempts and bool(
+                    getattr(exc, "retryable", True)
+                )
             except auth_error_cls as exc:
                 handler = getattr(token_manager, "handle_auth_failure", None)
                 if callable(handler):

@@ -41,6 +41,7 @@ from core.adobe_client import (
 )
 from core.token_mgr import (
     token_manager,
+    retire_account_for_quota,
     LEASE_QUEUE_FULL,
     LEASE_TIMEOUT,
 )
@@ -993,9 +994,18 @@ def _run_with_token_retries(
             )
             return result
         except QuotaExhaustedError as exc:
-            token_manager.report_exhausted(token)
+            # 用租约上的账号键出池，不要拿 token 值反查：请求在飞期间 cookie 刷新
+            # 可能已经把该行的 token 值换掉，反查会落空、账号就漏标了。
+            retire_account_for_quota(
+                token_manager,
+                account_key=lease.account_key,
+                token=token,
+                operation_name=operation_name,
+            )
             last_exc = exc
-            retryable = True
+            # 轮询阶段发现的配额耗尽标了 retryable=False：上游已经受理并计费，
+            # 换号重跑等于让它再出一次图再扣一次费，用户却只拿一个结果。
+            retryable = bool(getattr(exc, "retryable", True))
             retry_reason = "quota_exhausted"
             err_code = report_error(
                 request,
