@@ -88,7 +88,117 @@ def _nonempty_video_field(value: Any) -> bool:
 EDIT_JSON_IMAGE_FIELDS = ("images", "image", "image_url", "image_urls")
 
 # 上游只支持 6 张输入图; 多收一张用于区分"正好 6 张"和"超了"
+_module_logger = logging.getLogger("adobe2api")
+
 EDIT_MAX_INPUT_IMAGES = 6
+
+# /v1/images/edits 的端到端时限（秒）。必须小于 sub2api 的 upstream 超时，
+# 让最内层先放弃：外层先超时的话，这边会继续跑完并照常计费，
+# 用户拿到 504 却被扣了额度。
+DEFAULT_EDITS_DEADLINE_SECONDS = 300
+
+
+def _edits_deadline() -> Optional[float]:
+    """返回 time.monotonic() 口径的绝对截止时刻；配成非正数表示不限时。"""
+    raw = config_manager.get(
+        "images_edits_deadline_seconds", DEFAULT_EDITS_DEADLINE_SECONDS
+    )
+    if isinstance(raw, bool):
+        raw = DEFAULT_EDITS_DEADLINE_SECONDS
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        seconds = DEFAULT_EDITS_DEADLINE_SECONDS
+    if seconds <= 0:
+        return None
+    return time.monotonic() + seconds
+
+
+def _loader_accepts_deadline(loader) -> bool:
+    try:
+        params = inspect.signature(loader).parameters
+    except (TypeError, ValueError):
+        return False
+    if "deadline" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+class _UploadCache:
+    """跨换号保留已上传的参考图 blob id。
+
+    为什么值得做：edits 一次最多 6 张图，每张都是一次独立的上传调用，
+    所以上传接口承受的是业务请求速率的 N 倍——现网 `upload image failed: 429`
+    是占比最高的错误（一小时 911 条错误里 626 条）。而换号重试如果把已经传成功的
+    图全部重传，等于自己放大对上传接口的压力，形成正反馈。
+
+    能这么做的前提：**Adobe 的 blob 跨账号通用**（2026-08-06 实测：账号 A 上传的
+    blob，账号 B 拿去提交被接受）。注意这是实测出来的当前行为、不是契约，
+    所以调用方要保留「提交被硬拒时清空重传」的兜底。
+    """
+
+    def __init__(self, client, input_images, deadline=None):
+        self._client = client
+        self._images = list(input_images or [])
+        self._deadline = deadline
+        self._ids: list[str] = []
+
+    @property
+    def has_cached(self) -> bool:
+        """本次是否会复用上一轮（可能是另一个账号）传好的 blob。"""
+        return bool(self._ids)
+
+    def ensure(self, token: str) -> list[str]:
+        """补齐还没传成功的那几张，返回完整 id 列表。"""
+        while len(self._ids) < len(self._images):
+            image_bytes, image_mime, *_ = self._images[len(self._ids)]
+            kwargs = {"deadline": self._deadline} if self._deadline is not None else {}
+            self._ids.append(
+                self._client.upload_image(token, image_bytes, image_mime, **kwargs)
+            )
+        return list(self._ids)
+
+    def reset(self) -> None:
+        self._ids.clear()
+
+
+def _is_hard_reject(exc, *, quota_cls, auth_cls, temp_cls) -> bool:
+    """提交被上游「明确拒绝」（而非限流/鉴权/额度问题）。
+
+    blob 失效会落在这一类里。限流和 5xx 走 temp_cls，不该触发重传。
+    """
+    if isinstance(exc, (quota_cls, auth_cls, temp_cls)):
+        return False
+    return isinstance(exc, AdobeRequestError)
+
+
+def _load_input_images_with_deadline(loader, messages, deadline):
+    """带时限调用注入的 load_input_images。
+
+    loader 是依赖注入进来的（测试里可能是不认识 deadline 的旧桩），
+    所以先探测签名再决定怎么调。**不能**用 try/except TypeError 兜底：
+    loader 内部任何一处抛 TypeError 都会被误判成「旧签名」，
+    于是 6 张图整轮重新下载 + 重新规范化，而且第二遍完全不受 deadline 约束。
+    """
+    if deadline is None or not _loader_accepts_deadline(loader):
+        return loader(messages)
+    return loader(messages, deadline=deadline)
+
+
+def _remaining_before_deadline(
+    deadline: Optional[float], what: str
+) -> Optional[float]:
+    """还剩多少秒；已超时就抛，别再发起新的 I/O。None 表示不限时。"""
+    if deadline is None:
+        return None
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        raise UpstreamTemporaryError(
+            f"{what} deadline exceeded",
+            status_code=503,
+            error_type="timeout",
+        )
+    return remaining
 
 
 def _collect_json_image_refs(
@@ -1004,11 +1114,12 @@ def build_generation_router(
         set_request_credit_context(request, resolved_model_id, output_resolution)
         set_request_task_progress(request, task_status="IN_PROGRESS", task_progress=0.0)
 
+        # 同 edits：已传成功的 blob 跨换号保留，重试只补缺的（见 _UploadCache）
+        uploads = _UploadCache(client, input_images)
+
         def _run_once(token: str):
-            source_image_ids = [
-                client.upload_image(token, image_bytes, image_mime)
-                for image_bytes, image_mime, *_ in input_images
-            ]
+            reused_blobs = uploads.has_cached
+            source_image_ids = uploads.ensure(token)
 
             def _image_progress_cb(update: dict):
                 set_request_task_progress(
@@ -1400,13 +1511,16 @@ def build_generation_router(
                     operation_name="images.edits",
                     run_once=_run_once_leo,
                     token_type="leonardo",
+                    deadline=deadline,
                 )
 
+            # 已传成功的 blob 跨换号保留，重试时只补缺的那几张（见 _UploadCache）。
+            # 上传用的是同一个绝对截止时间：每次换号都重置预算的话，总时限永远到不了。
+            uploads = _UploadCache(client, input_images, deadline=deadline)
+
             def _run_once(token: str):
-                source_image_ids = [
-                    client.upload_image(token, image_bytes, image_mime)
-                    for image_bytes, image_mime, *_ in input_images
-                ]
+                reused_blobs = uploads.has_cached
+                source_image_ids = uploads.ensure(token)
 
                 def _image_progress_cb(update: dict):
                     set_request_task_progress(

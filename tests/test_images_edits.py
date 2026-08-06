@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import logging
+import time
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -36,11 +37,21 @@ class FakeAdobeClient:
 
     def __init__(self):
         self.uploads: list[tuple[str, bytes, str]] = []
+        self.upload_deadlines: list[float | None] = []
         self.generate_kwargs: dict | None = None
         self.generate_error: Exception | None = None
 
-    def upload_image(self, token: str, image_bytes: bytes, mime: str) -> str:
+    # 签名跟真实 AdobeClient.upload_image 保持一致（含 deadline），
+    # 否则替身会掩盖掉调用方漏传预算的问题。
+    def upload_image(
+        self,
+        token: str,
+        image_bytes: bytes,
+        mime: str = "image/jpeg",
+        deadline: float | None = None,
+    ) -> str:
         self.uploads.append((token, image_bytes, mime))
+        self.upload_deadlines.append(deadline)
         return f"img-{len(self.uploads)}"
 
     def generate(self, **kwargs):
@@ -84,10 +95,17 @@ def recording_load_input_images(recorded: list):
 def make_client(
     tmp_path: Path,
     adobe_client: FakeAdobeClient,
-    load_input_images=lambda messages: [],
+    load_input_images=lambda messages, **kw: [],
+    retry_kwargs: list | None = None,
 ):
     credit_contexts: list[tuple[str, str]] = []
     logging_fields: list[tuple[str, str]] = []
+
+    def _retries(**kwargs):
+        if retry_kwargs is not None:
+            retry_kwargs.append(kwargs)
+        return kwargs["run_once"]("token-value")
+
     api = FastAPI()
     api.include_router(
         build_generation_router(
@@ -107,7 +125,7 @@ def make_client(
             set_request_credit_context=lambda request, model, resolution: (
                 credit_contexts.append((model, resolution))
             ),
-            run_with_token_retries=lambda **kwargs: kwargs["run_once"]("token-value"),
+            run_with_token_retries=_retries,
             set_request_error_detail=lambda request, **kwargs: "ERR-TEST",
             set_request_preview=lambda request, url, kind="image": None,
             public_image_url=lambda request, job_id: f"/generated/{job_id}.png",
@@ -642,3 +660,258 @@ def test_edits_json_explicit_size_beats_portrait_input_image(tmp_path: Path):
     assert response.status_code == 200, response.text
     assert adobe.generate_kwargs["aspect_ratio"] == "16:9"
     assert adobe.generate_kwargs["upstream_model_id"] == "gpt-image"
+
+
+def test_edits_propagates_deadline_to_upstream(tmp_path: Path):
+    """端到端时限必须一路传到重试器和上传层。
+
+    事故里这条路径 deadline=None，重试器的时限检查全程空转、上传各用固定超时，
+    换一次号就整套重来，最后被下游 480s 掐断成 504。
+    """
+    adobe = FakeAdobeClient()
+    retry_kwargs: list = []
+    client, _, _ = make_client(tmp_path, adobe, retry_kwargs=retry_kwargs)
+
+    response = client.post(
+        "/v1/images/edits",
+        data={"prompt": "night", "model": "gpt-image-2"},
+        files={"image": ("a.png", png_bytes(512, 512), "image/png")},
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(retry_kwargs) == 1
+    deadline = retry_kwargs[0].get("deadline")
+    assert deadline is not None, "重试器必须拿到 deadline，否则时限检查形同虚设"
+
+    # 上传与生成共用同一个绝对截止时间：换号重试时不能各自重新计时，
+    # 否则总时限永远到不了。
+    assert adobe.upload_deadlines == [deadline]
+    assert adobe.generate_kwargs["deadline"] == deadline
+
+
+class _LeonardoOnlyTokenManager:
+    """池里只有 Leonardo token → pool_prefers_leonardo 为真，edits 走 Leonardo 分支。"""
+
+    def has_active_token(self, token_type=None):
+        return token_type == "leonardo"
+
+
+def test_multipart_deadline_returns_503_not_bare_500(tmp_path: Path, monkeypatch):
+    """multipart 的 deadline 检查发生在 endpoint 的 try 之外。
+
+    早期实现直接抛 UpstreamTemporaryError，会一路穿到 ASGI 层变成裸 500——
+    而下游网关只对 503 换渠道重试，500 会被当成本端故障。
+    """
+    import api.routes.generation as gen_mod
+
+    monkeypatch.setattr(gen_mod, "_edits_deadline", lambda: time.monotonic() - 1)
+    adobe = FakeAdobeClient()
+    client, _, _ = make_client(tmp_path, adobe)
+
+    response = client.post(
+        "/v1/images/edits",
+        data={"prompt": "night", "model": "gpt-image-2"},
+        files={"image": ("a.png", png_bytes(512, 512), "image/png")},
+    )
+
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"]["type"] == "server_error"
+    assert "deadline" in body["error"]["message"].lower()
+    assert adobe.uploads == [], "预算已耗尽就不该再碰上游"
+
+
+def test_json_loader_timeout_maps_to_503(tmp_path: Path):
+    """JSON 分支的时限由 app.py 的 loader 抛出（那边另有单测），
+    这里验证路由把它映射成 503 而不是 500——下游只对 503 换渠道重试。"""
+    from core.adobe_client import UpstreamTemporaryError
+
+    def timing_out_loader(messages, **kwargs):
+        raise UpstreamTemporaryError(
+            "Input image loading deadline exceeded",
+            status_code=503,
+            error_type="timeout",
+        )
+
+    adobe = FakeAdobeClient()
+    client, _, _ = make_client(tmp_path, adobe, load_input_images=timing_out_loader)
+
+    response = client.post(
+        "/v1/images/edits",
+        json={"prompt": "night", "model": "gpt-image-2",
+              "image": data_url(png_bytes(64, 64))},
+    )
+    assert response.status_code == 503, response.text
+    assert adobe.uploads == []
+
+
+def test_leonardo_edits_receives_deadline(tmp_path: Path, monkeypatch):
+    """Leonardo 分支的 edit_images 本来就支持 deadline，漏传的话
+    上传+生成+轮询（最长 300s+）能整段穿透端到端时限。"""
+    import api.routes.generation as gen_mod
+
+    captured: dict = {}
+
+    def fake_edit_images(client, token, **kwargs):
+        captured.update(kwargs)
+        return {
+            "data": [{"url": "https://cdn.test/out.png"}],
+            "provider": {"generation_id": "gen-1"},
+        }
+
+    class _Resp:
+        content = b"leonardo-bytes"
+
+    cdn_calls: list = []
+
+    def fake_fetch(url, headers, *, max_seconds=None):
+        cdn_calls.append(max_seconds)
+        return _Resp()
+
+    import core.leonardo_generation as leo_gen
+
+    monkeypatch.setattr(leo_gen, "edit_images", fake_edit_images)
+    monkeypatch.setattr(gen_mod, "_fetch_cdn_image", fake_fetch)
+    monkeypatch.setattr(gen_mod, "_record_leonardo_credit_cost", lambda *a, **k: None)
+
+    adobe = FakeAdobeClient()
+    api = FastAPI()
+    api.include_router(
+        build_generation_router(
+            store=object(),
+            token_manager=_LeonardoOnlyTokenManager(),
+            client=adobe,
+            credits_tracker=object(),
+            request_log_store=object(),
+            generated_dir=tmp_path,
+            model_catalog=MODEL_CATALOG,
+            video_model_catalog=VIDEO_MODEL_CATALOG,
+            supported_ratios=SUPPORTED_RATIOS,
+            resolve_model=resolve_model,
+            resolve_image_geometry=resolve_image_geometry,
+            require_service_api_key=lambda request: None,
+            set_request_task_progress=lambda request, **kwargs: None,
+            set_request_credit_context=lambda request, model, resolution: None,
+            run_with_token_retries=lambda **kwargs: kwargs["run_once"]("leo-token"),
+            set_request_error_detail=lambda request, **kwargs: "ERR-TEST",
+            set_request_preview=lambda request, url, kind="image": None,
+            public_image_url=lambda request, job_id: f"/generated/{job_id}.png",
+            public_generated_url=lambda request, filename: f"/generated/{filename}",
+            resolve_video_options=lambda data: (True, "", "frame"),
+            load_input_images=lambda messages, **kw: [],
+            normalize_image_mime=lambda mime: str(mime or "image/jpeg"),
+            set_request_logging_fields=lambda request, model, prompt: None,
+            prepare_video_source_image=lambda image, ratio, resolution: (image, "image/png"),
+            video_ext_from_meta=lambda meta: "mp4",
+            extract_prompt_from_messages=lambda messages: "",
+            sse_chat_stream=lambda payload: iter(()),
+            on_generated_file_written=lambda path, old_size, new_size: None,
+            quota_error_cls=QuotaError,
+            auth_error_cls=AuthError,
+            upstream_temp_error_cls=UpstreamError,
+            logger=logging.getLogger("test-images-edits-leo"),
+        )
+    )
+
+    response = TestClient(api).post(
+        "/v1/images/edits",
+        data={"prompt": "watercolor", "model": "gpt-image-2"},
+        files={"image": ("a.png", png_bytes(512, 512), "image/png")},
+    )
+
+    assert response.status_code == 200, response.text
+    assert captured.get("deadline") is not None, "edit_images 必须拿到端到端时限"
+    assert cdn_calls and cdn_calls[0] is not None, "CDN 下载也要吃同一份预算"
+    assert cdn_calls[0] <= 300
+
+
+class _FlakyUploadClient(FakeAdobeClient):
+    """前 N 次上传成功，第 N+1 次抛错；换号后继续。"""
+
+    def __init__(self, fail_after: int, error: Exception):
+        super().__init__()
+        self._fail_after = fail_after
+        self._error = error
+        self._raised = False
+
+    def upload_image(self, token, image_bytes, mime="image/jpeg", deadline=None):
+        if not self._raised and len(self.uploads) >= self._fail_after:
+            self._raised = True
+            raise self._error
+        return super().upload_image(token, image_bytes, mime, deadline)
+
+
+def test_edits_does_not_reupload_on_account_rotation(tmp_path: Path):
+    """换号重试只补传缺的那几张，不把已成功的重传一遍。
+
+    edits 一张图 = 一次上传调用，最多 6 张；重试全量重传等于自己放大对上传接口的
+    压力，而 `upload image failed: 429` 正是现网占比最高的错误。
+    Adobe 的 blob 跨账号通用（实测），所以换号后旧 id 仍然有效。
+    """
+    adobe = _FlakyUploadClient(fail_after=2, error=UpstreamError("upload image failed: 429"))
+    tokens_used: list[str] = []
+
+    def _retries(**kwargs):
+        # 模拟换号：第一个账号在第 3 张上传时失败，换第二个账号继续
+        for tok in ("token-A", "token-B"):
+            tokens_used.append(tok)
+            try:
+                return kwargs["run_once"](tok)
+            except UpstreamError:
+                continue
+        raise AssertionError("both accounts failed")
+
+    client, _, _ = make_client(tmp_path, adobe)
+    client.app.dependency_overrides = {}
+    # 直接替换注入的重试器
+    api = FastAPI()
+    api.include_router(
+        build_generation_router(
+            store=object(), token_manager=object(), client=adobe,
+            credits_tracker=object(), request_log_store=object(),
+            generated_dir=tmp_path, model_catalog=MODEL_CATALOG,
+            video_model_catalog=VIDEO_MODEL_CATALOG, supported_ratios=SUPPORTED_RATIOS,
+            resolve_model=resolve_model, resolve_image_geometry=resolve_image_geometry,
+            require_service_api_key=lambda request: None,
+            set_request_task_progress=lambda request, **kw: None,
+            set_request_credit_context=lambda request, m, r: None,
+            run_with_token_retries=_retries,
+            set_request_error_detail=lambda request, **kw: "ERR-TEST",
+            set_request_preview=lambda request, url, kind="image": None,
+            public_image_url=lambda request, job_id: f"/generated/{job_id}.png",
+            public_generated_url=lambda request, fn: f"/generated/{fn}",
+            resolve_video_options=lambda data: (True, "", "frame"),
+            load_input_images=lambda messages, **kw: [],
+            normalize_image_mime=lambda mime: str(mime or "image/jpeg"),
+            set_request_logging_fields=lambda request, m, p: None,
+            prepare_video_source_image=lambda i, r, res: (i, "image/png"),
+            video_ext_from_meta=lambda meta: "mp4",
+            extract_prompt_from_messages=lambda messages: "",
+            sse_chat_stream=lambda payload: iter(()),
+            on_generated_file_written=lambda p, o, n: None,
+            quota_error_cls=QuotaError, auth_error_cls=AuthError,
+            upstream_temp_error_cls=UpstreamError,
+            logger=logging.getLogger("test-upload-cache"),
+        )
+    )
+    resp = TestClient(api).post(
+        "/v1/images/edits",
+        data={"prompt": "merge", "model": "gpt-image-2"},
+        files=[
+            ("image[]", ("a.png", png_bytes(256, 256), "image/png")),
+            ("image[]", ("b.png", png_bytes(256, 256), "image/png")),
+            ("image[]", ("c.png", png_bytes(256, 256), "image/png")),
+            ("image[]", ("d.png", png_bytes(256, 256), "image/png")),
+        ],
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert tokens_used == ["token-A", "token-B"], "应当发生了一次换号"
+    # 4 张图：账号A 传成 2 张后第 3 张失败；账号B 只需补第 3、4 张 = 总共 4 次上传。
+    # 若换号后全量重传，总数会是 2(成功) + 1(失败不计入) + 4 = 6 次。
+    assert len(adobe.uploads) == 4, (
+        f"换号后应只补传缺的两张，实际上传 {len(adobe.uploads)} 次"
+    )
+    assert adobe.generate_kwargs["source_image_ids"] == [
+        "img-1", "img-2", "img-3", "img-4",
+    ]
