@@ -1532,7 +1532,8 @@ def build_generation_router(
                     last_error = str(exc)
                     last_status_code = 503
                     retryable = (
-                        attempt < max_attempts
+                        bool(getattr(exc, "retryable", True))
+                        and attempt < max_attempts
                         and client.should_retry_temporary_error(exc)
                     )
                 except Exception as exc:

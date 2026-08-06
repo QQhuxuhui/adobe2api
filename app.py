@@ -1043,7 +1043,8 @@ def _run_with_token_retries(
                 err_status_code = 503
                 err_type = "server_error"
                 err_value = refresh_message
-            retryable = True
+            # post-submit 的 auth 失败（轮询阶段）不可重试：上游已受理并计费
+            retryable = bool(getattr(exc, "retryable", True))
             err_code = report_error(
                 request,
                 error=err_value,
@@ -1072,8 +1073,10 @@ def _run_with_token_retries(
                     token, getattr(exc, "retry_after", None)
                 )
             limited_retry_attempts += 1
-            retryable = limited_retry_attempts < max_attempts and client.should_retry_temporary_error(
-                exc
+            retryable = (
+                bool(getattr(exc, "retryable", True))
+                and limited_retry_attempts < max_attempts
+                and client.should_retry_temporary_error(exc)
             )
             status_part = f"status={exc.status_code}" if exc.status_code else "status=?"
             type_part = f"type={exc.error_type or 'temporary'}"

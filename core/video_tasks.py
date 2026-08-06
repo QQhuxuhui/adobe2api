@@ -716,7 +716,10 @@ def build_video_task_runner(
                 last_error = VideoTaskExecutionError(
                     str(exc), "authentication_failed", 401
                 )
-                retryable = attempt < max_attempts
+                # 轮询阶段的 auth 失败不可重试：上游已受理并计费
+                retryable = attempt < max_attempts and bool(
+                    getattr(exc, "retryable", True)
+                )
             except upstream_temp_error_cls as exc:
                 if int(getattr(exc, "status_code", 0) or 0) == 429:
                     # 账号级限流：冷却这个账号，别让下一个请求立刻又打上去
@@ -725,8 +728,10 @@ def build_video_task_runner(
                         limiter(token, getattr(exc, "retry_after", None))
                 last_error = exc
                 should_retry = getattr(client, "should_retry_temporary_error", None)
-                retryable = attempt < max_attempts and (
-                    bool(should_retry(exc)) if callable(should_retry) else True
+                retryable = (
+                    bool(getattr(exc, "retryable", True))
+                    and attempt < max_attempts
+                    and (bool(should_retry(exc)) if callable(should_retry) else True)
                 )
             except adobe_error_cls as exc:
                 last_error = exc

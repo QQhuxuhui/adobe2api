@@ -88,6 +88,14 @@ def _arp_session_id_for_token(token: str) -> str:
 
 
 class AdobeRequestError(Exception):
+    """上游请求失败。
+
+    retryable=False 表示「上游已经受理并计费之后」才失败——典型是轮询阶段：
+    submit 已经成功、上游正在出图并已扣费，这时换号重试等于让它再出一次、
+    再扣一次费，而用户只会拿到一个结果。这类错误该做的是把账号状态处理掉
+    （出池/标失效/冷却），但本次请求直接失败，不再换号重来。
+    """
+
     def __init__(
         self,
         message: str,
@@ -95,6 +103,7 @@ class AdobeRequestError(Exception):
         status_code: Optional[int] = None,
         error_type: str = "",
         user_message: str = "",
+        retryable: bool = True,
     ):
         super().__init__(message)
         self.status_code = status_code
@@ -102,6 +111,7 @@ class AdobeRequestError(Exception):
         self.user_message = (
             str(user_message or "").strip() or str(message or "").strip()
         )
+        self.retryable = retryable
 
 
 class QuotaExhaustedError(AdobeRequestError):
@@ -119,12 +129,54 @@ class UpstreamTemporaryError(AdobeRequestError):
         status_code: Optional[int] = None,
         error_type: str = "",
         retry_after: Optional[float] = None,
+        retryable: bool = True,
     ):
-        super().__init__(message)
+        super().__init__(message, retryable=retryable)
         self.status_code = status_code
         self.error_type = str(error_type or "").strip().lower()
         # 上游 429 带的 Retry-After（秒）。没带就是 None，由调用方回退到配置的冷却时长。
         self.retry_after = retry_after
+
+
+# Adobe 在 401/403 的 x-access-error 头里区分「配额耗尽」和「凭证失效」。
+# 观测到的配额码有两种拼法（taste_exhausted 是旧码，quota_exhausted 是现网在返回的），
+# 两者语义相同。只做精确匹配、不做子串模糊匹配：头里可能出现别的含 exhausted
+# 字样但语义不同的码，误判会把好号错杀出池。
+QUOTA_EXHAUSTED_ACCESS_ERRORS = frozenset({"taste_exhausted", "quota_exhausted"})
+
+
+def access_error_of(resp) -> str:
+    """读归一化后的 x-access-error。头缺失/异常一律返回空串。"""
+    try:
+        return str(resp.headers.get("x-access-error") or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def raise_for_access_error(resp, context: str = "", *, retryable: bool = True) -> None:
+    """401/403 的统一分类：配额耗尽抛 QuotaExhaustedError，其余抛 AuthError。
+
+    配额耗尽必须与凭证失效分开——前者要把账号按配额出池并等余额恢复，
+    后者才该走 cookie 刷新。分错方向会导致死号永远留在调度池里被反复撞。
+
+    retryable=False 给已提交之后的阶段（轮询）用，避免换号重试造成重复计费。
+    """
+    access_error = access_error_of(resp)
+    if access_error in QUOTA_EXHAUSTED_ACCESS_ERRORS:
+        raise QuotaExhaustedError(
+            "Adobe quota exhausted for this account", retryable=retryable
+        )
+    if access_error:
+        # 未知码：按凭证失效处理，但留日志——Adobe 再改码时靠它发现，而不是靠模糊匹配。
+        logger.warning(
+            "unknown x-access-error=%s context=%s status=%s",
+            access_error,
+            context or "-",
+            getattr(resp, "status_code", "?"),
+        )
+    # retryable 同样要传给这条：轮询阶段的凭证失效也是 post-submit，
+    # 换号重来一样会让上游再出一次图、再扣一次费。
+    raise AuthError("Token invalid or expired", retryable=retryable)
 
 
 def retry_after_seconds(resp) -> Optional[float]:
@@ -325,7 +377,7 @@ class AdobeClient:
         remaining = float(deadline) - time.monotonic()
         if remaining <= 0:
             raise UpstreamTemporaryError(
-                "Gemini native request deadline exceeded",
+                "Upstream request deadline exceeded",
                 status_code=503,
                 error_type="timeout",
             )
@@ -429,7 +481,7 @@ class AdobeClient:
                 raise UpstreamTemporaryError(
                     f"upstream timeout: {exc}", error_type="timeout"
                 )
-            except requests.ProxyError as exc:
+            except requests.exceptions.ProxyError as exc:
                 raise UpstreamTemporaryError(
                     f"upstream proxy error: {exc}", error_type="proxy"
                 )
@@ -463,7 +515,7 @@ class AdobeClient:
                 raise UpstreamTemporaryError(
                     f"upstream timeout: {exc}", status_code=451, error_type="timeout"
                 )
-            except requests.ProxyError as exc:
+            except requests.exceptions.ProxyError as exc:
                 raise UpstreamTemporaryError(
                     f"upstream proxy error: {exc}", status_code=451, error_type="proxy"
                 )
@@ -503,7 +555,7 @@ class AdobeClient:
                 raise UpstreamTemporaryError(
                     f"upstream timeout: {exc}", error_type="timeout"
                 )
-            except requests.ProxyError as exc:
+            except requests.exceptions.ProxyError as exc:
                 raise UpstreamTemporaryError(
                     f"upstream proxy error: {exc}", error_type="proxy"
                 )
@@ -540,7 +592,7 @@ class AdobeClient:
                 raise UpstreamTemporaryError(
                     f"upstream timeout: {exc}", error_type="timeout"
                 )
-            except requests.ProxyError as exc:
+            except requests.exceptions.ProxyError as exc:
                 raise UpstreamTemporaryError(
                     f"upstream proxy error: {exc}", error_type="proxy"
                 )
@@ -583,7 +635,7 @@ class AdobeClient:
                 raise UpstreamTemporaryError(
                     f"upstream timeout: {exc}", error_type="timeout"
                 )
-            except requests.ProxyError as exc:
+            except requests.exceptions.ProxyError as exc:
                 raise UpstreamTemporaryError(
                     f"upstream proxy error: {exc}", error_type="proxy"
                 )
@@ -619,7 +671,7 @@ class AdobeClient:
                 raise UpstreamTemporaryError(
                     f"upstream timeout: {exc}", error_type="timeout"
                 )
-            except requests.ProxyError as exc:
+            except requests.exceptions.ProxyError as exc:
                 raise UpstreamTemporaryError(
                     f"upstream proxy error: {exc}", error_type="proxy"
                 )
@@ -644,7 +696,7 @@ class AdobeClient:
     def _get_json(self, url: str, headers: dict, timeout: int = 60) -> Any:
         resp = self._get(url, headers=headers, timeout=timeout)
         if resp.status_code in (401, 403):
-            raise AuthError("Token invalid or expired")
+            raise_for_access_error(resp, "get_json")
         if resp.status_code != 200:
             if resp.status_code in (429, 451) or resp.status_code >= 500:
                 raise UpstreamTemporaryError(
@@ -692,7 +744,7 @@ class AdobeClient:
             raise
         except requests.Timeout as exc:
             raise UpstreamTemporaryError(f"upstream timeout: {exc}", error_type="timeout")
-        except requests.ProxyError as exc:
+        except requests.exceptions.ProxyError as exc:
             raise UpstreamTemporaryError(
                 f"upstream proxy error: {exc}", error_type="proxy"
             )
@@ -728,7 +780,9 @@ class AdobeClient:
         )
 
         if resp.status_code in (401, 403):
-            raise AuthError("Token invalid or expired")
+            # edits 链路的首跳：配额耗尽在这里就会暴露，必须与凭证失效分开，
+            # 否则整条 edits 都会把限额号当失效号送去刷 cookie。
+            raise_for_access_error(resp, "image.upload")
         if resp.status_code != 200:
             if resp.status_code in (429, 451) or resp.status_code >= 500:
                 raise UpstreamTemporaryError(
@@ -791,7 +845,7 @@ class AdobeClient:
         }
         resp = self._post_json(self.entity_api_base, self._entity_headers(token), payload)
         if resp.status_code in (401, 403):
-            raise AuthError("Token invalid or expired")
+            raise_for_access_error(resp, "entity.create")
         if resp.status_code not in (200, 201):
             if resp.status_code in (429, 451) or resp.status_code >= 500:
                 raise UpstreamTemporaryError(
@@ -846,7 +900,7 @@ class AdobeClient:
         }
         resp = self._put_bytes(url, headers=headers, payload=image_bytes)
         if resp.status_code in (401, 403):
-            raise AuthError("Token invalid or expired")
+            raise_for_access_error(resp, "entity.upload_image")
         if resp.status_code not in (200, 201):
             if resp.status_code in (429, 451) or resp.status_code >= 500:
                 raise UpstreamTemporaryError(
@@ -920,7 +974,7 @@ class AdobeClient:
             body.append(entry)
         resp = self._post_json(url, self._entity_headers(token), body)
         if resp.status_code in (401, 403):
-            raise AuthError("Token invalid or expired")
+            raise_for_access_error(resp, "entity.register_base_resources")
         if resp.status_code not in (200, 201):
             if resp.status_code in (429, 451) or resp.status_code >= 500:
                 raise UpstreamTemporaryError(
@@ -991,7 +1045,7 @@ class AdobeClient:
             self._entity_headers(token),
         )
         if resp.status_code in (401, 403):
-            raise AuthError("Token invalid or expired")
+            raise_for_access_error(resp, "entity.delete")
         if resp.status_code in (200, 202, 204):
             return True
         if resp.status_code in (429, 451) or resp.status_code >= 500:
@@ -1404,10 +1458,7 @@ class AdobeClient:
         )
 
         if submit_resp.status_code in (401, 403):
-            access_error = submit_resp.headers.get("x-access-error")
-            if access_error == "taste_exhausted":
-                raise QuotaExhaustedError("Adobe quota exhausted for this account")
-            raise AuthError("Token invalid or expired")
+            raise_for_access_error(submit_resp, "video.submit")
 
         if submit_resp.status_code != 200:
             if submit_resp.status_code in (429, 451) or submit_resp.status_code >= 500:
@@ -1447,16 +1498,19 @@ class AdobeClient:
                 poll_url, headers=self._poll_headers(token), timeout=60
             )
             if poll_resp.status_code in (401, 403):
-                raise AuthError("Token invalid or expired")
+                raise_for_access_error(poll_resp, "video.poll", retryable=False)
             if poll_resp.status_code != 200:
                 if poll_resp.status_code in (429, 451) or poll_resp.status_code >= 500:
                     raise UpstreamTemporaryError(
                         f"video poll failed: {poll_resp.status_code} {poll_resp.text[:300]}",
                         status_code=poll_resp.status_code,
                         error_type="status",
+                        # 451 是内容拦截、没有产出，重试是唯一出路；其余已计费，不重试
+                        retryable=(poll_resp.status_code == 451),
                     )
                 raise AdobeRequestError(
-                    f"video poll failed: {poll_resp.status_code} {poll_resp.text[:300]}"
+                    f"video poll failed: {poll_resp.status_code} {poll_resp.text[:300]}",
+                    retryable=False,
                 )
 
             latest = poll_resp.json()
@@ -1606,16 +1660,13 @@ class AdobeClient:
             raise AdobeRequestError("submit failed: no response")
 
         if submit_resp.status_code in (401, 403):
-            access_error = submit_resp.headers.get("x-access-error")
             logger.warning(
                 "submit auth failed status=%s access_error=%s body=%s",
                 submit_resp.status_code,
-                access_error,
+                access_error_of(submit_resp),
                 submit_resp.text[:300],
             )
-            if access_error == "taste_exhausted":
-                raise QuotaExhaustedError("Adobe quota exhausted for this account")
-            raise AuthError("Token invalid or expired")
+            raise_for_access_error(submit_resp, "image.submit")
 
         if submit_resp.status_code != 200:
             logger.error(
@@ -1674,14 +1725,33 @@ class AdobeClient:
                     poll_resp.status_code,
                     poll_resp.text[:500],
                 )
-                if poll_resp.status_code in (429, 451) or poll_resp.status_code >= 500:
+                # 轮询阶段的失败原则上不可重试：submit 已经成功、上游正在出图
+                # 并且已经扣费，换号从头重来只会再出一次、再扣一次费，
+                # 而用户只能拿到一个结果。账号状态照常处理（出池/标失效/冷却），
+                # 但本次请求就到此为止。
+                #
+                # 唯一例外是 451 image_unsafe：它是内容安全拦截，**没有产出**——
+                # 用户什么也拿不到。这时换号/换种子重试是唯一能把请求做成的方式，
+                # 也是线上一直在做的事（现网每天数百次靠它救回）。
+                # 判定标准不是「有没有扣费」，而是「用户能不能拿到结果」。
+                if poll_resp.status_code == 451:
                     raise UpstreamTemporaryError(
                         f"poll failed: {poll_resp.status_code} {poll_resp.text[:300]}",
                         status_code=poll_resp.status_code,
                         error_type="status",
                     )
+                if poll_resp.status_code in (401, 403):
+                    raise_for_access_error(poll_resp, "image.poll", retryable=False)
+                if poll_resp.status_code == 429 or poll_resp.status_code >= 500:
+                    raise UpstreamTemporaryError(
+                        f"poll failed: {poll_resp.status_code} {poll_resp.text[:300]}",
+                        status_code=poll_resp.status_code,
+                        error_type="status",
+                        retryable=False,
+                    )
                 raise AdobeRequestError(
-                    f"poll failed: {poll_resp.status_code} {poll_resp.text[:300]}"
+                    f"poll failed: {poll_resp.status_code} {poll_resp.text[:300]}",
+                    retryable=False,
                 )
 
             latest = poll_resp.json()
@@ -1765,7 +1835,7 @@ class AdobeClient:
             now = time.monotonic()
             if deadline is not None and now >= deadline:
                 raise UpstreamTemporaryError(
-                    "Gemini native request deadline exceeded",
+                    "Upstream request deadline exceeded",
                     status_code=503,
                     error_type="timeout",
                 )
