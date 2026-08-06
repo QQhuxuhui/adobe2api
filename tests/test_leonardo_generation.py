@@ -64,6 +64,10 @@ def test_generate_images_happy_path():
         "model_id": "M1",
         "credit_cost": None,  # 该 fake 不回报 apiCreditCost，也无余额接口
         "credit_cost_source": None,
+        # 测不到成本时靠这两个字段估算：按像素计费的模型要尺寸，
+        # 张数要用钳过之后的真实值（路由层的 n 可能大于 4）
+        "output_size": {"width": 2752, "height": 1536},
+        "quantity": 2,
     }
     # 归一化正确传给 client
     assert client.calls["create"]["aspect_ratio"] == "16:9"

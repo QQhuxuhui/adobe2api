@@ -362,6 +362,23 @@ def test_leo_pool_quota_maps_to_429(tmp_path):
     assert resp.status_code == 429, resp.text
 
 
+def test_leo_pool_gateway_429_is_rate_limit_not_quota(tmp_path):
+    """网关限流不能走额度耗尽通道。
+
+    判成 quota 的话会触发账号级出池，而出池后只能等余额恢复才复活——
+    一次瞬时限流就把一个余额充足的账号打下线。限流只该让该账号冷却一会儿。
+
+    这条路由上三种归类的响应码互不相同，正好用来区分：
+      配额耗尽 → 429（见 test_leo_pool_quota_maps_to_429）
+      网关限流 → 503（可重试的临时错误，账号走冷却而非出池）
+      漏了分支 → 500（不可重试）
+    """
+    h = Harness(tmp_path, raise_on_create=_leo_err("graphql HTTP 429"))
+    resp = post(h, "gemini-3-pro-image", "generateContent", image_request())
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"]["status"] == "UNAVAILABLE"
+
+
 def test_leo_pool_transport_maps_to_503(tmp_path):
     h = Harness(tmp_path, raise_on_create=_leo_err("graphql HTTP 500"))
     resp = post(h, "gemini-3-pro-image", "generateContent", image_request())
@@ -438,11 +455,27 @@ def test_leo_pool_records_exact_credit_cost(tmp_path):
     assert h.credit_logs and h.credit_logs[-1] == (250.0, "upstream")
 
 
-def test_leo_pool_no_credit_cost_when_upstream_silent(tmp_path):
+def test_leo_pool_falls_back_to_estimate_when_upstream_silent(tmp_path):
+    """上游沉默、差分也测不到时，按实测单价表估算。
+
+    线上 apiCreditCost 恒为 null，而余额差分在账号被他处并发使用时会被判污染
+    整条丢弃——两条路都断的话这一列永远是空的，用户既看不出单次消耗
+    也没法预估成本。所以必须有 estimated 兜底，并在来源上标明。
+
+    gemini-3-pro-image 走 Leonardo 的 gemini-image-2，按张固定 140（见 README 实测表）。
+    """
     h = Harness(tmp_path, credit_cost=None)
     resp = post(h, "gemini-3-pro-image", "generateContent", image_request())
     assert resp.status_code == 200, resp.text
-    assert h.credit_logs == []
+    assert h.credit_logs and h.credit_logs[-1] == (140.0, "estimated")
+
+
+def test_leo_pool_measured_beats_estimate(tmp_path):
+    """实测值优先于估算：估算只是兜底，不能盖掉真实测量。"""
+    h = Harness(tmp_path)  # Harness 默认 credit_cost=250 → upstream
+    resp = post(h, "gemini-3-pro-image", "generateContent", image_request())
+    assert resp.status_code == 200, resp.text
+    assert h.credit_logs[-1] == (250.0, "upstream")
 
 
 def test_leo_pool_2k_request_ok(tmp_path):

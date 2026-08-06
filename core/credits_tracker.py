@@ -317,20 +317,24 @@ class CreditsTracker:
         except queue.Full:
             self._backfill_estimate(task)
 
+    # 请求自己测出来的成本比事后差分更可信，不得被回填覆盖：
+    #   upstream —— 上游直接回报的精确值
+    #   measured —— 请求内部生成前后查余额做的差分（Leonardo 走这条）
+    # 少了 measured 的话，Leonardo 明明在请求里测到了精确成本，
+    # 事后回填线程还是会把它抹成 null，日志里那一列就永远是空的。
+    AUTHORITATIVE_CREDIT_SOURCES = frozenset({"upstream", "measured"})
+
     @staticmethod
     def _merge_credits(
         payload: dict,
         credits_used: float | None,
         credits_source: str | None,
     ) -> dict:
-        """写入本次测得的积分消耗；但**不覆盖**上游回报的精确值。
-
-        Leonardo 的 Generate 直接回报 apiCreditCost（精确单张成本），
-        余额差分/估值不得把它盖掉。
-        """
+        """写入本次测得的积分消耗；但**不覆盖**请求内已确定的精确值。"""
         merged = dict(payload)
         if (
-            str(merged.get("credits_source") or "") == "upstream"
+            str(merged.get("credits_source") or "")
+            in CreditsTracker.AUTHORITATIVE_CREDIT_SOURCES
             and merged.get("credits_used") is not None
         ):
             return merged

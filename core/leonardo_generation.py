@@ -50,7 +50,11 @@ def classify_leonardo_error(exc: Exception) -> str:
 
     返回："unsafe"（已提交后失败/单发可能已受理，换号重试会重复扣费 → 不可重试 500）、
     "auth"（JWT/鉴权失效 → 标失效并切号）、"quota"（额度耗尽 → 标耗尽并切号）、
+    "rate_limited"（网关限流 → 给账号冷却窗口后回池，**不是**额度耗尽）、
     "temp"（HTTP/传输等临时故障 → 可重试）。
+
+    quota 与 rate_limited 必须分开：前者会把整个账号出池、只能等余额恢复才复活，
+    后者冷却几分钟就回来。混为一谈的话，一次瞬时限流就能打下一个余额充足的账号。
     """
     from core.leonardo_client import LeonardoGraphQLError, LeonardoRetryUnsafeError
 
@@ -71,7 +75,11 @@ def classify_leonardo_error(exc: Exception) -> str:
     if "http 401" in message or "http 403" in message:
         return "auth"
     if "http 429" in message:
-        return "quota"
+        # 429 是网关限流，不是账号额度耗尽——两者后果差很远：
+        # 限流该给账号一个冷却窗口然后回池，而配额耗尽会把整个账号出池、
+        # 且只能等余额恢复才复活。判成 quota 的话，一次瞬时限流就能把一个
+        # 余额充足的账号打下线。（Adobe 侧一直是这么分的。）
+        return "rate_limited"
     # 文本特征：避免裸 "invalid" 误伤 "invalid model" 等请求错误而误废健康 token
     if any(
         kw in message
@@ -331,5 +339,9 @@ def generate_images(
             "model_id": model_id,
             "credit_cost": credit_cost,
             "credit_cost_source": credit_cost_source,
+            # 供按像素计费的模型估算成本；quantity 是**钳过之后**的真实张数，
+            # 路由层拿到的 n 可能大于 4，用它算会高估
+            "output_size": {"width": width, "height": height},
+            "quantity": quantity,
         },
     }

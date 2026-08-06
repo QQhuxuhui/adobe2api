@@ -143,6 +143,12 @@ def _map_leonardo_error(exc: Exception) -> Exception:
         return AuthError(str(exc))
     if kind == "quota":
         return QuotaExhaustedError(str(exc))
+    if kind == "rate_limited":
+        # 带 429 才能走到重试器里的账号冷却分支（report_rate_limited）——
+        # 用 503 的话只会换号重试，被限流的账号下一个请求又会被选中。
+        return UpstreamTemporaryError(
+            str(exc), status_code=429, error_type="rate_limit"
+        )
     if kind == "temp":
         # 必须带可重试 status_code，否则 should_retry_temporary_error → False → 不重试
         return UpstreamTemporaryError(
@@ -219,20 +225,60 @@ def _leonardo_public_backend(model_id, enabled: bool):
     return LEONARDO_PUBLIC_ALIASES.get(str(model_id or "").strip())
 
 
-def _record_leonardo_credit_cost(request, result) -> None:
-    """把本次单张积分成本写进请求日志。
+def _record_leonardo_credit_cost(
+    request,
+    result,
+    *,
+    model_config=None,
+    output_resolution: str = "2K",
+    quantity: int = 1,
+    is_edit: bool = False,
+) -> None:
+    """把本次积分成本写进请求日志。
 
-    来源 upstream=上游回报的精确值；measured=生成前后余额差分实测。
+    三种来源，可信度递减：
+      upstream  上游回报的精确值（线上实测恒为 null，基本不会出现）
+      measured  生成前后余额差分实测；账号被他处并发使用时会被判污染而丢弃
+      estimated 按 core/leonardo_pricing 的实测单价表估算
+
+    没有 estimated 兜底的话，共享账号上这一列会大面积为空——
+    既看不出单次消耗，也没法预估成本。
     """
     provider = (result or {}).get("provider") or {}
     cost = provider.get("credit_cost")
+    source = provider.get("credit_cost_source") or "measured"
+
     if cost is None:
-        return
+        from core.leonardo_pricing import estimate_credits
+
+        size = provider.get("output_size") or {}
+        # 张数以 provider 回报的为准：上游会把 n 钳到 1~4，
+        # 拿路由层原始的 n 记账会高估。
+        actual_quantity = provider.get("quantity")
+        cost = estimate_credits(
+            model_config,
+            width=size.get("width"),
+            height=size.get("height"),
+            output_resolution=output_resolution,
+            quantity=actual_quantity if actual_quantity is not None else quantity,
+            is_edit=is_edit,
+        )
+        source = "estimated"
+        if cost is None:
+            _module_logger.info(
+                "leonardo credit cost unavailable: no measurement and no price entry "
+                "(model=%s resolution=%s n=%s edit=%s log_id=%s)",
+                (model_config or {}).get("upstream_model"),
+                output_resolution,
+                quantity,
+                is_edit,
+                getattr(request.state, "log_id", ""),
+            )
+            return
+
     try:
         request.state.log_credits_used = float(cost)
-        request.state.log_credits_source = (
-            provider.get("credit_cost_source") or "measured"
-        )
+        request.state.log_credits_source = source
     except Exception:  # noqa: BLE001 - 记账失败不得影响出图
         pass
 
@@ -255,6 +301,7 @@ def _build_leonardo_run_once(
     generated_dir: Path,
     on_generated_file_written: Optional[Callable] = None,
     set_request_preview: Optional[Callable] = None,
+    model_config: Optional[dict] = None,
 ) -> Callable[[str], dict]:
     from core.leonardo_generation import generate_images, to_aspect
 
@@ -280,7 +327,13 @@ def _build_leonardo_run_once(
         except LeonardoError as exc:
             raise _map_leonardo_error(exc) from exc
 
-        _record_leonardo_credit_cost(request, result)
+        _record_leonardo_credit_cost(
+            request,
+            result,
+            model_config=model_config,
+            output_resolution=output_resolution,
+            quantity=n,
+        )
 
         data_items = []
         for i, item in enumerate(result.get("data") or []):
@@ -656,6 +709,7 @@ def build_generation_router(
                     generated_dir=generated_dir,
                     on_generated_file_written=on_generated_file_written,
                     set_request_preview=set_request_preview,
+                    model_config=model_conf,
                 )
                 sel_token_type = "leonardo"
             else:
@@ -966,20 +1020,38 @@ def build_generation_router(
                     error=update.get("error"),
                 )
 
-            artifact = generate_image_artifact(
-                client=client,
-                token=token,
-                prompt=parsed.prompt,
-                aspect_ratio=ratio,
-                output_resolution=output_resolution,
-                model_config=model_conf,
-                generated_dir=generated_dir,
-                source_image_ids=source_image_ids,
-                output_size=geometry.output_size,
-                fallback_aspect_ratio=geometry.fallback_aspect_ratio,
-                progress_cb=_image_progress_cb,
-                on_generated_file_written=on_generated_file_written,
-            )
+            def _generate(ids):
+                return generate_image_artifact(
+                    client=client,
+                    token=token,
+                    prompt=parsed.prompt,
+                    aspect_ratio=ratio,
+                    output_resolution=output_resolution,
+                    model_config=model_conf,
+                    generated_dir=generated_dir,
+                    source_image_ids=ids,
+                    output_size=geometry.output_size,
+                    fallback_aspect_ratio=geometry.fallback_aspect_ratio,
+                    progress_cb=_image_progress_cb,
+                    on_generated_file_written=on_generated_file_written,
+                )
+
+            try:
+                artifact = _generate(source_image_ids)
+            except Exception as exc:  # noqa: BLE001 - 下面按类型分流
+                # 复用了别的账号传的 blob 且提交被硬拒 → 可能 blob 失效，全量重传一次
+                if not (
+                    reused_blobs
+                    and _is_hard_reject(
+                        exc,
+                        quota_cls=quota_error_cls,
+                        auth_cls=auth_error_cls,
+                        temp_cls=upstream_temp_error_cls,
+                    )
+                ):
+                    raise
+                uploads.reset()
+                artifact = _generate(uploads.ensure(token))
             image_url = public_image_url(request, artifact.job_id)
             set_request_preview(request, image_url, kind="image")
             result_b64 = encode_image_result(
@@ -1276,17 +1348,29 @@ def build_generation_router(
                             input_images=input_images,
                             aspect_ratio=ratio,
                             output_resolution=output_resolution,
+                            deadline=deadline,
                         )
                     except LeonardoError as exc:
                         raise _map_leonardo_error(exc) from exc
 
-                    _record_leonardo_credit_cost(request, result)
+                    _record_leonardo_credit_cost(
+                        request,
+                        result,
+                        model_config=model_conf,
+                        output_resolution=output_resolution,
+                        quantity=1,
+                        is_edit=True,
+                    )
                     items = result.get("data") or []
                     url = str((items[0] if items else {}).get("url") or "").strip()
                     if not url:
                         raise AdobeRequestError("Leonardo returned no image URL")
                     resp = _fetch_cdn_image(
-                        url, {"User-Agent": "adobe2api/1.0", "Accept": "image/*"}
+                        url,
+                        {"User-Agent": "adobe2api/1.0", "Accept": "image/*"},
+                        max_seconds=_remaining_before_deadline(
+                            deadline, "Leonardo image download"
+                        ),
                     )
                     job_id = f"{result['provider']['generation_id']}-0"
                     out_path = generated_dir / f"{job_id}.png"

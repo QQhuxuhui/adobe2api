@@ -468,6 +468,9 @@ class TokenManager:
                     "token_account_email": t.get("refresh_profile_email") or "",
                     "token_source": t.get("source") or "manual",
                     "refresh_profile_id": t.get("refresh_profile_id") or "",
+                    # 供调用方按后端分流：Leonardo 的积分是另一套币值，
+                    # 不能和 Adobe 混在同一套事后差分/估算里
+                    "token_type": str(t.get("type") or ""),
                 }
         return {
             "token_id": "",
@@ -475,6 +478,7 @@ class TokenManager:
             "token_account_name": "",
             "token_account_email": "",
             "token_source": "manual",
+            "token_type": "",
             "refresh_profile_id": "",
         }
 

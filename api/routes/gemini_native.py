@@ -1025,6 +1025,14 @@ def build_gemini_native_router(
                         return auth_error_cls(str(exc))
                     if kind == "quota":
                         return quota_error_cls(str(exc))
+                    if kind == "rate_limited":
+                        # 429 带上原状态码才能触发账号冷却；用 503 只会换号，
+                        # 被限流的账号下一个请求又会被选中。
+                        return upstream_temp_error_cls(
+                            str(exc),
+                            status_code=429,
+                            error_type="rate_limit",
+                        )
                     if kind == "temp":
                         return upstream_temp_error_cls(
                             str(exc),
@@ -1079,7 +1087,18 @@ def build_gemini_native_router(
                     except LeonardoError as exc:
                         raise _map_leo_error(exc) from exc
 
-                    _record_leonardo_credit_cost(request, result)
+                    # 估算兜底需要知道模型和是否图生图；gemini 路由手里只有 spec，
+                    # 用它的 leonardo_slug 拼一个最小 catalog 形状即可。
+                    _record_leonardo_credit_cost(
+                        request,
+                        result,
+                        model_config={
+                            "upstream_model": f"leonardo:{spec.leonardo_slug}"
+                        },
+                        output_resolution=str(parsed.image_size or "2K"),
+                        quantity=1,
+                        is_edit=bool(parsed.images),
+                    )
 
                     items = result.get("data") or []
                     url = str((items[0] if items else {}).get("url") or "").strip()

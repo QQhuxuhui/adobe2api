@@ -417,3 +417,36 @@ def test_single_refresh_frontend_reloads_tokens_in_finally():
 
     assert "finally" in function_source
     assert "await loadTokens();" in function_source
+
+
+def test_batch_admin_refresh_covers_exhausted_accounts():
+    """默认批量刷新必须走 list_credit_refresh_ids，不是 list_active_ids。
+
+    exhausted 账号的唯一复活触发器就是余额查询——cookie 刷新不再复活它们。
+    这里要是退回 list_active_ids，配额恢复后账号也永远回不了池子。
+    """
+
+    class Store(FakeAdminTokenStore):
+        def __init__(self):
+            super().__init__()
+            self.used_active_list = False
+
+        def list_active_ids(self):
+            self.used_active_list = True
+            return ["token-active"]
+
+        def list_credit_refresh_ids(self):
+            return ["token-active", "token-exhausted"]
+
+    token_store = Store()
+    refresh_manager = FakeAdminRefreshManager()
+    client = make_admin_client(token_store, refresh_manager)
+
+    response = client.post("/api/v1/tokens/credits/refresh-batch", json={})
+
+    assert response.status_code == 200
+    assert not token_store.used_active_list, "调度可用集合 ≠ 余额刷新集合"
+    assert sorted(tid for tid, _ in refresh_manager.calls) == [
+        "token-active",
+        "token-exhausted",
+    ]

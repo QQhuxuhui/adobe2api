@@ -501,6 +501,12 @@ def _set_request_task_progress(
 
 def _set_request_token_context(request: Request, token: str, attempt: int) -> dict:
     meta = token_manager.get_meta_by_value(token)
+    # Leonardo 不进 Adobe 的事后积分回填队列。两个理由：
+    #   1) 它的成本在请求内部就精确测出来了（生成前后查余额差分），事后再差分只会更差；
+    #   2) 两边积分不是同一种币值，Adobe 的估算表套到 Leonardo 上会写出错的数字。
+    #      而且 Leonardo 余额只给剩余、used 恒为 0，Adobe 那套 delta 差分对它恒等于 0，
+    #      必然落到估算回填，把请求里测好的值覆盖掉——这正是「使用记录没有积分数据」的根因。
+    is_leonardo = str(meta.get("token_type") or "").strip().lower() == "leonardo"
     try:
         token_id = str(meta.get("token_id") or "").strip()
         account_id = str(meta.get("token_account_id") or "").strip()
@@ -521,15 +527,17 @@ def _set_request_token_context(request: Request, token: str, attempt: int) -> di
                 account_id=previous_account_id or None,
                 completed=False,
             )
-        if token_id and request_id and previous_token_id != token_id:
+        if not is_leonardo and token_id and request_id and previous_token_id != token_id:
             credits_tracker.begin(
                 token_id,
                 request_id,
                 account_id=account_id or None,
             )
-        request.state.log_credit_token_id = token_id or None
-        request.state.log_credit_account_id = account_id or None
-        request.state.log_credit_request_id = request_id or None
+        # Leonardo 不登记到回填队列，log_credit_token_id 也留空——
+        # 结算时 _finalize_request_credits 靠它判断要不要 complete()。
+        request.state.log_credit_token_id = None if is_leonardo else (token_id or None)
+        request.state.log_credit_account_id = None if is_leonardo else (account_id or None)
+        request.state.log_credit_request_id = None if is_leonardo else (request_id or None)
         request.state.log_token_id = token_id or None
         request.state.log_token_account_id = meta.get("token_account_id")
         request.state.log_token_account_name = meta.get("token_account_name")

@@ -317,7 +317,9 @@ def test_classify_leonardo_error():
     # HTTP 状态优先
     assert c(LeonardoError("graphql HTTP 401")) == "auth"
     assert c(LeonardoError("graphql HTTP 403")) == "auth"
-    assert c(LeonardoError("graphql HTTP 429")) == "quota"
+    # 429 是网关限流，不是账号额度耗尽：判成 quota 的话一次瞬时限流就会把整个
+    # 账号出池，而出池后只能等余额恢复才复活（见 test_account_quota_retirement）。
+    assert c(LeonardoError("graphql HTTP 429")) == "rate_limited"
     # 不再误伤：GetTokenBalance/invalid model 不判 quota/auth
     assert c(LeonardoError("graphql GetTokenBalance failed: connection reset")) == "temp"
     assert c(LeonardoError("invalid model requested")) == "temp"
@@ -360,7 +362,7 @@ def test_temp_error_is_retryable_has_status():
 
 @pytest.mark.parametrize(
     "status,kind",
-    [(401, "auth"), (403, "auth"), (429, "quota")],
+    [(401, "auth"), (403, "auth"), (429, "rate_limited")],
 )
 def test_client_gateway_reject_is_switchable_not_retry_unsafe(monkeypatch, status, kind):
     # #1(a)：单发 Generate 收到 401/403/429 → LeonardoError(可切号/标记)，不是 RetryUnsafe
