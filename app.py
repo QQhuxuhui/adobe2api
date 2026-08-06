@@ -922,6 +922,37 @@ def _resolve_video_options(data: dict) -> tuple[bool, str, str]:
     return generate_audio, negative_prompt, reference_mode
 
 
+def _rotation_config_key(operation_name: str) -> str:
+    """operation_name → 配置键。
+
+    注意 operation_name 带点（images.edits），gemini 那边还是驼峰动态拼的
+    （gemini.generateContent）。统一小写 + 点转下划线，登记配置时必须用
+    压平后的名字（rotation_max_accounts_gemini_generatecontent），
+    写成保留驼峰的样子会永远读不到。
+
+    另外：ConfigManager 的默认字典是唯一的键注册表，只往 config.json 里加
+    新的 per-operation 键会被 load() 静默丢弃。要给别的 operation 设上限，
+    先在 core/config_mgr.py 的默认字典里登记该键。目前只登记了
+    images_edits 和 default 两个。
+    """
+    normalized = str(operation_name or "").strip().lower().replace(".", "_")
+    return f"rotation_max_accounts_{normalized}" if normalized else ""
+
+
+def _rotation_max_accounts(operation_name: str) -> int:
+    """本次请求最多试几个账号；<=0 表示不限。"""
+    default_raw = config_manager.get("rotation_max_accounts_default", 0)
+    key = _rotation_config_key(operation_name)
+    raw = config_manager.get(key, default_raw) if key else default_raw
+    if isinstance(raw, bool):
+        return 0
+    try:
+        value = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
 def _run_with_token_retries(
     request: Request,
     operation_name: str,
@@ -945,13 +976,25 @@ def _run_with_token_retries(
     def _ensure_deadline() -> None:
         if deadline is not None and time.monotonic() >= deadline:
             raise UpstreamTemporaryError(
-                "Gemini native request deadline exceeded",
+                "Upstream request deadline exceeded",
                 status_code=503,
                 error_type="timeout",
             )
 
+    max_rotations = _rotation_max_accounts(operation_name)
+
     while True:
         _ensure_deadline()
+        # 换号次数上限：deadline 是主保险，这条是第二道。号池很大时，光是
+        # 挨个试过去（每次都要重传输入图）就能把整个预算烧光，还不如早点认输
+        # 让上游换渠道重试。0 表示不限，未配置的 operation 行为不变。
+        if max_rotations > 0 and attempt >= max_rotations:
+            last_exc = UpstreamTemporaryError(
+                "Account rotation budget exhausted; no usable account for this request.",
+                status_code=503,
+                error_type="pool_saturated",
+            )
+            break
         attempt += 1
         # 占用一个空闲账号（含并发闸门 + 排队）。拿不到时区分是「排队没排到(池满)」
         # 还是「本请求可用的账号已试完」。
@@ -1364,13 +1407,35 @@ def _normalize_image_mime(mime_type: str) -> str:
     return normalized
 
 
-def _load_input_images(messages) -> list[tuple[bytes, str]]:
+def _remaining_before(deadline: Optional[float], what: str) -> Optional[float]:
+    """还剩多少秒。已经超时就直接抛，别再发起新的 I/O。
+
+    deadline 是 time.monotonic() 口径的绝对时刻，返回 None 表示没有时限。
+    """
+    if deadline is None:
+        return None
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        raise UpstreamTemporaryError(
+            f"{what} deadline exceeded",
+            status_code=503,
+            error_type="timeout",
+        )
+    return remaining
+
+
+def _load_input_images(
+    messages, *, deadline: Optional[float] = None
+) -> list[tuple[bytes, str]]:
     image_urls = _extract_image_urls_from_messages(messages, max_items=6)
     if not image_urls:
         return []
 
     loaded: list[tuple[bytes, str]] = []
     for image_url in image_urls:
+        # 所有输入图共享同一个绝对截止时间：最多 6 张图，每张都重置 30 秒的话
+        # 光加载就能吃掉三分钟，总时限就成了摆设。
+        remaining = _remaining_before(deadline, "Input image loading")
         if image_url.startswith("data:"):
             try:
                 image_bytes, mime_type = _data_url_to_bytes(image_url)
@@ -1382,7 +1447,8 @@ def _load_input_images(messages) -> list[tuple[bytes, str]]:
                     status_code=400,
                     detail="Only http/https or data URL images are supported",
                 )
-            resp = requests.get(image_url, timeout=30)
+            fetch_timeout = 30 if remaining is None else min(30.0, remaining)
+            resp = requests.get(image_url, timeout=fetch_timeout)
             if resp.status_code != 200:
                 raise HTTPException(
                     status_code=400,
@@ -1395,6 +1461,8 @@ def _load_input_images(messages) -> list[tuple[bytes, str]]:
 
         if not image_bytes:
             raise HTTPException(status_code=400, detail="image_url is empty")
+        # 规范化（解码 + 可能的压缩）本身也要花时间，进去之前再看一眼
+        _remaining_before(deadline, "Input image loading")
         try:
             upload_bytes, upload_mime, width, height = normalize_input_image(
                 image_bytes, mime_type

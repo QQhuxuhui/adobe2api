@@ -501,8 +501,12 @@ class LeonardoClient:
             )
         return resp
 
-    def get_credits(self, token: str) -> Optional[int]:
-        return parse_token_balance(self._call(token, TOKEN_BALANCE_QUERY))
+    def get_credits(
+        self, token: str, deadline: Optional[float] = None
+    ) -> Optional[int]:
+        return parse_token_balance(
+            self._call(token, TOKEN_BALANCE_QUERY, deadline=deadline)
+        )
 
     def get_user_credits(self, token: str) -> Dict[str, int]:
         """查询用户 credits 详情（用于 refresh_mgr）"""
@@ -527,8 +531,11 @@ class LeonardoClient:
         )
         files = {k: (None, str(v)) for k, v in (up["fields"] or {}).items()}
         files["file"] = (f"image.{extension}", image_bytes, f"image/{extension}")
+        # S3 直传是独立于 GraphQL 的另一条 I/O，此前写死 120s 且不看 deadline：
+        # 6 张参考图能串行阻塞 720 秒，把端到端时限整个穿透。
+        upload_timeout = self._timeout_for_deadline(120, deadline)
         try:
-            resp = requests.post(up["url"], files=files, timeout=120)
+            resp = requests.post(up["url"], files=files, timeout=upload_timeout)
         except Exception as exc:  # noqa: BLE001 - 传输失败统一转领域错误
             raise LeonardoError(f"init image upload failed: {exc}") from exc
         if getattr(resp, "status_code", 0) not in (200, 201, 204):

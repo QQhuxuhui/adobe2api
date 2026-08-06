@@ -703,6 +703,10 @@ def build_admin_router(
             ("max_inflight_per_account", 1, 100),
             ("account_queue_size", 0, 10000),
             ("account_queue_timeout_seconds", 0, 300),
+            ("images_edits_deadline_seconds", 0, 3600),
+            ("rotation_max_accounts_default", 0, 100),
+            ("rotation_max_accounts_images_edits", 0, 100),
+            ("leonardo_credits_refresh_minutes", 1, 30),
         ):
             if _key in incoming:
                 try:

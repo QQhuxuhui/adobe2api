@@ -24,6 +24,19 @@ class ConfigManager:
             "use_proxy": False,
             "generate_timeout": 300,
             "gemini_native_deadline_seconds": 500,
+            # /v1/images/edits 的端到端时限（秒），0=不限。必须小于下游网关的
+            # upstream 超时，让最内层先放弃，避免「上游已断开、这边还在跑并计费」。
+            "images_edits_deadline_seconds": 300,
+            # 单个请求最多试几个账号（换号上限），0=不限。deadline 是主保险，
+            # 这是第二道：号池很大时挨个试过去也能把预算烧光。
+            # 按 operation 覆盖：rotation_max_accounts_<operation 小写且点转下划线>，
+            # 例如 images.edits → rotation_max_accounts_images_edits。
+            "rotation_max_accounts_default": 0,
+            "rotation_max_accounts_images_edits": 5,
+            # Leonardo 余额自动刷新间隔（分钟）。Leonardo 的 refresher 是独立进程、
+            # 推完 token 就走，不像 Adobe 那样顺带查余额；而配额出池的账号没有请求
+            # 去顺带刷它，余额刷新就是它唯一的复活触发器。
+            "leonardo_credits_refresh_minutes": 10,
             "refresh_interval_hours": 15,
             "retry_enabled": True,
             "retry_max_attempts": 3,

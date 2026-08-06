@@ -31,6 +31,7 @@ def generate_image_artifact(
     progress_cb: Callable[[dict], None] | None,
     on_generated_file_written: Callable[[Path, int, int], None],
     job_id: str | None = None,
+    deadline: float | None = None,
 ) -> GeneratedImageArtifact:
     resolved_job_id = job_id or uuid.uuid4().hex
     path = generated_dir / f"{resolved_job_id}.png"
@@ -62,6 +63,7 @@ def generate_image_artifact(
         timeout=client.generate_timeout,
         out_path=path,
         progress_cb=progress_cb,
+        deadline=deadline,
     )
     if image_bytes is not None:
         path.write_bytes(image_bytes)

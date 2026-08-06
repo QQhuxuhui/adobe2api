@@ -93,6 +93,10 @@ class ConfigUpdateRequest(BaseModel):
     use_proxy: Optional[bool] = None
     generate_timeout: Optional[int] = None
     gemini_native_deadline_seconds: Optional[StrictInt] = None
+    images_edits_deadline_seconds: Optional[StrictInt] = None
+    rotation_max_accounts_default: Optional[StrictInt] = None
+    rotation_max_accounts_images_edits: Optional[StrictInt] = None
+    leonardo_credits_refresh_minutes: Optional[StrictInt] = None
     refresh_interval_hours: Optional[int] = None
     retry_enabled: Optional[bool] = None
     retry_max_attempts: Optional[int] = None

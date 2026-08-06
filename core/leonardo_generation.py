@@ -208,17 +208,29 @@ def edit_images(
             "init_image_ids": init_ids,
             "credit_cost": credit_cost,
             "credit_cost_source": credit_cost_source,
+            # 供按像素计费的模型估算成本（测不到时的兜底）
+            "output_size": {"width": width, "height": height},
+            "quantity": 1,
         },
     }
 
 
 def _read_balance(client, token: str, deadline) -> Optional[int]:
-    """读出图可用额度；余额查询不消耗积分。任何失败都不得影响出图。"""
+    """读出图可用额度；余额查询不消耗积分。任何失败都不得影响出图。
+
+    deadline 必须传下去：这个查询会走 GraphQL 重试（3 次 × 60s），
+    形参在这里躺着不用的话，一次生成前后两次余额查询最坏能多阻塞 6 分钟，
+    而且发生在端到端预算已经烧穿之后。
+    """
     reader = getattr(client, "get_credits", None)
     if not callable(reader):
         return None
     try:
-        value = reader(token)
+        try:
+            value = reader(token, deadline=deadline)
+        except TypeError:
+            # 旧签名/测试桩不认识 deadline
+            value = reader(token)
     except Exception:  # noqa: BLE001 - 记账失败不影响出图
         return None
     return value if isinstance(value, (int, float)) else None
@@ -268,6 +280,13 @@ def generate_images(
 
     aspect = to_aspect(size=size, aspect_ratio=aspect_ratio)
     quantity = clamp_quantity(n)
+    # 与 client 内部解尺寸用的是同一张表；按像素计费的模型要靠它估成本
+    from core.leonardo_client import aspect_to_size as _aspect_to_size
+
+    _wh = _aspect_to_size(
+        aspect, model_slug=model_slug, output_resolution=output_resolution
+    )
+    width, height = _wh if _wh else (None, None)
 
     # 单张积分成本：优先用上游 Generate 回报的 apiCreditCost；实测该字段恒为 null，
     # 故回退到「生成前后余额差分」实测（余额查询免费，不消耗积分）。

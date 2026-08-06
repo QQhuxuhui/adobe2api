@@ -1,4 +1,6 @@
 import base64
+import inspect
+import logging
 import re
 import secrets
 import time
@@ -1025,6 +1027,29 @@ def build_generation_router(
     async def openai_edit(request: Request):
         require_service_api_key(request)
 
+        # 端到端时限：从进入 endpoint 就开始算，覆盖输入图下载/规范化、
+        # 上传、submit、轮询和下载。必须在输入图加载之前创建——最多 6 张远程图
+        # 的下载发生在生成之前，只约束上游那段的话它们不受任何限制。
+        # 层级关系：本时限 < sub2api 的 upstream 超时 < nginx，最内层先放弃，
+        # 才不会出现「上游已经断开、这边还在跑并照常计费」。
+        deadline = _edits_deadline()
+
+        def _deadline_response():
+            """预算耗尽时返回 OpenAI 形状的 503；没超时返回 None。
+
+            这里刻意不抛异常：multipart 的解析发生在 endpoint 的 try 之外，
+            抛出去会一路穿到 ASGI 层变成裸 500，而下游网关只对 503 做换渠道重试，
+            500 会被当成本端故障。
+            """
+            if deadline is None or time.monotonic() < deadline:
+                return None
+            return _openai_image_error_response(
+                request,
+                upstream_temp_error_cls("Images edits request deadline exceeded"),
+                endpoint="/v1/images/edits",
+                model_label=str(_field("model") or ""),
+            )
+
         def _bad_request(message: str) -> JSONResponse:
             set_request_error_detail(
                 request,
@@ -1107,7 +1132,12 @@ def build_generation_router(
                 }
             ]
             try:
-                input_images = await run_in_threadpool(load_input_images, messages)
+                input_images = await run_in_threadpool(
+                    _load_input_images_with_deadline,
+                    load_input_images,
+                    messages,
+                    deadline,
+                )
             except HTTPException as exc:
                 # 图片拉不到(非 200)/超 10MB/协议不支持: 按原状态码回给客户端
                 return _openai_image_error_response(
@@ -1147,9 +1177,18 @@ def build_generation_router(
                 )
 
             for upload in uploads:
+                # multipart 是官方 SDK 的默认路径，它不经过 load_input_images，
+                # 只在 JSON 分支插检查的话这里会完全绕过 deadline。
+                expired = _deadline_response()
+                if expired is not None:
+                    return expired
                 image_bytes = await upload.read()
                 if not image_bytes:
                     return _bad_request("image file is empty")
+                # 规范化（解码 + 压缩阶梯）本身也很耗时，进去之前再看一眼
+                expired = _deadline_response()
+                if expired is not None:
+                    return expired
                 try:
                     upload_bytes, upload_mime, width, height = await run_in_threadpool(
                         normalize_input_image, image_bytes, upload.content_type
@@ -1295,20 +1334,47 @@ def build_generation_router(
                         error=update.get("error"),
                     )
 
-                artifact = generate_image_artifact(
-                    client=client,
-                    token=token,
-                    prompt=prompt,
-                    aspect_ratio=ratio,
-                    output_resolution=output_resolution,
-                    model_config=model_conf,
-                    generated_dir=generated_dir,
-                    source_image_ids=source_image_ids,
-                    output_size=geometry.output_size,
-                    fallback_aspect_ratio=geometry.fallback_aspect_ratio,
-                    progress_cb=_image_progress_cb,
-                    on_generated_file_written=on_generated_file_written,
-                )
+                def _generate(ids):
+                    return generate_image_artifact(
+                        client=client,
+                        token=token,
+                        prompt=prompt,
+                        aspect_ratio=ratio,
+                        output_resolution=output_resolution,
+                        model_config=model_conf,
+                        generated_dir=generated_dir,
+                        source_image_ids=ids,
+                        output_size=geometry.output_size,
+                        fallback_aspect_ratio=geometry.fallback_aspect_ratio,
+                        progress_cb=_image_progress_cb,
+                        on_generated_file_written=on_generated_file_written,
+                        deadline=deadline,
+                    )
+
+                try:
+                    artifact = _generate(source_image_ids)
+                except Exception as exc:  # noqa: BLE001 - 下面按类型分流
+                    # 复用了上一轮（可能是别的账号）的 blob，而提交被明确拒绝：
+                    # 有可能 blob 已失效。跨账号可用是实测出来的当前行为、不是契约，
+                    # 所以这里留一次用当前账号全量重传的兜底，免得上游改行为时整条链路挂掉。
+                    if not (
+                        reused_blobs
+                        and _is_hard_reject(
+                            exc,
+                            quota_cls=quota_error_cls,
+                            auth_cls=auth_error_cls,
+                            temp_cls=upstream_temp_error_cls,
+                        )
+                    ):
+                        raise
+                    _module_logger.warning(
+                        "images.edits: submit rejected with reused blobs, "
+                        "re-uploading with current account log_id=%s err=%s",
+                        getattr(request.state, "log_id", ""),
+                        str(exc)[:160],
+                    )
+                    uploads.reset()
+                    artifact = _generate(uploads.ensure(token))
                 image_url = public_image_url(request, artifact.job_id)
                 set_request_preview(request, image_url, kind="image")
                 if response_format == "b64_json":
@@ -1333,6 +1399,7 @@ def build_generation_router(
                 request=request,
                 operation_name="images.edits",
                 run_once=_run_once,
+                deadline=deadline,
             )
 
         try:
