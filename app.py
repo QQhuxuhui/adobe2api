@@ -1789,6 +1789,11 @@ _cleanup_interrupted_video_tasks()
 def _shutdown_video_services() -> None:
     video_task_manager.close()
     credits_tracker.close()
+    # 后台刷新线程（Adobe profile 轮询 + Leonardo 余额刷新）也要停，
+    # 否则热重载后旧实例的线程会继续打上游。
+    stopper = getattr(refresh_manager, "stop", None)
+    if callable(stopper):
+        stopper()
 
 
 app.add_event_handler("shutdown", _shutdown_video_services)

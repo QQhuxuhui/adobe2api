@@ -488,20 +488,71 @@ class TokenManager:
                         t["error_until"] = 0
             self.save()
 
+    @staticmethod
+    def _write_credits_locked(target: Dict, credits: Dict) -> None:
+        """把余额写进 token 行。字段集必须完整——credits_total / credits_used /
+        credits_error 是后台余额展示和错误态依赖的，漏一个后台就显示不出来。"""
+        target["credits_total"] = credits.get("total")
+        target["credits_used"] = credits.get("used")
+        target["credits_available"] = credits.get("available")
+        target["credits_available_until"] = credits.get("available_until")
+        target["credits_updated_at"] = credits.get("updated_at") or int(time.time())
+        target["credits_error"] = ""
+
     def set_credits(self, tid: str, credits: Dict):
         with self._lock:
             for t in self.tokens:
                 if t.get("id") != tid:
                     continue
-                t["credits_total"] = credits.get("total")
-                t["credits_used"] = credits.get("used")
-                t["credits_available"] = credits.get("available")
-                t["credits_available_until"] = credits.get("available_until")
-                t["credits_updated_at"] = credits.get("updated_at") or int(time.time())
-                t["credits_error"] = ""
+                self._write_credits_locked(t, credits)
                 self.save()
                 return dict(t)
         return None
+
+    def set_credits_and_maybe_revive(
+        self,
+        tid: str,
+        credits: Dict,
+        observed_quota_epoch: Optional[int] = None,
+    ):
+        """写余额，并在同一把锁内决定要不要把 exhausted 账号放回池子。
+
+        复活条件（缺一不可）：账号确实处于 exhausted、余额 > 0、且本次余额快照
+        属于当前配额版本（observed_quota_epoch == 当前 quota_epoch）。
+
+        第三条挡的是乱序：余额请求可能在耗尽事件之前就发出、之后才返回，
+        那份「余额还有」的旧快照不能把刚耗尽的账号复活。用版本号而不是时间戳，
+        是因为余额的 updated_at 只有秒级精度，同秒发生时分不出先后。
+
+        版本失配的余额仍然落盘（后台要看），但打上 credits_quota_epoch 标记，
+        调度侧的余额 fast-path 会据此忽略它。
+        """
+        with self._lock:
+            target = next((t for t in self.tokens if t.get("id") == tid), None)
+            if target is None:
+                return None
+
+            key = self._account_key(target)
+            current_epoch = self._quota_epochs.get(key, 0)
+            snapshot_epoch = self._quota_epoch_value(observed_quota_epoch)
+
+            self._write_credits_locked(target, credits)
+            # 注意不能用 `or` 兜底：0 是合法版本（账号从未耗尽过）。
+            target["credits_quota_epoch"] = snapshot_epoch
+
+            available = self._credits_available_value(target)
+            if (
+                available is not None
+                and available > 0
+                and snapshot_epoch is not None
+                and snapshot_epoch == current_epoch
+            ):
+                for t in self.tokens:
+                    if self._account_key(t) == key and t.get("status") == "exhausted":
+                        t["status"] = "active"
+                        t["fails"] = 0
+            self.save()
+            return dict(target)
 
     def set_credits_error(self, tid: str, error_message: str):
         with self._lock:
@@ -521,6 +572,40 @@ class TokenManager:
                 for t in self.tokens
                 if t.get("status") == "active"
             ]
+
+    # 余额刷新要覆盖的状态：
+    #   active/error —— 常规刷新，error 号还指望余额查询触发 auth 复活
+    #   exhausted    —— 唯一的复活触发器。cookie 刷新不再复活配额耗尽的号，
+    #                   只有「余额回来了」才放回池子，所以必须持续查它们的余额。
+    # 注意：这个集合只用于余额刷新，绝不能拿去放宽 list_active_ids——
+    # 那会把 exhausted 账号重新送进生成调度池。
+    CREDIT_REFRESH_STATUSES = frozenset({"active", "error", "exhausted"})
+
+    def list_credit_refresh_ids(self) -> List[str]:
+        """批量余额刷新的目标 token id，按账号去重（同账号查一行就够）。"""
+        with self._lock:
+            by_account: Dict[str, List[Dict]] = {}
+            loose: List[str] = []
+            for t in self.tokens:
+                if t.get("status") not in self.CREDIT_REFRESH_STATUSES:
+                    continue
+                tid = str(t.get("id") or "")
+                if not tid:
+                    continue
+                key = self._account_key(t)
+                if not key:
+                    loose.append(tid)
+                    continue
+                by_account.setdefault(key, []).append(t)
+
+            ids: List[str] = []
+            for _key, rows in by_account.items():
+                # 同账号只查一行，优先自动刷新行：手动导入行的 token 往往早已过期，
+                # 拿它查余额只会得到 401——既查不到余额，还会把那行标成 invalid。
+                chosen = next((r for r in rows if r.get("auto_refresh")), rows[0])
+                ids.append(str(chosen.get("id") or ""))
+            ids.extend(loose)
+            return [i for i in ids if i]
 
     def has_active_token(self, token_type: Optional[str] = None) -> bool:
         """池中是否存在指定类型的可用 token（非消费、不推进轮询）。
@@ -649,6 +734,70 @@ class TokenManager:
     def _is_busy(self, t: Dict, max_inflight: int) -> bool:
         return self._inflight.get(self._account_key(t), 0) >= max_inflight
 
+    # 余额缓存超过这个岁数就不再用于跳过账号——宁可多打一次 403，
+    # 也不能让一份陈旧的「余额为 0」把账号永久挡在池外。
+    CREDITS_FASTPATH_TTL = 30 * 60
+
+    def _account_known_zero_credits(self, rows: List[Dict]) -> bool:
+        """这个账号是否「确定没额度」，可以在选号阶段直接跳过。
+
+        只是 fast-path：省掉对已知空号的整次多图上传。任何不确定（没缓存、
+        缓存过期、额度周期已翻转、快照属于旧配额版本、数据脏）一律返回 False 放行，
+        由真实的 403 分类做最终裁决。
+
+        必须无锁：本方法在 acquire_lease 的 _gate_cond 持锁段内被调用，
+        而 _gate_cond 和 self._lock 是同一把不可重入锁。
+        """
+        now = time.time()
+        # 只采信属于当前配额版本的快照：耗尽事件之前发出、之后才返回的余额
+        # 反映的是旧状态，既不能复活账号，也不能拿来裁决它。
+        current_epoch = max(
+            (self._quota_epoch_value(row.get("quota_epoch")) or 0 for row in rows),
+            default=0,
+        )
+        current = [
+            row
+            for row in rows
+            if self._quota_epoch_value(row.get("credits_quota_epoch")) == current_epoch
+        ]
+        if not current:
+            return False
+
+        freshest = max(current, key=self._credits_updated_at)
+        # 上一次余额刷新失败时 set_credits_error 只写错误、保留旧余额，
+        # 却把 credits_updated_at 刷新了——那份陈旧的「零余额」会重新显得新鲜，
+        # 一直挡住可能早就恢复额度的账号。带错误标记的快照一律不采信。
+        if str(freshest.get("credits_error") or "").strip():
+            return False
+        updated_at = self._credits_updated_at(freshest)
+        if updated_at <= 0 or now - updated_at > self.CREDITS_FASTPATH_TTL:
+            return False
+        until = self._parse_credits_until(freshest.get("credits_available_until"))
+        if until is not None and until <= now:
+            return False
+        available = self._credits_available_value(freshest)
+        return available is not None and available <= 0
+
+    def _filter_zero_credit_accounts(self, active: List[Dict]) -> List[Dict]:
+        """按账号整组过滤掉已知零余额的号。
+
+        按账号而不是按行：同账号两行 token 的余额缓存不一定同步，
+        按行过滤时「一行是 0、另一行没缓存」的账号会从后一行漏过去。
+        全被滤空时返回原列表——fast-path 不该把池子清空。
+        """
+        if not active:
+            return active
+        by_account: Dict[str, List[Dict]] = {}
+        for t in active:
+            by_account.setdefault(self._account_key(t), []).append(t)
+        kept = [
+            t
+            for _key, rows in by_account.items()
+            if not self._account_known_zero_credits(rows)
+            for t in rows
+        ]
+        return kept or active
+
     def _ready_pool_locked(self, active: List[Dict]) -> List[Dict]:
         """滤掉还在限流冷却、以及正在被占满的账号。
 
@@ -725,6 +874,9 @@ class TokenManager:
             active = [t for t in active if t.get("type") != "leonardo"]
         if not active:
             return None
+        # 在 _ready_pool_locked 之前过滤：它在全池不可用时会兜底交回一行，
+        # 放到之后过滤的话零余额账号会被那条兜底重新塞回来。
+        active = self._filter_zero_credit_accounts(active)
 
         mode = str(strategy or "round_robin").strip().lower()
         chosen = self._choose_locked(self._ready_pool_locked(active), mode)
@@ -765,6 +917,7 @@ class TokenManager:
             ]
             if not active:
                 return None
+            active = self._filter_zero_credit_accounts(active)
             mode = str(strategy or "round_robin").strip().lower()
             chosen = self._choose_locked(
                 self._ready_pool_locked(active), mode, cursor_key=aid
@@ -787,7 +940,7 @@ class TokenManager:
             active = [t for t in active if t.get("type") != "leonardo"]
         if exclude_accounts:
             active = [t for t in active if self._account_key(t) not in exclude_accounts]
-        return active
+        return self._filter_zero_credit_accounts(active)
 
     def acquire_lease(
         self,

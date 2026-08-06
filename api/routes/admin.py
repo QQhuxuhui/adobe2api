@@ -439,7 +439,12 @@ def build_admin_router(
         if ids:
             token_ids = [str(x or "").strip() for x in ids if str(x or "").strip()]
         else:
-            token_ids = token_manager.list_active_ids()
+            # 余额刷新的目标集合比调度可用集合大：exhausted 账号靠余额查询复活，
+            # error 账号靠它触发 auth 恢复，都不能像 list_active_ids 那样被漏掉。
+            lister = getattr(token_manager, "list_credit_refresh_ids", None)
+            token_ids = (
+                lister() if callable(lister) else token_manager.list_active_ids()
+            )
 
         if not token_ids:
             raise HTTPException(status_code=400, detail="no token to refresh")

@@ -1,3 +1,4 @@
+import logging
 import base64
 import json
 import re
@@ -12,6 +13,8 @@ import requests
 
 from core.config_mgr import config_manager
 from core.token_mgr import token_manager
+
+logger = logging.getLogger("adobe2api.refresh")
 
 
 BASE_DIR = Path(__file__).parent.parent
@@ -870,6 +873,36 @@ class RefreshManager:
             "updated_at": int(time.time()),
         }
 
+    @staticmethod
+    def _capture_quota_epoch(token_id: str, token_value: str):
+        """查余额之前记下账号键和配额版本。
+
+        返回 (account_key, epoch)；解析不出账号时 epoch 为 None，
+        表示「无从判断这份余额属于哪个配额世代」，落盘时不得据此复活账号。
+        """
+        key_resolver = getattr(token_manager, "account_key_for_id", None)
+        if not callable(key_resolver):
+            return "", None
+        account_key = str(
+            key_resolver(token_id, fallback_value=token_value) or ""
+        ).strip()
+        if not account_key:
+            return "", None
+        epoch_reader = getattr(token_manager, "quota_epoch", None)
+        if not callable(epoch_reader):
+            return account_key, None
+        return account_key, epoch_reader(account_key)
+
+    @staticmethod
+    def _commit_credits(token_id: str, credits, observed_quota_epoch):
+        """写余额，并在版本未变时复活账号。老版本 TokenManager 回退到普通写入。"""
+        revive_writer = getattr(token_manager, "set_credits_and_maybe_revive", None)
+        if callable(revive_writer):
+            return revive_writer(
+                token_id, credits, observed_quota_epoch=observed_quota_epoch
+            )
+        return token_manager.set_credits(token_id, credits)
+
     def refresh_credits_for_token_id(
         self, token_id: str, handle_auth: bool = False
     ) -> Dict:
@@ -880,8 +913,15 @@ class RefreshManager:
         # Leonardo token 使用不同的 credits API
         token_type = token_info.get("type")
         if token_type == "leonardo":
+            # 和 Adobe 分支同样要走 epoch-aware 提交：Leonardo 账号出池后，
+            # cookie 刷新（upsert_leonardo_token）不再复活它，余额驱动复活
+            # 就成了唯一出路——这里要是只调普通 set_credits，Leonardo 号
+            # 一旦 exhausted 就永久出不来了。
+            leo_key, leo_epoch = self._capture_quota_epoch(
+                token_id, str(token_info.get("value") or "").strip()
+            )
             credits = self._fetch_leonardo_credits(token_info)
-            token_manager.set_credits(token_id, credits)
+            self._commit_credits(token_id, credits, leo_epoch)
             return {
                 "token_id": token_id,
                 "account_id": token_info.get("account_id"),
@@ -890,6 +930,15 @@ class RefreshManager:
 
         token_value = str(token_info.get("value") or "").strip()
         account_id = self._extract_account_id(token_value)
+
+        # 在发起任何网络请求之前记下账号的配额版本。落盘时版本没变，才说明
+        # 这份余额确实反映了当前配额状态，可以用来复活账号；期间要是又撞了一次
+        # 配额耗尽，这份快照就成了过期数据，只能留档不能复活。
+        # 下面 auth 重试分支重新取 token 后仍用这同一个版本——重试属于同一次查询。
+        account_key, observed_quota_epoch = self._capture_quota_epoch(
+            token_id, token_value
+        )
+
         try:
             credits = self._fetch_credits_balance(token_value, account_id)
         except CreditsAuthError as exc:
@@ -918,7 +967,7 @@ class RefreshManager:
                 refreshed_account_id,
             )
 
-        token_manager.set_credits(token_id, credits)
+        self._commit_credits(token_id, credits, observed_quota_epoch)
         return {
             "token_id": token_id,
             "credits": credits,
@@ -1039,8 +1088,96 @@ class RefreshManager:
             if self._runner_started:
                 return
             self._runner_started = True
-        t = threading.Thread(target=self._run, daemon=True)
-        t.start()
+        self._stop_event.clear()
+        threading.Thread(target=self._run, daemon=True).start()
+        # Leonardo 单起一个线程，不并进 _run 的 2 秒轮询：
+        # 那个循环是串行的，Leonardo 的 GraphQL 往返会拖慢 Adobe 的 profile 刷新。
+        threading.Thread(target=self._run_leonardo_credits, daemon=True).start()
+
+    def stop(self) -> None:
+        """停掉后台刷新线程。
+
+        两个线程都以 _stop_event 为退出条件，Leonardo 那条还用它做 sleep，
+        所以 set 之后最多一个循环周期就会退出。热重载/重复实例化时必须调用，
+        否则旧实例的线程会继续打上游。
+        """
+        self._stop_event.set()
+        with self._lock:
+            self._runner_started = False
+
+    @staticmethod
+    def _leonardo_credits_interval_seconds() -> int:
+        """Leonardo 余额自动刷新间隔（秒）。
+
+        上界不超过 TokenManager 的余额缓存 TTL（30 分钟），
+        否则零余额 fast-path 的缓存会在两次刷新之间过期、白白放行空号。
+        """
+        raw = config_manager.get("leonardo_credits_refresh_minutes", 10)
+        if isinstance(raw, bool):
+            return 600
+        try:
+            minutes = int(float(str(raw).strip()))
+        except (TypeError, ValueError):
+            return 600
+        return max(60, min(1800, minutes * 60))
+
+    def _leonardo_credit_targets(self) -> list:
+        """本轮要刷余额的 Leonardo token id。
+
+        Adobe 是「cookie 刷新顺带查余额」，Leonardo 的 refresher 是独立进程、
+        推完 token 就走，没有这一环。而配额出池的账号既不会被调度选中、
+        也就永远不会有请求去顺带刷它的余额——余额刷新是它唯一的复活触发器，
+        所以 exhausted 行**不做新鲜度跳过**，宁可多查一次。
+        """
+        lister = getattr(token_manager, "list_credit_refresh_ids", None)
+        try:
+            ids = lister() if callable(lister) else token_manager.list_active_ids()
+        except Exception:
+            return []
+
+        interval = self._leonardo_credits_interval_seconds()
+        stale_before = time.time() - interval
+        targets = []
+        for tid in ids:
+            try:
+                info = token_manager.get_by_id(tid)
+            except Exception:
+                continue
+            if not info or str(info.get("type") or "") != "leonardo":
+                continue
+            if info.get("status") == "exhausted":
+                targets.append(tid)
+                continue
+            # 活跃号的余额已经被 CreditsTracker 的每请求刷新带着走了，
+            # 只补刷那些确实很久没更新的，避免重复打 GraphQL。
+            try:
+                updated_at = float(info.get("credits_updated_at") or 0)
+            except (TypeError, ValueError):
+                updated_at = 0.0
+            if updated_at <= stale_before:
+                targets.append(tid)
+        return targets
+
+    def _run_leonardo_credits(self):
+        while not self._stop_event.is_set():
+            interval = self._leonardo_credits_interval_seconds()
+            try:
+                for tid in self._leonardo_credit_targets():
+                    if self._stop_event.is_set():
+                        break
+                    try:
+                        self.refresh_credits_for_token_id(tid, handle_auth=True)
+                    except Exception as exc:  # noqa: BLE001 - 单个账号失败不影响其余
+                        logger.warning(
+                            "leonardo credits refresh failed token_id=%s: %s", tid, exc
+                        )
+                        try:
+                            token_manager.set_credits_error(tid, str(exc))
+                        except Exception:
+                            pass
+            except Exception:  # noqa: BLE001 - 循环不得因任何异常退出
+                logger.exception("leonardo credits refresh round failed")
+            self._stop_event.wait(interval)
 
     def _run(self):
         while not self._stop_event.is_set():
