@@ -149,6 +149,25 @@ class TokenMetadata:
         }
 
 
+class ProviderTokenMetadata(TokenMetadata):
+    def __init__(self, provider: str):
+        self.provider = provider
+
+    def get_meta_by_value(self, token: str) -> dict:
+        return {**super().get_meta_by_value(token), "token_type": self.provider}
+
+
+class PricingConfig:
+    def __init__(self):
+        self.data = {
+            "leonardo_credit_price_cny": 0.001,
+            "adobe_credit_price_cny": 0.002,
+        }
+
+    def get(self, key: str, default=None):
+        return self.data.get(key, default)
+
+
 class MiddlewareLogStore:
     def __init__(self):
         self.records: list[dict] = []
@@ -169,6 +188,32 @@ class MiddlewareLiveStore:
 
     def remove(self, log_id: str) -> None:
         self.items.pop(log_id, None)
+
+
+def test_middleware_preserves_request_start_price_snapshot(monkeypatch):
+    config = PricingConfig()
+    logs = MiddlewareLogStore()
+    monkeypatch.setattr(app_module, "config_manager", config)
+    monkeypatch.setattr(app_module, "token_manager", ProviderTokenMetadata("leonardo"))
+    monkeypatch.setattr(app_module, "credits_tracker", FakeCreditsTracker(), raising=False)
+    monkeypatch.setattr(app_module, "log_store", logs)
+    monkeypatch.setattr(app_module, "live_log_store", MiddlewareLiveStore())
+    request = make_request()
+
+    async def call_next(req: Request):
+        config.data["leonardo_credit_price_cny"] = 0.009
+        app_module._set_request_token_context(req, "token-1", 1)
+        req.state.log_credits_used = 10
+        req.state.log_credits_source = "measured"
+        return Response(status_code=200)
+
+    asyncio.run(app_module.request_logger(request, call_next))
+
+    payload = logs.records[-1]
+    assert payload["credit_type"] == "leonardo"
+    assert payload["credit_unit_price_cny"] == 0.001
+    assert payload["credits_used"] == 10
+    assert payload["cost_cny"] == 0.01
 
 
 def test_token_context_tracks_first_binding_and_finishes_before_retry_switch(

@@ -126,8 +126,10 @@ GPT Image 图像模型（实验接入）：
 - 命名：`firefly-gpt-image-{resolution}-{ratio}`
 - 分辨率：`1k` / `2k` / `4k`
 - 比例后缀：`1x1` / `5x4` / `9x16` / `21x9` / `16x9` / `4x3` / `3x2` / `4x5` / `3x4` / `2x3`
-- 当前实现会携带 `outputResolution` 和对应像素 `size`
-- GPT Image 质量由系统配置 `gpt_image_quality` 控制：`low` / `medium` / `high`，默认 `low`
+- 动态 GPT Image 别名（`gpt-image-2` / `firefly-gpt-image`）保持下游请求的实际宽高；固定分辨率模型继续使用原有档位行为
+- 对动态别名而言，`quality` 与 `size` 相互独立，不会把 `1024x1024` 自动改成 `2048x2048`
+- `quality`（`low` / `medium` / `high`）控制 GPT Image 渲染质量并传到 `detailLevel`；未传请求质量时才使用系统配置 `gpt_image_quality`（默认 `low`）
+- 上游 payload 仍携带 `outputResolution` 作为 Adobe 兼容档位，但它不会覆盖显式 `size`
 - 示例：
   - `firefly-gpt-image-2k-16x9`
   - `firefly-gpt-image-4k-1x1`
@@ -462,7 +464,7 @@ curl -X POST "http://127.0.0.1:6001/v1/images/generations" \
 
 > 计费数字为余额差分实测。**账号若被他处并发使用，差分会混入他人消耗**——代码对离谱差值（>600）不记录，但仍建议使用独享账号，否则积分统计与余额均不可控。
 
-另：纯文生图（带 inlineData 输入图返回 400）。`imageSize` 仅对 nano-banana 系 1:1 改变像素（1K/2K 如上），其余比例上游只有单一档位。OpenAI 兼容端点的 `gpt-image-2` 同理（仅 `/v1/images/generations` 接了 Leonardo；`/v1/responses`、`/v1/chat/completions` 仍固定走 Adobe）。**以上仅 Leonardo 后端生效，Adobe 侧的尺寸/比例行为完全不变。**
+另：纯文生图（带 inlineData 输入图返回 400）。`imageSize` 仅对 nano-banana 系 1:1 改变像素（1K/2K 如上），其余比例上游只有单一档位。OpenAI 兼容端点的 `gpt-image-2` 同理（仅 `/v1/images/generations` 接了 Leonardo；`/v1/responses`、`/v1/chat/completions` 仍固定走 Adobe）。动态 GPT Image（如 `gpt-image-2` / `firefly-gpt-image`）会保留显式 `size`；`quality` 只传递为质量设置，不会覆盖尺寸。旧的固定分辨率模型继续使用原有档位行为。
 
 请求约束：
 

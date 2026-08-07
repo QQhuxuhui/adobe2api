@@ -139,6 +139,7 @@
         <div class="config-form">
           <div class="config-category-tabs" role="tablist" aria-label="配置分类">
             <button class="config-cat-btn active" type="button" data-target="cfg-account">账户与安全</button>
+            <button class="config-cat-btn" type="button" data-target="cfg-billing">计费</button>
             <button class="config-cat-btn" type="button" data-target="cfg-network">代理与网络</button>
             <button class="config-cat-btn" type="button" data-target="cfg-retry">重试与容错</button>
             <button class="config-cat-btn" type="button" data-target="cfg-storage">刷新与存储</button>
@@ -167,6 +168,20 @@
               <label for="confPublicBaseUrl">公共 URL (Public Base URL)</label>
               <input type="text" id="confPublicBaseUrl" class="input-text" placeholder="例如：http://127.0.0.1:6001/ 或 https://your-domain/antigravity" />
               <p class="help">用于生成图片/视频预览的绝对链接。建议填写外部可访问地址。</p>
+            </div>
+          </section>
+
+          <section id="cfg-billing" class="config-cat-pane">
+            <div class="form-group">
+              <label for="confLeonardoCreditPriceCny">Leonardo 单积分价格（元/积分）</label>
+              <input type="number" id="confLeonardoCreditPriceCny" class="input-text" min="0" step="0.000001" placeholder="未配置" />
+              <p class="help">留空表示成本未知。新请求按请求开始时的单价记录，历史日志不会随配置变更。</p>
+            </div>
+
+            <div class="form-group">
+              <label for="confAdobeCreditPriceCny">Adobe 单积分价格（元/积分）</label>
+              <input type="number" id="confAdobeCreditPriceCny" class="input-text" min="0" step="0.000001" placeholder="未配置" />
+              <p class="help">留空表示成本未知。预估积分的成本会在日志中显示 `~`。</p>
             </div>
           </section>
 
@@ -389,13 +404,14 @@
                 <th>账号</th>
                 <th>模型</th>
                 <th>积分</th>
+                <th>成本</th>
                 <th>提示词摘要</th>
                 <th>预览</th>
               </tr>
             </thead>
             <tbody>
               <tr>
-                <td colspan="9" class="empty-state">暂无日志</td>
+                <td colspan="10" class="empty-state">暂无日志</td>
               </tr>
             </tbody>
           </table>
@@ -530,7 +546,7 @@
   <script src="/static/admin_token_filters.js?v=20260717-1"></script>
   <script src="/static/admin_ui_state.js?v=20260717-2"></script>
   <script src="/static/admin_cookie_import.js?v=20260721-2"></script>
-  <script src="/static/admin_log_credits.js?v=20260717-1"></script>
-  <script src="/static/admin.js?v=20260806-1"></script>
+  <script src="/static/admin_log_credits.js?v=20260807-1"></script>
+  <script src="/static/admin.js?v=20260807-1"></script>
 </body>
 </html>

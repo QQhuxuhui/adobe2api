@@ -45,7 +45,24 @@ test("upstream-reported credits render as exact values", () => {
   assert.equal(formatLogCredits(null, "upstream").text, "-");
 });
 
-test("logs table declares the credit column and nine-column empty states", () => {
+test("cost formatter renders unit price, exact cost, and estimated marker", () => {
+  const { formatLogCost } = require("../static/admin_log_credits.js");
+
+  assert.deepEqual(formatLogCost(0.146, "leonardo", 0.001, "measured"), {
+    text: "¥0.1460",
+    title: "Leonardo 单价 ¥0.0010/积分",
+    estimated: false,
+  });
+  assert.deepEqual(formatLogCost(0.02, "adobe", 0.002, "estimated"), {
+    text: "~¥0.0200",
+    title: "Adobe 单价 ¥0.0020/积分",
+    estimated: true,
+  });
+  assert.equal(formatLogCost(null, "adobe", 0.002, "measured").text, "-");
+  assert.equal(formatLogCost(0.02, "adobe", null, "measured").text, "-");
+});
+
+test("logs table declares the credit and cost columns with ten-column empty states", () => {
   const html = fs.readFileSync(path.join(repoRoot, "static", "admin.html"), "utf8");
   const source = fs.readFileSync(path.join(repoRoot, "static", "admin.js"), "utf8");
   const table = html.match(/<table id="logsTable">[\s\S]*?<\/table>/)?.[0] || "";
@@ -59,12 +76,13 @@ test("logs table declares the credit column and nine-column empty states", () =>
     "账号",
     "模型",
     "积分",
+    "成本",
     "提示词摘要",
     "预览",
   ]);
-  assert.match(table, /colspan="9"/);
+  assert.match(table, /colspan="10"/);
   assert.doesNotMatch(table, /colspan="8"/);
-  assert.match(source, /colspan="9"/);
+  assert.match(source, /colspan="10"/);
   assert.doesNotMatch(source, /colspan="8"/);
 });
 
@@ -76,10 +94,26 @@ test("admin controller loads and uses the credit formatter", () => {
   assert.ok(
     html.indexOf("/static/admin_log_credits.js") < html.indexOf("/static/admin.js"),
   );
-  assert.match(source, /const \{ formatLogCredits \} = window\.AdminLogCredits;/);
+  assert.match(source, /const \{ formatLogCredits, formatLogCost \} = window\.AdminLogCredits;/);
   assert.match(source, /formatLogCredits\(item\.credits_used, item\.credits_source\)/);
+  assert.match(source, /formatLogCost\(item\.cost_cny, item\.credit_type, item\.credit_unit_price_cny, item\.credits_source\)/);
   assert.match(source, /class="log-credits-cell/);
+  assert.match(source, /class="log-cost-cell/);
   assert.match(css, /#logsTable th:nth-child\(7\)/);
+  assert.match(css, /#logsTable th:nth-child\(8\)/);
   assert.match(css, /\.log-prompt-cell[\s\S]*text-overflow:\s*ellipsis/);
   assert.match(css, /\.log-credits-cell\.estimated/);
+});
+
+test("billing config exposes and persists separate provider prices", () => {
+  const html = fs.readFileSync(path.join(repoRoot, "static", "admin.html"), "utf8");
+  const source = fs.readFileSync(path.join(repoRoot, "static", "admin.js"), "utf8");
+
+  assert.match(html, /data-target="cfg-billing"/);
+  assert.match(html, /id="confLeonardoCreditPriceCny"[^>]*step="0\.000001"/);
+  assert.match(html, /id="confAdobeCreditPriceCny"[^>]*step="0\.000001"/);
+  assert.match(source, /data\.leonardo_credit_price_cny == null/);
+  assert.match(source, /data\.adobe_credit_price_cny == null/);
+  assert.match(source, /leonardo_credit_price_cny: parseCreditPrice\(/);
+  assert.match(source, /adobe_credit_price_cny: parseCreditPrice\(/);
 });

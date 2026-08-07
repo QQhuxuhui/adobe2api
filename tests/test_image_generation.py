@@ -26,6 +26,7 @@ def _model_config():
     return {
         "upstream_model_id": "gpt-image",
         "upstream_model_version": "2",
+        "dynamic": True,
         "detail_level": "high",
     }
 
@@ -53,6 +54,49 @@ def test_executor_writes_returned_bytes_and_passes_adobe_options(tmp_path: Path)
     assert client.kwargs["source_image_ids"] == ["source-1"]
     assert client.kwargs["fallback_aspect_ratio"] == "3:4"
     assert writes == [(tmp_path / "fixed.png", 0, len(b"returned-image"))]
+
+
+def test_executor_uses_request_quality_over_server_default(tmp_path: Path):
+    client = ReturningClient()
+
+    generate_image_artifact(
+        client=client,
+        token="token",
+        prompt="draw",
+        aspect_ratio="1:1",
+        output_resolution="2K",
+        model_config=_model_config(),
+        generated_dir=tmp_path,
+        source_image_ids=[],
+        quality_level="medium",
+        progress_cb=None,
+        on_generated_file_written=lambda path, old, new: None,
+        job_id="quality",
+    )
+
+    assert client.kwargs["quality_level"] == "medium"
+
+
+def test_executor_keeps_fixed_model_on_server_default_quality(tmp_path: Path):
+    client = ReturningClient()
+    fixed_config = dict(_model_config(), dynamic=False)
+
+    generate_image_artifact(
+        client=client,
+        token="token",
+        prompt="draw",
+        aspect_ratio="1:1",
+        output_resolution="2K",
+        model_config=fixed_config,
+        generated_dir=tmp_path,
+        source_image_ids=[],
+        quality_level="high",
+        progress_cb=None,
+        on_generated_file_written=lambda path, old, new: None,
+        job_id="fixed-quality",
+    )
+
+    assert client.kwargs["quality_level"] == "low"
 
 
 def test_executor_reads_file_when_client_streams_to_out_path(tmp_path: Path):

@@ -58,6 +58,8 @@ class VideoTaskSpec:
     log_id: str
     # 图生视频：(bytes, mime_type) 元组列表，worker 提交前先上传 Adobe 换取 blob id
     source_images: tuple = ()
+    credit_type: str | None = None
+    credit_unit_price_cny: float | None = None
 
 
 @dataclass
@@ -82,6 +84,8 @@ class VideoTaskRecord:
     created_at: float = 0.0
     started_at: float | None = None
     completed_at: float | None = None
+    credit_type: str | None = None
+    credit_unit_price_cny: float | None = None
 
 
 @dataclass(frozen=True)
@@ -318,6 +322,8 @@ class VideoTaskManager:
             requested_size=spec.requested_size,
             log_id=spec.log_id,
             created_at=time.time(),
+            credit_type=spec.credit_type,
+            credit_unit_price_cny=spec.credit_unit_price_cny,
         )
 
     def submit(self, spec: VideoTaskSpec) -> VideoTaskRecord:
@@ -556,6 +562,9 @@ def build_video_task_runner(
             "token_attempt": token_attempt,
             "credits_used": None,
             "credits_source": None,
+            "credit_type": spec.credit_type,
+            "credit_unit_price_cny": spec.credit_unit_price_cny,
+            "cost_cny": None,
         }
 
     def runner(

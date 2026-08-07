@@ -307,6 +307,10 @@ def build_openai_videos_router(
                 credit_model_id=resolved.credit_model_id,
                 result_url_prefix=url_prefix,
                 log_id=log_id,
+                credit_type="adobe",
+                credit_unit_price_cny=(
+                    getattr(request.state, "log_credit_prices_cny", {}) or {}
+                ).get("adobe"),
             )
             request.state.log_model = model
             request.state.log_prompt_preview = spec.prompt_preview

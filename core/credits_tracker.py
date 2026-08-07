@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from core.credit_costs import calculate_credit_cost
+
 
 logger = logging.getLogger("adobe2api.credits")
 
@@ -332,14 +334,21 @@ class CreditsTracker:
     ) -> dict:
         """写入本次测得的积分消耗；但**不覆盖**请求内已确定的精确值。"""
         merged = dict(payload)
-        if (
+        authoritative = (
             str(merged.get("credits_source") or "")
             in CreditsTracker.AUTHORITATIVE_CREDIT_SOURCES
             and merged.get("credits_used") is not None
-        ):
-            return merged
-        merged["credits_used"] = credits_used
-        merged["credits_source"] = credits_source if credits_used is not None else None
+        )
+        if not authoritative:
+            merged["credits_used"] = credits_used
+            merged["credits_source"] = (
+                credits_source if credits_used is not None else None
+            )
+        cost = calculate_credit_cost(
+            merged.get("credits_used"), merged.get("credit_unit_price_cny")
+        )
+        if cost is not None:
+            merged["cost_cny"] = cost
         return merged
 
     def _backfill(

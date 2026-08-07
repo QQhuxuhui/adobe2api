@@ -37,6 +37,9 @@ class ConfigManager:
             # 推完 token 就走，不像 Adobe 那样顺带查余额；而配额出池的账号没有请求
             # 去顺带刷它，余额刷新就是它唯一的复活触发器。
             "leonardo_credits_refresh_minutes": 10,
+            # 每个积分系统独立配置单价（人民币/积分）；None 表示成本未知。
+            "leonardo_credit_price_cny": None,
+            "adobe_credit_price_cny": None,
             "refresh_interval_hours": 15,
             "retry_enabled": True,
             "retry_max_attempts": 3,

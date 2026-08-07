@@ -496,8 +496,13 @@ def make_worker_runner(
 def test_worker_writes_completed_log_and_submits_credit_measurement(tmp_path: Path):
     runner, token_manager, credits, logs = make_worker_runner(tmp_path)
     progress_values: list[float] = []
+    spec = dataclasses.replace(
+        make_spec("video-ok"),
+        credit_type="adobe",
+        credit_unit_price_cny=0.002,
+    )
 
-    outcome = runner(make_spec("video-ok"), progress_values.append)
+    outcome = runner(spec, progress_values.append)
 
     payload = logs.payloads["log-video-ok"]
     assert outcome.result_path == tmp_path / "video-ok.mp4"
@@ -506,6 +511,8 @@ def test_worker_writes_completed_log_and_submits_credit_measurement(tmp_path: Pa
     assert payload["preview_kind"] == "video"
     assert payload["model"] == "sora-2"
     assert payload["token_id"] == "token-id"
+    assert payload["credit_type"] == "adobe"
+    assert payload["credit_unit_price_cny"] == 0.002
     assert token_manager.reported_success == ["token-value"]
     assert credits.begin_calls == [("token-id", "video-ok", "account-id")]
     assert credits.finish_calls == []

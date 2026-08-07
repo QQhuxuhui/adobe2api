@@ -46,6 +46,11 @@ from core.token_mgr import (
     LEASE_TIMEOUT,
 )
 from core.config_mgr import config_manager
+from core.credit_costs import (
+    calculate_credit_cost,
+    select_credit_price,
+    snapshot_credit_prices,
+)
 from core.credits_tracker import CreditsTracker
 from core.refresh_mgr import refresh_manager
 from core.stores import (
@@ -506,7 +511,21 @@ def _set_request_token_context(request: Request, token: str, attempt: int) -> di
     #   2) 两边积分不是同一种币值，Adobe 的估算表套到 Leonardo 上会写出错的数字。
     #      而且 Leonardo 余额只给剩余、used 恒为 0，Adobe 那套 delta 差分对它恒等于 0，
     #      必然落到估算回填，把请求里测好的值覆盖掉——这正是「使用记录没有积分数据」的根因。
-    is_leonardo = str(meta.get("token_type") or "").strip().lower() == "leonardo"
+    credit_type = str(meta.get("token_type") or "").strip().lower()
+    if credit_type not in {"leonardo", "adobe"}:
+        credit_type = None
+    request.state.log_credit_type = credit_type
+    prices = getattr(request.state, "log_credit_prices_cny", None)
+    if not isinstance(prices, dict):
+        try:
+            prices = snapshot_credit_prices(config_manager.get)
+        except Exception:
+            prices = {}
+        request.state.log_credit_prices_cny = prices
+    request.state.log_credit_unit_price_cny = select_credit_price(
+        prices, credit_type
+    ) if credit_type else None
+    is_leonardo = credit_type == "leonardo"
     try:
         token_id = str(meta.get("token_id") or "").strip()
         account_id = str(meta.get("token_account_id") or "").strip()
@@ -559,6 +578,16 @@ def _set_request_token_context(request: Request, token: str, attempt: int) -> di
     except Exception:
         pass
     return meta
+
+
+def _request_credit_log_fields(request: Request) -> dict:
+    credits_used = getattr(request.state, "log_credits_used", None)
+    unit_price = getattr(request.state, "log_credit_unit_price_cny", None)
+    return {
+        "credit_type": getattr(request.state, "log_credit_type", None),
+        "credit_unit_price_cny": unit_price,
+        "cost_cny": calculate_credit_cost(credits_used, unit_price),
+    }
 
 
 def _finalize_request_credits(
@@ -686,6 +715,7 @@ def _append_attempt_log(
                     if getattr(request.state, "log_credits_used", None) is not None
                     else None
                 ),
+                **_request_credit_log_fields(request),
             )
         )
         records = getattr(request.state, "log_attempt_records", None)
@@ -701,6 +731,10 @@ def _append_attempt_log(
 @app.middleware("http")
 async def request_logger(request: Request, call_next):
     started = time.time()
+    try:
+        request.state.log_credit_prices_cny = snapshot_credit_prices(config_manager.get)
+    except Exception:
+        request.state.log_credit_prices_cny = {}
     method = request.method.upper()
     path = request.url.path
     preview_url = None
@@ -897,6 +931,7 @@ async def request_logger(request: Request, call_next):
                                 is not None
                                 else None
                             ),
+                            **_request_credit_log_fields(request),
                         )
                     ),
                 )
@@ -1774,6 +1809,8 @@ def _write_submitted_video_log(spec, record) -> None:
             prompt_preview=spec.prompt_preview,
             task_status="QUEUED",
             task_progress=0.0,
+            credit_type=record.credit_type,
+            credit_unit_price_cny=record.credit_unit_price_cny,
         )
     )
     log_store.upsert(spec.log_id, payload)
@@ -1817,6 +1854,8 @@ def _write_terminal_video_log(record) -> None:
                     error_code=record.error_code,
                     task_status="FAILED",
                     task_progress=float(record.progress or 0),
+                    credit_type=record.credit_type,
+                    credit_unit_price_cny=record.credit_unit_price_cny,
                 )
             ),
         )

@@ -930,11 +930,18 @@ td input[type="checkbox"] {
 
 #logsTable th:nth-child(8),
 #logsTable td:nth-child(8) {
-  width: 220px;
+  width: 88px;
+  text-align: right;
+  white-space: nowrap;
 }
 
 #logsTable th:nth-child(9),
 #logsTable td:nth-child(9) {
+  width: 220px;
+}
+
+#logsTable th:nth-child(10),
+#logsTable td:nth-child(10) {
   width: 64px;
   white-space: nowrap;
 }
@@ -983,7 +990,18 @@ td input[type="checkbox"] {
   font-variant-numeric: tabular-nums;
 }
 
+.log-cost-cell {
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
 .log-credits-cell.estimated {
+  color: var(--muted);
+}
+
+.log-cost-cell.estimated {
   color: var(--muted);
 }
 

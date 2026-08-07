@@ -197,7 +197,7 @@ def ratio_from_size(size: str) -> str:
 
 
 def resolution_from_size(size: str) -> Optional[str]:
-    """从 size 的最大边推分辨率档(仅当未显式传 quality 时用)。"""
+    """从显式 size 的最大边推 Adobe 兼容分辨率档。"""
     s = str(size or "").strip().lower()
     if "x" not in s:
         return None
@@ -235,13 +235,7 @@ def _parse_size_dimensions(size: object) -> Optional[tuple[int, int]]:
 def prevent_gpt_image_downscale(
     size: object, ratio: str, output_resolution: str
 ) -> str:
-    """显式 size 是交付下界：若当前档位出的图比请求的还小，逐级抬档。
-
-    背景：quality 直接决定档位(low→1K)，而 size 只用来定比例。于是
-    `2048x2048 + quality=low` 会交付 1024x1024 —— 客户明确要 2K 却拿到 1K。
-    官方语义里 size 与 quality 正交(实测 2048x2048+low 返回 2048x2048)，
-    这里至少保证不缩水；反向的超额交付(1024x1024+high 给 4K)保持不变。
-    """
+    """保留固定 GPT Image 模型的历史行为，避免输出低于显式 size。"""
     requested = _parse_size_dimensions(size)
     if requested is None:
         return output_resolution
@@ -404,15 +398,24 @@ def resolve_requested_aspect_ratio(
 def _output_resolution(data: dict, model_id: Optional[str], model_conf: dict) -> str:
     output_resolution = str(model_conf["output_resolution"])
     if not model_id or model_conf.get("dynamic"):
-        quality = str(data.get("quality") or "").lower().strip()
-        if quality in ("4k", "ultra", "high"):
-            output_resolution = "4K"
-        elif quality in ("2k", "hd", "medium"):
-            output_resolution = "2K"
-        elif quality in ("1k", "low", "standard"):
-            output_resolution = "1K"
-        else:
-            output_resolution = resolution_from_size(data.get("size")) or "2K"
+        is_gpt_image = (
+            str(model_conf.get("upstream_model_id") or "").strip().lower()
+            == "gpt-image"
+        )
+        if is_gpt_image:
+            # GPT Image's size is the physical output; quality is an independent
+            # rendering setting passed separately as detailLevel.
+            output_resolution = resolution_from_size(data.get("size")) or ""
+        if not output_resolution or not is_gpt_image:
+            quality = str(data.get("quality") or "").lower().strip()
+            if quality in ("4k", "ultra", "high"):
+                output_resolution = "4K"
+            elif quality in ("2k", "hd", "medium"):
+                output_resolution = "2K"
+            elif quality in ("1k", "low", "standard"):
+                output_resolution = "1K"
+            else:
+                output_resolution = "2K"
     return output_resolution
 
 
@@ -475,7 +478,19 @@ def resolve_image_geometry(
     else:
         resolved_ratio = ResolvedAspectRatio("1:1", "1:1", None)
 
-    if is_gpt_image:
+    if is_gpt_image and model_conf.get("dynamic"):
+        explicit_dimensions = _dimensions_from_size(requested_size)
+        if explicit_dimensions is not None:
+            resolved_ratio = ResolvedAspectRatio(
+                aspect_ratio=resolved_ratio.aspect_ratio,
+                usage_ratio=resolved_ratio.usage_ratio,
+                output_size={
+                    "width": explicit_dimensions[0],
+                    "height": explicit_dimensions[1],
+                },
+                fallback_aspect_ratio=resolved_ratio.fallback_aspect_ratio,
+            )
+    elif is_gpt_image:
         output_resolution = prevent_gpt_image_downscale(
             requested_size, resolved_ratio.aspect_ratio, output_resolution
         )

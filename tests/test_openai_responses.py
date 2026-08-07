@@ -136,6 +136,12 @@ def test_non_streaming_response_returns_image_generation_call(tmp_path: Path):
     assert base64.b64decode(payload["output"][0]["result"]) == png_bytes()
     assert "images.test" not in payload["output"][0]["result"]
     assert harness.credit_contexts == [("gpt-image-2", "1K")]
+    assert harness.adobe.generate_kwargs["quality_level"] == "low"
+    assert harness.adobe.generate_kwargs["output_resolution"] == "1K"
+    assert harness.adobe.generate_kwargs["output_size"] == {
+        "width": 1024,
+        "height": 1024,
+    }
     assert harness.retry_calls == ["responses.create"]
     assert harness.previews[0][1] == "image"
 

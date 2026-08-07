@@ -40,5 +40,41 @@
     return { text: numberText, title: "", estimated: false };
   }
 
-  return { formatLogCredits };
+  function formatCny(value) {
+    if (value === null || value === undefined || value === "") return "";
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < 0) return "";
+    const rounded = Math.round(number * 1000000) / 1000000;
+    let text = rounded.toFixed(6);
+    text = text.replace(/0+$/, "");
+    if (!text.includes(".")) text += ".0000";
+    else {
+      const digits = text.length - text.indexOf(".") - 1;
+      if (digits < 4) text += "0".repeat(4 - digits);
+    }
+    return `¥${text}`;
+  }
+
+  function formatLogCost(costCny, creditType, unitPriceCny, creditsSource) {
+    const source = String(creditsSource || "").trim().toLowerCase();
+    const provider = String(creditType || "").trim().toLowerCase();
+    const costText = formatCny(costCny);
+    const priceText = formatCny(unitPriceCny);
+    if (
+      !costText
+      || !priceText
+      || !["leonardo", "adobe"].includes(provider)
+      || !["measured", "estimated", "upstream"].includes(source)
+    ) {
+      return unknownCredits();
+    }
+    const label = provider === "adobe" ? "Adobe" : "Leonardo";
+    return {
+      text: source === "estimated" ? `~${costText}` : costText,
+      title: `${label} 单价 ${priceText}/积分`,
+      estimated: source === "estimated",
+    };
+  }
+
+  return { formatLogCredits, formatLogCost };
 });

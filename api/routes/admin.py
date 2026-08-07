@@ -547,6 +547,9 @@ def build_admin_router(
             return config_manager.get_all()
 
         update_data = {}
+        for key in ("leonardo_credit_price_cny", "adobe_credit_price_cny"):
+            if key in incoming:
+                update_data[key] = incoming[key]
         if "api_key" in incoming:
             update_data["api_key"] = str(incoming["api_key"] or "").strip()
         if "admin_username" in incoming:

@@ -170,9 +170,20 @@ def build_image_payload_candidates(
         effective_detail_level = detail_level
         if effective_detail_level is None:
             effective_detail_level = gpt_image_detail_level_from_quality(quality_level)
-        pixel_size = gpt_image_pixels_from_ratio(effective_ratio, output_resolution)
-        if pixel_size is None:
-            raise ValueError(f"unsupported gpt-image ratio: {effective_ratio}")
+        if output_size is not None:
+            try:
+                pixel_size = {
+                    "width": int(output_size["width"]),
+                    "height": int(output_size["height"]),
+                }
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("gpt-image output size is invalid") from exc
+            if pixel_size["width"] <= 0 or pixel_size["height"] <= 0:
+                raise ValueError("gpt-image output size must be positive")
+        else:
+            pixel_size = gpt_image_pixels_from_ratio(effective_ratio, output_resolution)
+            if pixel_size is None:
+                raise ValueError(f"unsupported gpt-image ratio: {effective_ratio}")
         base_payload = {
             "modelId": upstream_model_id,
             "modelVersion": upstream_model_version,

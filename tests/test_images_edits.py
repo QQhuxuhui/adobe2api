@@ -182,6 +182,30 @@ def test_edits_happy_path_defaults_to_b64_json(tmp_path: Path):
     assert adobe.generate_kwargs["quality_level"] == "standard"
 
 
+def test_edits_request_quality_overrides_server_default(tmp_path: Path):
+    adobe = FakeAdobeClient()
+    client, _, _ = make_client(tmp_path, adobe)
+
+    response = client.post(
+        "/v1/images/edits",
+        data={
+            "prompt": "make it night",
+            "model": "gpt-image-2",
+            "quality": "medium",
+            "size": "1024x1024",
+        },
+        files={"image": ("a.png", png_bytes(1024, 1024), "image/png")},
+    )
+
+    assert response.status_code == 200, response.text
+    assert adobe.generate_kwargs["quality_level"] == "medium"
+    assert adobe.generate_kwargs["output_resolution"] == "1K"
+    assert adobe.generate_kwargs["output_size"] == {
+        "width": 1024,
+        "height": 1024,
+    }
+
+
 def test_edits_accepts_bracket_field_name_and_multiple_images(tmp_path: Path):
     adobe = FakeAdobeClient()
     client, _, _ = make_client(tmp_path, adobe)

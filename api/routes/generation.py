@@ -24,6 +24,7 @@ from core.adobe_client import (
     UpstreamTemporaryError,
 )
 from core.config_mgr import config_manager
+from core.credit_costs import select_credit_price
 from core.leonardo_client import LeonardoClient
 from core.token_mgr import retire_account_for_quota
 from core.leonardo_generation import (
@@ -843,6 +844,7 @@ def build_generation_router(
                         model_config=model_conf,
                         generated_dir=generated_dir,
                         source_image_ids=[],
+                        quality_level=data.get("quality"),
                         output_size=geometry.output_size,
                         fallback_aspect_ratio=geometry.fallback_aspect_ratio,
                         progress_cb=_image_progress_cb,
@@ -1141,6 +1143,7 @@ def build_generation_router(
                     model_config=model_conf,
                     generated_dir=generated_dir,
                     source_image_ids=ids,
+                    quality_level=parsed.quality,
                     output_size=geometry.output_size,
                     fallback_aspect_ratio=geometry.fallback_aspect_ratio,
                     progress_cb=_image_progress_cb,
@@ -1542,6 +1545,7 @@ def build_generation_router(
                         model_config=model_conf,
                         generated_dir=generated_dir,
                         source_image_ids=ids,
+                        quality_level=_field("quality"),
                         output_size=geometry.output_size,
                         fallback_aspect_ratio=geometry.fallback_aspect_ratio,
                         progress_cb=_image_progress_cb,
@@ -1660,6 +1664,10 @@ def build_generation_router(
             error: str | None = None,
         ) -> dict:
             meta = token_meta if isinstance(token_meta, dict) else {}
+            credit_type = str(meta.get("token_type") or "").strip().lower()
+            if credit_type not in {"leonardo", "adobe"}:
+                credit_type = None
+            prices = getattr(request.state, "log_credit_prices_cny", {}) or {}
             return asdict(
                 RequestLogRecord(
                     id=request_log_id,
@@ -1685,6 +1693,12 @@ def build_generation_router(
                     ),
                     token_source=str(meta.get("token_source") or "") or None,
                     token_attempt=token_attempt,
+                    credit_type=credit_type,
+                    credit_unit_price_cny=(
+                        select_credit_price(prices, credit_type)
+                        if credit_type
+                        else None
+                    ),
                 )
             )
 
@@ -2120,6 +2134,7 @@ def build_generation_router(
                         model_config=image_model_conf,
                         generated_dir=generated_dir,
                         source_image_ids=source_image_ids,
+                        quality_level=data.get("quality"),
                         output_size=image_geometry.output_size,
                         fallback_aspect_ratio=(
                             image_geometry.fallback_aspect_ratio

@@ -179,7 +179,36 @@ def test_openai_image_route_captures_resolved_model_and_resolution(tmp_path: Pat
     )
 
     assert response.status_code == 200
-    assert credit_contexts == [("firefly-gpt-image", "4K")]
+    assert credit_contexts == [("firefly-gpt-image", "1K")]
+
+
+def test_openai_image_route_keeps_size_and_request_quality_independent(tmp_path: Path):
+    adobe = JobAdobeClient()
+    client, credit_contexts = make_client(
+        tmp_path,
+        adobe_client=adobe,
+        token_manager=JobTokenManager(),
+        execute_retries=True,
+    )
+
+    response = client.post(
+        "/v1/images/generations",
+        json={
+            "model": "gpt-image-2",
+            "prompt": "draw this",
+            "quality": "medium",
+            "size": "1024x1024",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert credit_contexts == [("gpt-image-2", "1K")]
+    assert adobe.generate_kwargs["quality_level"] == "medium"
+    assert adobe.generate_kwargs["output_resolution"] == "1K"
+    assert adobe.generate_kwargs["output_size"] == {
+        "width": 1024,
+        "height": 1024,
+    }
 
 
 def test_chat_free_resolves_after_loading_primary_image(tmp_path: Path):

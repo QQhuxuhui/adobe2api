@@ -108,7 +108,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     parseCookieFilesToItems,
     toCookieBatchItems,
   } = window.AdminCookieImport;
-  const { formatLogCredits } = window.AdminLogCredits;
+  const { formatLogCredits, formatLogCost } = window.AdminLogCredits;
   const tokenSelectedIds = new Set();
   let logsAutoTimer = null;
   let latestTokens = [];
@@ -131,11 +131,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       tokenLoadGate,
       () => fetchTokenList(fetch),
       {
-        onSuccess: ({ tokens, summary }) => {
-          renderTable(tokens, summary);
-          // Token 列表刷新时一并同步 Leonardo 登录账号状态/余额告警。
-          if (typeof refreshLeoLoginStatus === "function") refreshLeoLoginStatus();
-        },
+        onSuccess: ({ tokens, summary }) => renderTable(tokens, summary),
         onFailure: (err) => {
           console.error(err);
           latestTokens = [];
@@ -147,7 +143,13 @@ document.addEventListener("DOMContentLoaded", async () => {
           syncTokenSelectAllState();
         },
       },
-    );
+    ).then((result) => {
+      // Token 列表刷新时一并同步 Leonardo 登录账号状态/余额告警。
+      if (result.status === "success" && typeof refreshLeoLoginStatus === "function") {
+        refreshLeoLoginStatus();
+      }
+      return result;
+    });
   }
 
   function getCurrentPageTokens(tokens = getFilteredTokens(latestTokens, tokenFilter)) {
@@ -1164,6 +1166,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   const proxyTestResult = document.getElementById("proxyTestResult");
   const confGenerateTimeout = document.getElementById("confGenerateTimeout");
   const confGptImageQuality = document.getElementById("confGptImageQuality");
+  const confLeonardoCreditPriceCny = document.getElementById("confLeonardoCreditPriceCny");
+  const confAdobeCreditPriceCny = document.getElementById("confAdobeCreditPriceCny");
   const confRetryEnabled = document.getElementById("confRetryEnabled");
   const confRetryMaxAttempts = document.getElementById("confRetryMaxAttempts");
   const confRetryBackoffSeconds = document.getElementById("confRetryBackoffSeconds");
@@ -1330,6 +1334,12 @@ document.addEventListener("DOMContentLoaded", async () => {
         updateInputValue(confProxy, data.proxy || "", invalidateProxyTestResult);
         confGenerateTimeout.value = Number(data.generate_timeout || 300);
         confGptImageQuality.value = String(data.gpt_image_quality || "low");
+        confLeonardoCreditPriceCny.value = data.leonardo_credit_price_cny == null
+          ? ""
+          : String(data.leonardo_credit_price_cny);
+        confAdobeCreditPriceCny.value = data.adobe_credit_price_cny == null
+          ? ""
+          : String(data.adobe_credit_price_cny);
         confRetryEnabled.checked = Boolean(data.retry_enabled ?? true);
         confRetryMaxAttempts.value = Number(data.retry_max_attempts || 3);
         confRetryBackoffSeconds.value = Number(data.retry_backoff_seconds ?? 1.0);
@@ -1361,6 +1371,22 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   }
 
+  function parseCreditPrice(input, label) {
+    const raw = String(input?.value || "").trim();
+    if (!raw) return null;
+    const value = Number(raw);
+    const scaled = value * 1000000;
+    if (
+      !Number.isFinite(value)
+      || value < 0
+      || !Number.isFinite(scaled)
+      || Math.abs(scaled - Math.round(scaled)) > 1e-9
+    ) {
+      throw new Error(`${label}必须是非负且最多 6 位小数的数字`);
+    }
+    return value;
+  }
+
   saveConfigBtn.addEventListener("click", async () => {
     saveConfigBtn.disabled = true;
     try {
@@ -1378,6 +1404,8 @@ document.addEventListener("DOMContentLoaded", async () => {
         proxy: confProxy.value.trim(),
         generate_timeout: Math.max(1, Number(confGenerateTimeout.value || 300)),
         gpt_image_quality: String(confGptImageQuality.value || "low").trim().toLowerCase() || "low",
+        leonardo_credit_price_cny: parseCreditPrice(confLeonardoCreditPriceCny, "Leonardo 单积分价格"),
+        adobe_credit_price_cny: parseCreditPrice(confAdobeCreditPriceCny, "Adobe 单积分价格"),
         retry_enabled: confRetryEnabled.checked,
         retry_max_attempts: Math.max(1, Math.min(10, Number(confRetryMaxAttempts.value || 3))),
         retry_backoff_seconds: Math.max(0, Math.min(30, Number(confRetryBackoffSeconds.value || 1))),
@@ -1845,7 +1873,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         renderLogStats(null);
       }
     } catch (err) {
-      logsTbody.innerHTML = `<tr><td colspan="9" class="empty-state" style="color: var(--critical);">${err.message || "日志加载失败"}</td></tr>`;
+      logsTbody.innerHTML = `<tr><td colspan="10" class="empty-state" style="color: var(--critical);">${err.message || "日志加载失败"}</td></tr>`;
       logsRunningTotal = 0;
       logsTotalPages = Math.max(1, logsCurrentPage || 1);
       renderLogsPagination();
@@ -2012,8 +2040,12 @@ document.addEventListener("DOMContentLoaded", async () => {
     const modelText = String(item.model || "-");
     const promptText = String(item.prompt_preview || "-");
     const credits = formatLogCredits(item.credits_used, item.credits_source);
+    const cost = formatLogCost(item.cost_cny, item.credit_type, item.credit_unit_price_cny, item.credits_source);
     const creditsTitle = credits.title
       ? ` title="${escapeHtml(credits.title)}"`
+      : "";
+    const costTitle = cost.title
+      ? ` title="${escapeHtml(cost.title)}"`
       : "";
     const tokenCell = `<div class="log-account-cell">${accountParts.join("<br>")}</div>`;
     const previewCell = previewUrl
@@ -2027,6 +2059,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       <td title="${tokenTitle}">${tokenCell}</td>
       <td class="log-model-cell" title="${escapeHtml(modelText)}">${escapeHtml(modelText)}</td>
       <td class="log-credits-cell${credits.estimated ? " estimated" : ""}"${creditsTitle}>${escapeHtml(credits.text)}</td>
+      <td class="log-cost-cell${cost.estimated ? " estimated" : ""}"${costTitle}>${escapeHtml(cost.text)}</td>
       <td class="log-prompt-cell" title="${escapeHtml(promptText)}">${escapeHtml(promptText)}</td>
       <td>${previewCell}</td>
     `;
@@ -2050,7 +2083,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       const emptyText = logsModelFilter
         ? `暂无模型 ${escapeHtml(logsModelFilter)} 的请求日志`
         : "暂无请求日志";
-      logsTbody.innerHTML = `<tr><td colspan="9" class="empty-state">${emptyText}</td></tr>`;
+      logsTbody.innerHTML = `<tr><td colspan="10" class="empty-state">${emptyText}</td></tr>`;
       return;
     }
 

@@ -124,8 +124,10 @@ GPT Image models (experimental):
 - Pattern: `firefly-gpt-image-{resolution}-{ratio}`
 - Resolution: `1k` / `2k` / `4k`
 - Ratio suffix: `1x1` / `5x4` / `9x16` / `21x9` / `16x9` / `4x3` / `3x2` / `4x5` / `3x4` / `2x3`
-- The implementation sends both `outputResolution` and the mapped pixel `size`
-- GPT Image quality is controlled by system config `gpt_image_quality`: `low` / `medium` / `high`, default `low`
+- Dynamic GPT Image aliases (`gpt-image-2` / `firefly-gpt-image`) preserve requested `size`; fixed-resolution IDs keep their legacy tier behavior
+- For dynamic aliases, `quality` and `size` are independent, so `1024x1024` is not silently changed to `2048x2048`
+- `quality` (`low` / `medium` / `high`) is passed to GPT Image rendering `detailLevel`; when omitted, the system `gpt_image_quality` setting is used (default `low`)
+- The upstream payload still carries `outputResolution` for Adobe compatibility, but it does not override an explicit `size`
 - Examples:
   - `firefly-gpt-image-2k-16x9`
   - `firefly-gpt-image-4k-1x1`

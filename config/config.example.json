@@ -11,6 +11,8 @@
   "rotation_max_accounts_default": 0,
   "rotation_max_accounts_images_edits": 5,
   "leonardo_credits_refresh_minutes": 10,
+  "leonardo_credit_price_cny": null,
+  "adobe_credit_price_cny": null,
   "refresh_interval_hours": 15,
   "retry_enabled": true,
   "retry_max_attempts": 3,

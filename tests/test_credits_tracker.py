@@ -474,3 +474,56 @@ def test_request_log_record_exposes_credit_backfill_fields():
 
     assert record.credits_used == 12
     assert record.credits_source == "measured"
+
+
+def test_request_log_record_preserves_credit_price_and_cost_snapshot():
+    record = RequestLogRecord(
+        id="log-1",
+        ts=1,
+        method="POST",
+        path="/v1/images/generations",
+        status_code=200,
+        duration_sec=1,
+        operation="images.generations",
+        credits_used=146,
+        credits_source="measured",
+        credit_type="leonardo",
+        credit_unit_price_cny=0.001,
+        cost_cny=0.146,
+    )
+
+    assert record.credit_type == "leonardo"
+    assert record.credit_unit_price_cny == 0.001
+    assert record.cost_cny == 0.146
+
+
+def test_merge_credits_calculates_cost_from_request_snapshot():
+    payload = {
+        "credits_used": None,
+        "credits_source": None,
+        "credit_type": "adobe",
+        "credit_unit_price_cny": 0.002,
+        "cost_cny": None,
+    }
+
+    merged = CreditsTracker._merge_credits(payload, 10, "estimated")
+
+    assert merged["credits_used"] == 10
+    assert merged["credits_source"] == "estimated"
+    assert merged["cost_cny"] == 0.02
+
+
+def test_merge_credits_recomputes_cost_for_authoritative_credits_only():
+    payload = {
+        "credits_used": 250,
+        "credits_source": "upstream",
+        "credit_type": "leonardo",
+        "credit_unit_price_cny": 0.001,
+        "cost_cny": None,
+    }
+
+    merged = CreditsTracker._merge_credits(payload, 999, "estimated")
+
+    assert merged["credits_used"] == 250
+    assert merged["credits_source"] == "upstream"
+    assert merged["cost_cny"] == 0.25

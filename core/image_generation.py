@@ -26,6 +26,7 @@ def generate_image_artifact(
     model_config: Mapping[str, Any],
     generated_dir: Path,
     source_image_ids: Sequence[str],
+    quality_level: str | None = None,
     output_size: Mapping[str, int] | None = None,
     fallback_aspect_ratio: str | None = None,
     progress_cb: Callable[[dict], None] | None,
@@ -40,22 +41,28 @@ def generate_image_artifact(
     except OSError:
         old_size = 0
 
+    upstream_model_id = str(model_config.get("upstream_model_id") or "")
+    is_gpt_image = upstream_model_id == "gpt-image"
+    is_dynamic_gpt_image = is_gpt_image and bool(model_config.get("dynamic"))
+    effective_quality = None
+    if is_gpt_image:
+        if is_dynamic_gpt_image and quality_level:
+            effective_quality = quality_level
+        else:
+            effective_quality = client.gpt_image_quality
+
     image_bytes, metadata = client.generate(
         token=token,
         prompt=prompt,
         aspect_ratio=aspect_ratio,
         output_resolution=output_resolution,
         upstream_model_id=str(
-            model_config.get("upstream_model_id") or "gemini-flash"
+            upstream_model_id or "gemini-flash"
         ),
         upstream_model_version=str(
             model_config.get("upstream_model_version") or "nano-banana-2"
         ),
-        quality_level=(
-            client.gpt_image_quality
-            if str(model_config.get("upstream_model_id") or "") == "gpt-image"
-            else None
-        ),
+        quality_level=effective_quality,
         detail_level=model_config.get("detail_level"),
         source_image_ids=list(source_image_ids),
         output_size=dict(output_size) if output_size is not None else None,

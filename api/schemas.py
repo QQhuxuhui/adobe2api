@@ -97,6 +97,8 @@ class ConfigUpdateRequest(BaseModel):
     rotation_max_accounts_default: Optional[StrictInt] = None
     rotation_max_accounts_images_edits: Optional[StrictInt] = None
     leonardo_credits_refresh_minutes: Optional[StrictInt] = None
+    leonardo_credit_price_cny: Optional[float] = None
+    adobe_credit_price_cny: Optional[float] = None
     refresh_interval_hours: Optional[int] = None
     retry_enabled: Optional[bool] = None
     retry_max_attempts: Optional[int] = None
@@ -113,6 +115,15 @@ class ConfigUpdateRequest(BaseModel):
     generated_max_size_mb: Optional[int] = None
     generated_prune_size_mb: Optional[int] = None
     gpt_image_quality: Optional[str] = None
+
+    @field_validator(
+        "leonardo_credit_price_cny", "adobe_credit_price_cny", mode="before"
+    )
+    @classmethod
+    def _credit_price(cls, value):
+        from core.credit_costs import normalize_credit_price
+
+        return normalize_credit_price(value)
 
 
 class RefreshCookieImportRequest(BaseModel):

@@ -979,6 +979,10 @@ def build_gemini_native_router(
                     result_url_prefix=str(public_generated_url(request, "")),
                     log_id=log_id,
                     source_images=parsed_video.images,
+                    credit_type="adobe",
+                    credit_unit_price_cny=(
+                        getattr(request.state, "log_credit_prices_cny", {}) or {}
+                    ).get("adobe"),
                 )
                 video_task_manager.submit(task_spec)
                 request.state.log_managed_externally = True

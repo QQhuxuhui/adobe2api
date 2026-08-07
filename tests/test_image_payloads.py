@@ -48,3 +48,18 @@ def test_explicit_ratio_keeps_existing_size_and_aspect_ratio_payload():
 
     assert payload["size"] == {"width": 1536, "height": 2048}
     assert payload["modelSpecificPayload"]["aspectRatio"] == "3:4"
+
+
+def test_gpt_image_quality_does_not_replace_explicit_size():
+    payload = build_payloads(
+        output_resolution="2K",
+        quality_level="medium",
+        output_size={"width": 1024, "height": 1024},
+        upstream_model_id="gpt-image",
+        upstream_model_version="2",
+    )[0]
+
+    assert payload["outputResolution"] == "2K"
+    assert payload["size"] == {"width": 1024, "height": 1024}
+    assert payload["modelSpecificPayload"]["size"] == "1024x1024"
+    assert payload["generationSettings"]["detailLevel"] == 3

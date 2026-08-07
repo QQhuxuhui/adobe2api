@@ -100,7 +100,16 @@ def test_gpt_image_explicit_size_overrides_primary_image_ratio():
     assert resolved.aspect_ratio == "16:9"
     assert resolved.usage_ratio == "16:9"
     assert resolved.output_resolution == "4K"
-    assert resolved.output_size is None
+    assert resolved.output_size == {"width": 3840, "height": 2160}
+
+
+def test_non_gpt_dynamic_model_keeps_quality_resolution_mapping():
+    resolved = resolve_image_geometry(
+        {"size": "1024x1024", "quality": "2k"},
+        "firefly-nano-banana-pro",
+    )
+
+    assert resolved.output_resolution == "2K"
 
 
 def test_multiple_images_always_use_first_image_dimensions():

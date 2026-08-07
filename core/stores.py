@@ -86,6 +86,9 @@ class RequestLogRecord:
     token_attempt: Optional[int] = None
     credits_used: Optional[float] = None
     credits_source: Optional[str] = None
+    credit_type: Optional[str] = None
+    credit_unit_price_cny: Optional[float] = None
+    cost_cny: Optional[float] = None
 
 
 class RequestLogStore:
